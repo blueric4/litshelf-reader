@@ -1,8 +1,16 @@
 # 文献架 LitShelf
 
+[![CI](https://github.com/blueric4/litshelf-reader/actions/workflows/ci.yml/badge.svg)](https://github.com/blueric4/litshelf-reader/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Electron](https://img.shields.io/badge/Electron-44-47848F.svg)](https://www.electronjs.org/)
+[![React](https://img.shields.io/badge/React-19-61DAFB.svg)](https://react.dev/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6.svg)](https://www.typescriptlang.org/)
+
 > 像视频播放器扫描影片库一样扫描你的文献文件夹；像 Apple 提醒事项一样清爽地管理；在软件内直接阅读 PDF 并做高亮批注。
 
 **三条主线**：① 指一个文件夹，自动识别里面的文献；② 在软件内直接打开阅读，不跳出到系统阅读器；③ **文件夹里的文件变了（新增/改名/删除/覆盖保存），软件内自动跟着变，且绝不丢你的标签、笔记、批注和阅读位置。**
+
+> **只想用、不想配环境？** 到 [Releases](https://github.com/blueric4/litshelf-reader/releases) 下载绿色免安装版（zip，解压后双击 `文献架 LitShelf.exe` 即用，无需安装 Node.js）；也可以自己打：`node tools/make-portable.mjs`。
 
 ---
 
