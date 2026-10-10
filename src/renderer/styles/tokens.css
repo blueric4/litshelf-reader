@@ -1,0 +1,206 @@
+/**
+ * 设计 tokens：参照 Apple 提醒事项 / macOS 系统色板。
+ * 所有颜色只在这里定义一次，深浅色靠 html[data-theme] 切换。
+ */
+:root {
+  color-scheme: light;
+
+  /* 底色层次 */
+  --bg: #f2f2f7;
+  --bg-elevated: #ffffff;
+  --sidebar-bg: rgba(242, 242, 247, 0.82);
+  --card: #ffffff;
+  --card-hover: rgba(0, 0, 0, 0.028);
+  --toolbar-bg: rgba(255, 255, 255, 0.78);
+
+  /* 文字 */
+  --text: #1d1d1f;
+  --text-2: #6e6e73;
+  --text-3: #8e8e93;
+  --text-invert: #ffffff;
+
+  /* 线与阴影 */
+  --line: rgba(60, 60, 67, 0.12);
+  --line-strong: rgba(60, 60, 67, 0.22);
+  --shadow-pop: 0 10px 30px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04);
+
+  /* 强调色 */
+  --accent: #007aff;
+  --accent-hover: #0a6fd8;
+  --accent-soft: rgba(0, 122, 255, 0.1);
+  --selection: rgba(0, 122, 255, 0.13);
+  --focus-ring: rgba(0, 122, 255, 0.45);
+
+  /* 系统色（标签 / 图标底） */
+  --c-red: #ff3b30;
+  --c-orange: #ff9500;
+  --c-yellow: #ffcc00;
+  --c-green: #34c759;
+  --c-teal: #32ade6;
+  --c-blue: #007aff;
+  --c-purple: #af52de;
+  --c-pink: #ff2d55;
+  --c-gray: #8e8e93;
+
+  /* 高亮色（阅读器批注） */
+  --hl-yellow: rgba(255, 224, 102, 0.45);
+  --hl-green: rgba(183, 240, 177, 0.45);
+  --hl-blue: rgba(169, 214, 255, 0.45);
+  --hl-pink: rgba(255, 194, 209, 0.45);
+  --hl-purple: rgba(217, 199, 255, 0.45);
+
+  /* 形状 */
+  --radius-panel: 16px;
+  --radius-card: 12px;
+  --radius-row: 10px;
+  --radius-pill: 999px;
+  --radius-sm: 8px;
+
+  /* 字体 */
+  --font-ui: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'HarmonyOS Sans SC',
+    'Microsoft YaHei', 'Segoe UI', system-ui, sans-serif;
+  --font-read: 'Charter', 'Iowan Old Style', 'Songti SC', 'Source Han Serif SC', 'Noto Serif SC', Georgia,
+    'Times New Roman', serif;
+  --font-mono: 'SF Mono', 'Cascadia Mono', 'JetBrains Mono', Consolas, 'Courier New', monospace;
+
+  /* 动效 */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur: 180ms;
+
+  /* 尺寸 */
+  --row-height: 56px;
+  --toolbar-height: 52px;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #1c1c1e;
+  --bg-elevated: #2c2c2e;
+  --sidebar-bg: rgba(28, 28, 30, 0.82);
+  --card: #2c2c2e;
+  --card-hover: rgba(255, 255, 255, 0.05);
+  --toolbar-bg: rgba(30, 30, 32, 0.78);
+
+  --text: #f5f5f7;
+  --text-2: #98989d;
+  --text-3: #8e8e93;
+  --text-invert: #1d1d1f;
+
+  --line: rgba(84, 84, 88, 0.42);
+  --line-strong: rgba(120, 120, 128, 0.6);
+  --shadow-pop: 0 12px 34px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+
+  --accent: #0a84ff;
+  --accent-hover: #3a9bff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --selection: rgba(10, 132, 255, 0.22);
+  --focus-ring: rgba(10, 132, 255, 0.6);
+
+  --c-red: #ff453a;
+  --c-orange: #ff9f0a;
+  --c-yellow: #ffd60a;
+  --c-green: #30d158;
+  --c-teal: #40c8e0;
+  --c-blue: #0a84ff;
+  --c-purple: #bf5af2;
+  --c-pink: #ff375f;
+  --c-gray: #98989d;
+
+  --hl-yellow: rgba(255, 214, 10, 0.32);
+  --hl-green: rgba(48, 209, 88, 0.28);
+  --hl-blue: rgba(10, 132, 255, 0.3);
+  --hl-pink: rgba(255, 55, 95, 0.28);
+  --hl-purple: rgba(191, 90, 242, 0.3);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+  user-select: none;
+}
+
+/* 滚动条：macOS 风格细条 */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 128, 0.32);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 128, 0.5);
+  background-clip: content-box;
+}
+
+::selection {
+  background: var(--selection);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+  border: none;
+  background: none;
+  padding: 0;
+}
+
+input,
+textarea {
+  user-select: text;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-radius: 6px;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

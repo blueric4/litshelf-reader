@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+dist/
+release/
+*.tsbuildinfo
+
+# 本地临时文件：探针、测试数据目录、日志
+tmp/
+*.log
+.litshelf/
+*.local
+
+# 绿色免安装整合版与压缩包（几十上百 MB，不进版本库；用 tools/make-portable.mjs 现场生成）
+文献架整合/
+*.zip
+
+# 构建时从 pdfjs-dist 同步过来的静态资源（跑 pnpm build 会重新生成）
+src/renderer/public/pdf.worker.min.mjs
+src/renderer/public/cmaps/
+src/renderer/public/standard_fonts/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+docs/screenshots/*.tmp
