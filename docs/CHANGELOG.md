@@ -281,3 +281,21 @@
 1. `chokidar` 等依赖漏收集 → 打出来的包一启动就崩（`Cannot find module`）。根因是 `require.resolve('<pkg>/package.json')` 对 `exports` 未暴露 package.json 的包会抛错，被 `continue` 静默跳过。改为"包内解析 + 入口回溯 + 报错不静默"。
 2. pnpm 传递依赖（`readdirp`、`jszip`、`commander`、`@xmldom/xmldom` 等）从项目根解析不到 → 改为在每个包自己的目录里解析。
 3. 冒烟测试误报：冷缓存时的 `cache/thumbs/*.webp ENOENT` 属于正常日志，不算致命错误；"删除文件后条目数减少"也不对——按设计是标记**文件缺失**并保留条目（批注不能丢）。两处判据都已修正。
+
+## 2026-10-10 · 开源发布 + 隐私处理
+
+### 发布
+
+- 仓库：<https://github.com/blueric4/litshelf-reader>（public，MIT）；首个提交 118 个文件；GitHub Actions 跑类型检查 + 209 例单测，两次运行均通过。
+- Release `v1.0.0` 附绿色免安装包 `LitShelf-v1.0.0-portable-win-x64.zip`（172 MB），下载即用。
+- 仓库补齐：MIT `LICENSE`、`.gitignore` / `.gitattributes`、README 徽章与下载指引、10 个 topics（electron / pdf-reader / reference-manager / zotero-alternative…）。
+
+### 隐私处理（发布前扫描发现并修复）
+
+1. **界面截图里的本机路径**：6 张截图的提示条里出现过 `%USERPROFILE%\Documents\文献架示例文献`（含 Windows 账户名），详情栏「文件」行也会显示完整路径。
+   - 处理：`tools/redact-shots.py` 统一对提示条区域做像素化、并裁掉底部 42px；`tools/privacy-scan-shots.py` / `tools/privacy-verify-shots.py` 用于生成核验图；处理后的截图已随提交更新。
+2. **脱敏脚本自身硬编码账户名**：`tools/sanitize-paths.mjs` 第一版把账户名写进了正则。改为运行时从 `os.homedir()` 与项目根目录推导，默认只报告、`--write` 才改文件。
+3. **源码注释里提到具体论文名**：改为通用表述（"有些中文期刊 PDF"）。
+4. **验收报告里粘贴的原始日志含本机工作目录**：统一改为相对路径。
+5. 处理方式：重写为**单一干净提交**并强推（旧提交里的泄露文件不再可达）。注意 GitHub 侧可能短时间缓存旧对象。
+6. 复核：全仓扫描（账户名 / 本机路径 / 论文标题关键词）无命中；线上 `tools/sanitize-paths.mjs` 与 `docs/screenshots/02-library.png` 的 SHA256 与本地脱敏版一致；整合包内不含任何个人信息与用户数据。
