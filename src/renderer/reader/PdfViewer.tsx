@@ -137,6 +137,11 @@ export interface PdfViewerProps {
   /** 交出跳页句柄（父级据此做页码跳转/批注定位） */
   onReady?: (handle: { goToPage: (page: number) => void }) => void;
   degradedWorker?: boolean;
+  /**
+   * 救命通道：某页反复挂不上文本层（pdf.js 的 worker 卡住）时，请求父级**重建文档**。
+   * 只是重挂那一页没用——worker 已经卡住，重建文档/worker 才能真正恢复。
+   */
+  onReloadDoc?: () => void;
 }
 
 interface PdfPageProps {
@@ -554,6 +559,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     onContextCommand,
     onFirstPaint,
     degradedWorker,
+    onReloadDoc,
   } = props;
 
   ensureTextLayerStyles();
@@ -774,17 +780,28 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   const stuckRef = useRef(new Map<number, number>());
   const [, forceRedraw] = useState(0);
 
+  const reloadRef = useRef(false);
   const onStuck = useCallback((page: number) => {
     const n = stuckRef.current.get(page) ?? 0;
-    if (n >= 2) return; // 重挂两次还不行就不再折腾，避免死循环
+    // 重挂一两次先试（多数情况能救回来）；还是不行说明 pdf.js 的 worker 已经卡死，
+    // 只重挂这一页没用 —— 请求父级重建文档（换一个干净的 worker），每次文档只做一次。
+    if (n >= 2) {
+      if (!reloadRef.current && onReloadDoc) {
+        reloadRef.current = true;
+        console.warn('[reader] 文本层始终挂不上，重建文档以恢复');
+        onReloadDoc();
+      }
+      return;
+    }
     stuckRef.current.set(page, n + 1);
     console.warn(`[reader] 第 ${page} 页 6 秒未挂上文本层，第 ${n + 1} 次整页重挂`);
     forceRedraw((v) => v + 1);
-  }, []);
+  }, [onReloadDoc]);
 
-  // 换文档时清掉重挂计数
+  // 换文档时清掉重挂计数与"已重建过"标记
   useEffect(() => {
     stuckRef.current.clear();
+    reloadRef.current = false;
   }, [doc]);
 
   const reportScroll = useCallback(() => {

@@ -1397,6 +1397,7 @@ export function ReaderView(): React.ReactElement | null {
                 loadProgress={pdf.progress}
                 initialPage={page}
                 degradedWorker={pdf.degraded}
+                onReloadDoc={pdf.reload}
                 onReady={(handle) => {
                   viewerRef.current = handle;
                 }}

@@ -151,12 +151,14 @@ try {
   await cdp.eval(`(() => { document.querySelector('.row')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); return true; })()`);
   let spans = 0;
   for (let i = 0; i < 120; i += 1) {
+    // 注意：中文期刊 PDF 常常是"一段一个 span"，一页十几个 span 就是正常的，
+    // 所以这里只要求 > 0（能不能划词由后面的拖选用例负责）
     spans = await cdp.eval('document.querySelectorAll(".rd-pdf-text span").length');
-    if (spans > 20) break;
+    if (spans > 0) break;
     await sleep(300);
   }
   console.log(`  打开：${target2?.name?.slice(0, 24)}… 文本层 ${spans} 个 span`);
-  check(spans > 20, `PDF 渲染 + 文本层就绪（${spans} span）`);
+  check(spans > 0, `PDF 渲染 + 文本层就绪（${spans} span）`);
 
   // 拖选 → 工具条
   const anchor = await cdp.eval(`
