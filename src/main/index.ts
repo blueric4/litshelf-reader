@@ -10,7 +10,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { BrowserWindow, Menu, Tray, app, dialog, nativeImage, protocol, shell } from 'electron';
 import { Host } from '../core/host';
-import { registerIpc } from './ipc';
+import { openFoldersDialog, registerIpc } from './ipc';
 
 /** 构建期由 scripts/build.mjs 的 define 注入 */
 declare const __APP_VERSION__: string;
@@ -368,15 +368,13 @@ function createTray(instance: Host): Tray | null {
 // ---------------------------------------------------------------- 菜单动作
 
 async function addFolderViaDialog(instance: Host): Promise<void> {
-  const win = BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
-  const options: Electron.OpenDialogOptions = {
-    title: '选择文献文件夹',
-    buttonLabel: '添加',
-    properties: ['openDirectory', 'multiSelections'],
-  };
-  const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
-  if (result.canceled || !result.filePaths.length) return;
-  for (const dir of result.filePaths) {
+  // 与界面里的「添加文献文件夹」走同一条路径：对话框里既能看到文件夹、也能看到文献文件
+  const { dirs, pickedFiles } = await openFoldersDialog();
+  if (!dirs.length) return;
+  if (pickedFiles > 0) {
+    instance.pushToast('info', '已按文件所在的文件夹添加', dirs[0], 6000);
+  }
+  for (const dir of dirs) {
     try {
       const added = await instance.addRoot(dir);
       instance.pushToast('success', `已添加「${added.root.name}」`, `发现 ${added.added} 篇文献`, 6000);

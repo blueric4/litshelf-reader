@@ -9,6 +9,7 @@
  * 浏览器形态（src/server/index.ts）实现同一套语义，二者必须保持一致。
  */
 import path from 'node:path';
+import { stat } from 'node:fs/promises';
 import { BrowserWindow, app, clipboard, dialog, ipcMain, shell } from 'electron';
 import type { Host } from '../core/host';
 import { createSampleLibrary } from '../core/sample';
@@ -46,16 +47,45 @@ function obj<T extends object>(v: unknown): T {
   return v && typeof v === 'object' ? (v as T) : ({} as T);
 }
 
-/** 系统对话框：能拿到焦点窗口就挂上去，这样对话框是模态的 */
-async function openDirectoryDialog(): Promise<string[]> {
+/**
+ * 系统对话框：让用户选文献文件夹。
+ *
+ * 关键点：**同时给出 openFile 与 openDirectory**。
+ * 只给 `openDirectory` 时，Windows 的文件夹选择框里**一个文件都不列**（用户看到的是一片
+ * "没有与搜索条件匹配的项"），很容易让人以为选错了文件夹；加上 `openFile` 之后，同一个
+ * 对话框会像资源管理器一样列出文件（并按下面的 filters 过滤出文献类型），
+ * 既能直接选文件夹，也能随手选一个 PDF —— 选文件时自动取它所在的文件夹。
+ */
+export interface PickedFolders {
+  dirs: string[];
+  /** 用户是"直接选了文件"的个数（>0 时给个提示，让他知道按所在文件夹处理了） */
+  pickedFiles: number;
+}
+
+export async function openFoldersDialog(): Promise<PickedFolders> {
   const options: Electron.OpenDialogOptions = {
-    title: '选择文献文件夹',
+    title: '选择文献文件夹（可直接选文件夹，也可以选一个文献文件）',
     buttonLabel: '添加',
-    properties: ['openDirectory', 'multiSelections'],
+    properties: ['openFile', 'openDirectory', 'multiSelections'],
+    filters: [
+      { name: '文献文件', extensions: ['pdf', 'docx', 'doc', 'md', 'markdown', 'txt', 'html', 'htm'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
   };
   const win = BrowserWindow.getFocusedWindow();
   const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
-  return result.canceled ? [] : result.filePaths;
+  if (result.canceled || !result.filePaths.length) return { dirs: [], pickedFiles: 0 };
+  const dirs: string[] = [];
+  let pickedFiles = 0;
+  for (const p of result.filePaths) {
+    const st = await stat(p).catch(() => null);
+    if (st?.isDirectory()) dirs.push(p);
+    else {
+      pickedFiles += 1;
+      dirs.push(path.dirname(p));
+    }
+  }
+  return { dirs: [...new Set(dirs)], pickedFiles };
 }
 
 // ---------------------------------------------------------------- 白名单
@@ -70,7 +100,13 @@ const HANDLERS: Record<string, Handler> = {
   capabilities: () => ({ nativeDialogs: true, revealInFolder: true, openPath: true, mode: 'electron' as const }),
 
   // ---- 根目录 ----
-  pickFolder: () => openDirectoryDialog(),
+  pickFolder: async ({ host }) => {
+    const { dirs, pickedFiles } = await openFoldersDialog();
+    if (pickedFiles > 0 && dirs[0]) {
+      host.pushToast('info', '已按文件所在的文件夹添加', dirs[0], 6000);
+    }
+    return dirs;
+  },
   addRoot: ({ host }, [dir, opts]) => host.addRoot(str(dir), obj<{ depth?: number }>(opts)),
   removeRoot: ({ host }, [rootId, opts]) => host.removeRoot(str(rootId), obj<{ forgetItems?: boolean }>(opts)),
   setRootEnabled: ({ host }, [rootId, enabled]) => {
