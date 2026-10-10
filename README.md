@@ -1,3 +1,5 @@
+#由于我用不习惯zetero，所以拿大肥鱼做了这个，全是ai生成的，所以对我来说相对来说比较轻松，目前已知bug还是很多的，后续我会一直更新的，因为我自己也会用的，希望有优化的地方能说出来，不好的可喷，我会让大肥鱼继续改进的
+
 # 文献架 LitShelf
 
 [![CI](https://github.com/blueric4/litshelf-reader/actions/workflows/ci.yml/badge.svg)](https://github.com/blueric4/litshelf-reader/actions/workflows/ci.yml)
