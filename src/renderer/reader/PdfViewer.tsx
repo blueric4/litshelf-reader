@@ -1846,6 +1846,16 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
          *              重算一遍，并且跳过"同栏就不动"的早退（这正是它平时要早退的那种情况）。
          */
         const clampToAnchorColumn = (force = false): boolean => {
+          /**
+           * **先收拾 pdf.js 的 `.endOfContent`，再量几何。**
+           *
+           * 它在"选中状态"下会被插到选区锚点旁边，并被设成**整个文本层那么大**；它一旦进了 range，
+           * `getClientRects()` 里就多出一条横贯整页的矩形 → `rectsInAnchorBand()` 把**每一个候选**都判失败
+           * （实测苏敬勤 p2 末栏：mouseup 后 7 拍补夹全部报"没有任何候选过整段在本栏内"→ 不夹 →
+           * 869 字 / rect 越界 463；改前那条 1 字的兜底也是同一个原因）。
+           * 所以夹取之前先把它挪回末尾并清掉行内宽高（用现成的 parkEndOfContent，pdf.js 自己的 reset() 口径）。
+           */
+          parkEndOfContent();
           /** [diag] 排查用：夹取在任何一步"没执行"时都要留下原因（以前是静默 return false） */
           const bail = (why: string): false => {
             console.debug(
@@ -2205,15 +2215,28 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
               bestLen = len;
             }
           }
+          /**
+           * (R5) 最长候选只有 1~2 字 → 判定"端点还没就绪"（浏览器选区尚未定型时，本栏内的候选端点
+           * 会残缺不全），**这一拍不夹**，等空窗期的下一拍（mouseup 后 +80…+900ms 共 7 拍）。
+           * 宁可晚一点夹对，也不要把"横跨整页"换成"1 个字" —— 后者正是用户报的"碎成 1~3 字"。
+           */
+          if (bestRange && bestLen <= 2) {
+            console.debug(`[diag] 第 ${pageNo} 页最长候选只有 ${bestLen} 字（端点未就绪）→ 本拍不夹，等下一拍`);
+            return false;
+          }
           if (!bestRange) {
             /**
              * 兜底：一整个候选都过不了"整段在本栏内"时（真实页面上方常有横跨栏缝的公告块/图注，
              * 反向拖的范围必然穿过它们），退到**锚点自己那个 span 的边界**——
              * 它一定在本栏内、也一定不会跨栏。宁可只夹出几个字，也绝不让跨栏选区留下。
              */
-            const node = anchorSpan.firstChild;
-            const r = buildFromAnchor(node, forward ? ((node?.textContent ?? '').length ?? 0) : 0);
-            if (r && rectsInAnchorBand(r)) bestRange = r;
+            /**
+             * (R5) 老代码这里退到**锚点 span 自身**（通常 1~3 个字）—— 正是用户报的"碎成 1~3 字"。
+             * 实测这一拍往往只是"端点还没就绪"，所以本拍不夹，交给 mouseup 后 +80…+900ms 的
+             * 空窗期补夹（7 拍）以及 selectionchange 那条路。宁可晚一拍夹对，也不产出碎片。
+             */
+            console.debug(`[diag] 第 ${pageNo} 页没有任何候选过"整段在本栏内"（端点未就绪）→ 本拍不夹，等下一拍`);
+            return false;
           }
           const fixed = bestRange;
           // 连兜底都过不了就不动手（宁可不夹，也绝不产出跨栏选区）
@@ -2437,10 +2460,57 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       };
 
       /** 看护窗口内：把选区套回锁定的那个（锁失效则返回 false，交回正常流程） */
+      /**
+       * 当前选区在**几何上**是否越出了"它锚点所在的那一栏"。
+       * 判据与 `clampToAnchorColumn()` 里那条一致：只要有 rect 的中心落在锚点栏之外就算越栏。
+       * 用途：`applyLocked()` 在"浏览器刚把整页 range 拉出来"时让位给夹取（否则上一轮的锁会短路本轮夹取）。
+       */
+      const liveSelectionCrossesColumn = (): boolean => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+        const spanOfNode = (n: Node | null): HTMLElement | null => {
+          const el = !n ? null : n.nodeType === Node.ELEMENT_NODE ? (n as HTMLElement) : n.parentElement;
+          return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
+        };
+        const anchorSpan =
+          spanOfNode(sel.anchorNode) ??
+          (anchorNodeRef && document.contains(anchorNodeRef) ? spanOfNode(anchorNodeRef) : null);
+        const page = anchorSpan?.closest?.('.rd-pdf-page') as HTMLElement | null;
+        if (!anchorSpan || !page) return false;
+        const pageNo = Number(page.dataset.pageIndex ?? '0');
+        const regions = regionsByPageRef.current.get(pageNo);
+        if (!regions?.length) return false;
+        const pr = page.getBoundingClientRect();
+        if (pr.width <= 0 || pr.height <= 0) return false;
+        const ar = anchorSpan.getBoundingClientRect();
+        const yRatio = (ar.top + ar.height / 2 - pr.top) / pr.height;
+        const region = regions[regionIndexAtY(regions, yRatio)];
+        if (!region || region.bands.length < 2) return false;
+        const xRatio = (ar.left + ar.width / 2 - pr.left) / pr.width;
+        const bi = bandIndexOf(region.bands, xRatio);
+        if (bi < 0) return false;
+        const band = region.bands[bi];
+        return [...sel.getRangeAt(0).getClientRects()].some((r) => {
+          const c = (r.left + r.right) / 2 - pr.left;
+          return c < band.start * pr.width - 15 || c > band.end * pr.width + 15;
+        });
+      };
+
       const applyLocked = (): boolean => {
         // 拖动中一律不改写选区：任何"套回旧区间"的动作都会和用户正在进行的拖动打架
         if (pressed) return false;
         if (!lockedRange) return false;
+        /**
+         * **让位给夹取**：当前选区在几何上已经越栏时，先把机会让给 `clampToAnchorColumn()`。
+         *
+         * 为什么：浏览器把排队的 mousemove 应用完那一刻，选区是"横跨整页"的；若这里先"套回上一轮
+         * 的锁"，夹取就被短路掉了。实测苏敬勤 p2 末栏：4 次快/慢拖里 3 次**全程没有任何夹取日志**，
+         * 最终量到 869 字 / rect 越界 463。
+         */
+        if (liveSelectionCrossesColumn()) {
+          console.debug('[diag] 当前选区几何上已越栏 → applyLocked 让位，交给夹取');
+          return false;
+        }
         if (!document.contains(lockedRange.startContainer) || !document.contains(lockedRange.endContainer)) {
           stopGuard(); // 边界节点已脱离文档：锁没意义了，定时器/监听一起收掉
           return false;
@@ -2574,6 +2644,19 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
         }
         collectSelection();
         schedule(60);
+        /**
+         * **空窗期补夹（有界连打）**：浏览器把排队的 mousemove 应用完的时刻不稳定 ——
+         * 实测（苏敬勤 p2 末栏）：mouseup 时选区塌陷，+150ms / +400ms 两拍**都还是塌陷**
+         * （`[diag] 选区为空/塌陷/没有 range`），而到 +900ms 量的时候已经是横跨整页的 869 字，
+         * 那一波**没有触发夹取**（`settle` 被 `applyLocked` 短路）。
+         * 所以在 1 秒内补若干拍，复用同一条 `schedule() → settle() → 夹取` 路径（不写第二套逻辑）；
+         * 没有"越栏选区"时每一拍都是空操作（夹取内部会早退），不会改写正常选区。
+         */
+        for (const delay of [80, 160, 260, 380, 520, 700, 900]) {
+          window.setTimeout(() => {
+            if (!pressed) schedule(0);
+          }, delay);
+        }
       };
 
       const onDown = (ev: Event): void => {

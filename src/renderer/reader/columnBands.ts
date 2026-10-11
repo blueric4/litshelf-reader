@@ -506,10 +506,20 @@ export function columnRegionsFromItems(
     if (!r.full) continue;
     const thin = r.bottom - r.top <= rowSize * 3;
     if (!thin) continue;
-    const near = [regions[i - 1], regions[i + 1]].filter((x) => x && !x.full);
-    if (!near.length) continue;
-    const anchor = near[0];
-    regions[i] = { top: r.top, bottom: r.bottom, full: false, bands: anchor.bands };
+    /**
+     * **只有"夹在两段多栏之间"的孤立宽行才降级**（上下都必须是多栏区）。
+     *
+     * 只要求"有一个多栏邻居"是不够的：论文第 1 页的**整幅标题/作者/摘要块**也是薄的宽区，
+     * 它下面紧跟双栏正文 —— 那种页面会把标题区也降级成多栏，于是在**本来就横跨整幅**的
+     * 标题行上横向拖选被硬性夹成一小段（实测 `acceptance-columns` 的 [1b]：通栏区拖选只出
+     * 3 字 / x 覆盖 40px，还打出了"选区跨栏，已夹回…"日志；交接文档 §3.2 明确要求
+     * "该分区只有一条栏带 → 不夹"）。
+     * 顶部/底部贴着页面内容边缘的宽区（`regions[0]` / `regions[n-1]`）一律保持通栏。
+     */
+    const prevR = regions[i - 1];
+    const nextR = regions[i + 1];
+    if (!prevR || !nextR || prevR.full || nextR.full) continue;
+    regions[i] = { top: r.top, bottom: r.bottom, full: false, bands: prevR.bands };
   }
   return regions.filter((r) => r.bands.length > 0);
 }
