@@ -316,8 +316,8 @@ export interface BandRegion {
   full: boolean;
 }
 
-/** 一行（y 行带）的横向跨度是否算"横跨整幅" */
-const DEFAULTS_WIDE_ROW_RATIO = 0.6;
+/** 一行（y 行带）的横向跨度是否算"横跨整幅"（**从严**：0.8，见下方注释） */
+const DEFAULTS_WIDE_ROW_RATIO = 0.8;
 
 /**
  * 把页面按 y 切成若干**版式一致**的区域，每个区域各给一套栏带。
@@ -452,6 +452,23 @@ export function columnRegionsFromItems(
     cur.rows.push(k);
   }
   flush();
+  /**
+   * 通栏判定**从严**（用户反馈的关键）：只有"真通栏段落"才允许不夹取。
+   *
+   * 夹在多栏段之间的**孤立宽行**（双栏正文里的通栏小标题、表格行、图注行）不算通栏区：
+   * 它的上下都是多栏文字，把它当通栏会让夹取在这几行上失效（实测案例研究那篇 p6/p9 整页被选中）。
+   * 处理：把这种"薄"的全宽区降级为非通栏，并沿用相邻多栏区的栏带。
+   */
+  for (let i = 0; i < regions.length; i += 1) {
+    const r = regions[i];
+    if (!r.full) continue;
+    const thin = r.bottom - r.top <= rowSize * 3;
+    if (!thin) continue;
+    const near = [regions[i - 1], regions[i + 1]].filter((x) => x && !x.full);
+    if (!near.length) continue;
+    const anchor = near[0];
+    regions[i] = { top: r.top, bottom: r.bottom, full: false, bands: anchor.bands };
+  }
   return regions.filter((r) => r.bands.length > 0);
 }
 

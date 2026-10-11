@@ -33,6 +33,8 @@ interface RegionRatio {
   /** 通栏区（区内一条栏带＝整幅内容宽）：既不夹取，也不按栏重排 */
   full: boolean;
   bands: { start: number; end: number }[];
+  /** 重排时是否按本区的栏排序（整页模型多栏才为 true；单栏页保持老的 orderTextSpans 路径） */
+  orderByBands?: boolean;
 }
 
 /** 某个 y 比例落在哪个分区；落在分区之间的缝隙时取最近的一个 */
@@ -53,9 +55,9 @@ function regionIndexAtY(regions: readonly RegionRatio[], y: number): number {
   return best;
 }
 
-/** 这一页是否存在"真正的多栏分区"（只有它才值得按栏重排/夹取） */
+/** 这一页是否值得按分区里的栏重排（只有"整页模型确实多栏"时才为 true） */
 function hasMultiColumnRegion(regions: readonly RegionRatio[] | undefined): boolean {
-  return !!regions?.some((r) => r.bands.length >= 2);
+  return !!regions?.some((r) => r.orderByBands && r.bands.length >= 2);
 }
 
 /**
@@ -446,29 +448,29 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         // pdf.js 的 items 里混有 TextMarkedContent（只有 type、没有几何），没有 str 的一律丢掉
         const textItems = content.items.filter((it) => 'str' in it);
         /**
-         * 先看**整页**是不是多栏：不是的话一律走老路径（不分区、不夹取、`orderTextSpans` 重排），
-         * 行为与改动前一模一样（45 条划词手感的场景 3「拖到空白」正是靠这条不变）。
-         * 只有整页确实多栏的页面，才用"按 y 分区"去细化：通栏段自成 1 栏区（不夹），
-         * 正文段在各段内部重新切栏（混排页的关键，见 columnBands.ts 的 columnRegionsFromItems）。
+         * 分区**始终**算（不再用"整页单栏"这种页面级结论关掉夹取 —— 有整幅图/图注/表格的页面上，
+         * 图注/表格行会把栏缝覆盖统计压过、全局模型误判成 1 栏，夹取被整个关掉，于是正文里拖 2~3 行
+         * 变成整页被选中）。
+         *
+         * 分工：
+         *   · **夹取**用分区（锚点所在分区只有一条栏带 → 不夹；多栏 → 照旧硬性禁止跨栏）；
+         *   · **重排**只在"整页模型确实多栏"时才接管（`orderBands`），单栏页继续走老的
+         *     `orderTextSpans` —— 45 条手感里的"行间距拖 31 字""拖到空白 308 字"都依赖这条不变。
          */
-        const globalBands = columnBandsFromItems(textItems as Parameters<typeof columnBandsFromItems>[0], {
+        const orderBands = columnBandsFromItems(textItems as Parameters<typeof columnBandsFromItems>[0], {
           pageWidth: viewport.width,
           pageHeight: viewport.height,
           scale: 1,
           styles: content.styles,
         });
-        const regions =
-          globalBands.length < 2
-            ? []
-            : columnRegionsFromItems(textItems as Parameters<typeof columnRegionsFromItems>[0], {
-                pageWidth: viewport.width,
-                pageHeight: viewport.height,
-                scale: 1,
-                styles: content.styles,
-              });
+        const regions = columnRegionsFromItems(textItems as Parameters<typeof columnRegionsFromItems>[0], {
+          pageWidth: viewport.width,
+          pageHeight: viewport.height,
+          scale: 1,
+          styles: content.styles,
+        });
         if (cancelled) return;
         if (!regions.length) {
-          console.debug(`[reader] 第 ${pageNumber} 页版式分区：整页单栏（不分区、不做跨栏夹取）`);
           cbRef.current.onBands?.(pageNumber, []);
           return;
         }
@@ -477,6 +479,8 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
           bottom: r.bottom / viewport.height,
           full: r.full,
           bands: r.bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width })),
+          // 重排是否按"分区里的栏"排序：只有整页模型确实多栏时才接管（见上方注释）
+          orderByBands: orderBands.length >= 2,
         }));
         console.debug(
           `[reader] 第 ${pageNumber} 页版式分区：${rel.length} 区 ` +
@@ -830,26 +834,25 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         const items = content.items.filter((it) => 'str' in it);
         const unscaledW = viewport.width / viewport.scale;
         const unscaledH = viewport.height / viewport.scale;
-        // 整页不是多栏 → 不给分区（重排退回 orderTextSpans、夹取不触发），与改动前一致
-        const globalBands = columnBandsFromItems(items as Parameters<typeof columnBandsFromItems>[0], {
+        // 分区照算（夹取用）；重排是否按栏排序看整页模型是否多栏（见 reorderTextLayer 的门）
+        const orderBands = columnBandsFromItems(items as Parameters<typeof columnBandsFromItems>[0], {
           pageWidth: unscaledW,
           pageHeight: unscaledH,
           scale: viewport.scale,
           styles: content.styles,
         });
-        if (globalBands.length >= 2) {
-          regions = columnRegionsFromItems(items as Parameters<typeof columnRegionsFromItems>[0], {
-            pageWidth: unscaledW,
-            pageHeight: unscaledH,
-            scale: viewport.scale,
-            styles: content.styles,
-          }).map((r) => ({
-            top: r.top / viewport.height,
-            bottom: r.bottom / viewport.height,
-            full: r.full,
-            bands: r.bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width })),
-          }));
-        }
+        regions = columnRegionsFromItems(items as Parameters<typeof columnRegionsFromItems>[0], {
+          pageWidth: unscaledW,
+          pageHeight: unscaledH,
+          scale: viewport.scale,
+          styles: content.styles,
+        }).map((r) => ({
+          top: r.top / viewport.height,
+          bottom: r.bottom / viewport.height,
+          full: r.full,
+          bands: r.bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width })),
+          orderByBands: orderBands.length >= 2,
+        }));
       } catch {
         regions = [];
       }
@@ -1775,9 +1778,32 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           const spans = [...page.querySelectorAll<HTMLElement>('.rd-pdf-text span')].filter(
             (s) => (s.textContent ?? '').trim().length > 0,
           );
-          // 本栏的 span 用**严格判定**（中心点确实落在锚点栏里），别用"最近栏"兜底，
+          /**
+           * 端点必须落在本栏的**安全区**里 —— 两端用**相邻栏缝**卡死。
+           *
+           * 栏缝本身来自 **pdf.js 文本项**的 x 覆盖（`columnBandsFromItems`/`columnRegionsFromItems`），
+           * 所以"哪个字属于哪一栏"实际是按文本项判的；DOM span 只用来定位端点、不再决定归属。
+           *
+           * 为什么必须这样（用户截图那批泄漏的真因）：两端对齐的中文正文里，**行末单个汉字会被字距
+           * 推进栏缝**（实测 p3：栏缝 555~595，却有 span `[595~613]「连」` 中心落在栏 1 一侧）。
+           * 按"span 中心在本栏"挑端点就会把它当本栏内容，夹出来的选区右端一律停在 613 ✗。
+           * 现在要求端点的**右端 ≤ 下一栏起点 +2px**（左端同理 ≥ 上一栏终点 -2px）。
+           */
+          const band = bands[anchorBand];
+          const prevBand = bands[anchorBand - 1];
+          const nextBand = bands[anchorBand + 1];
+          const tolPx = 2;
+          const safeLo = (prevBand ? prevBand.end : band.start) * pageRect.width - tolPx;
+          const safeHi = (nextBand ? nextBand.start : band.end) * pageRect.width + tolPx;
+          const safeEndpoint = (s: HTMLElement): boolean => {
+            const r = s.getBoundingClientRect();
+            const l = r.left - pageRect.left;
+            const rr = r.right - pageRect.left;
+            return rr <= safeHi && l >= safeLo;
+          };
+          // 本栏的 span 用**严格判定**（中心点确实落在锚点栏里）+ 安全区，别用"最近栏"兜底，
           // 否则栏缝外那一列的第一个 span 会被算进来，夹取结果会多出半栏。
-          const inAnchor = spans.filter((s) => bandIndexOf(bands, ratioOf(s)) === anchorBand);
+          const inAnchor = spans.filter((s) => bandIndexOf(bands, ratioOf(s)) === anchorBand && safeEndpoint(s));
           if (!inAnchor.length) return false;
           // 往前拖（按下点在前）夹到本栏末尾，往回拖夹到本栏开头；焦点不在 span 上时用指针 x 判方向。
           // 强制重算时用上次记下的方向（DOM 变动后 compareDocumentPosition 已经不可信）。
