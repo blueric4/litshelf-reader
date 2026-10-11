@@ -179,6 +179,10 @@ export function usePdfDocument(item: Item | null): PdfDocumentResult {
         cMapUrl: new URL('cmaps/', document.baseURI).href,
         cMapPacked: true,
         standardFontDataUrl: new URL('standard_fonts/', document.baseURI).href,
+        // 图片解码资源：JPEG2000 / JBIG2 / ICC 色彩配置都靠它们。
+        // 缺了 qcms_bg.wasm + iccs/，CMYK JPEG（中文期刊照片常见）会渲染成一块灰色。
+        wasmUrl: new URL('wasm/', document.baseURI).href,
+        iccUrl: new URL('iccs/', document.baseURI).href,
       };
       // worker 资源缺失时直接退化，省掉一次必然失败的首轮加载
       const preDegraded = await prepareWorker();

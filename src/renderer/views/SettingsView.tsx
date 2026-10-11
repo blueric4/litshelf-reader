@@ -7,7 +7,7 @@ import { HIGHLIGHT_COLORS } from '@shared/types';
 import { useStore } from '../state/store';
 import { api, isElectron, platform } from '../bridge';
 import { confirmDialog, promptDialog } from '../components/Overlays';
-import { IconExternal, IconFolderPlus, IconRefresh, IconTrash, IconWarning } from '../components/Icons';
+import { IconExternal, IconFileText, IconFolderPlus, IconRefresh, IconTrash, IconWarning } from '../components/Icons';
 import { formatRelative, modKey } from '../utils/format';
 
 type Section = 'roots' | 'scan' | 'reader' | 'meta' | 'appearance' | 'data' | 'about';
@@ -43,6 +43,13 @@ const EXTRA_SIDEBAR_HINTS: Record<SidebarExtraFilter, string> = {
   noted: '写过笔记的文献',
   missing: '有文件缺失时才出现',
 };
+
+/**
+ * 文献库两个添加入口的文案，与 `SidebarFolders.tsx` 里的 `FILE_PICK_HINT` / `PATH_HINT`
+ * **逐字一致**（两处入口说法必须一样；常量目前各自私有，改文案时两边一起改）。
+ */
+const FILE_PICK_HINT = '选择文献文件（可多选、可按类型筛选）；会按文件所在的文件夹添加';
+const PATH_HINT = '手动填写路径：文件夹里还没有文献时用这个';
 
 function Row({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
@@ -87,18 +94,39 @@ export function SettingsView() {
 
   const totalSize = useMemo(() => items.reduce((n, i) => n + i.size, 0), [items]);
 
-  const addRoot = async () => {
-    let picked: string[] = [];
-    if (capabilities.nativeDialogs) picked = await api.pickFolder().catch(() => []);
-    else picked = [];
-    if (!picked.length && !capabilities.nativeDialogs) {
-      const typed = await promptDialog({ title: '添加文献文件夹', message: '请填写文件夹完整路径', placeholder: 'D:\\文献', confirmLabel: '添加' });
-      if (typed) picked = [typed];
-    }
-    for (const dir of picked) {
+  /** 把文件夹加入文献库（同一个目录只加一次） */
+  const addDirs = async (dirs: string[]) => {
+    for (const dir of [...new Set(dirs)]) {
       await api.addRoot(dir, { depth: 8 }).catch((err) => pushToast({ kind: 'error', message: '添加失败', detail: err.message }));
     }
     await refresh();
+  };
+
+  /**
+   * 手动填写路径：**始终**可用。桌面版的原生框是文件对话框（选不了文件夹），
+   * "文件夹里还没有文献 / 只想先挂一个空目录"只能走这条，不能只在浏览器形态才给。
+   */
+  const addByPath = async () => {
+    const typed = await promptDialog({
+      title: '手动填写路径',
+      message: (
+        <>
+          填写文献文件夹的完整路径，例如 <b>D:\文献</b>。文件夹里暂时还没有文献也可以，之后放进去的会自动入库。
+        </>
+      ),
+      placeholder: 'D:\\文献',
+      confirmLabel: '添加',
+    });
+    if (typed) await addDirs([typed]);
+  };
+
+  /** 选文献文件：桌面版弹原生文件对话框（可多选，按文件所在文件夹入库），浏览器形态退化成手填路径 */
+  const pickFiles = async () => {
+    if (!capabilities.nativeDialogs) {
+      await addByPath();
+      return;
+    }
+    await addDirs(await api.pickFolder().catch(() => []));
   };
 
   return (
@@ -170,9 +198,17 @@ export function SettingsView() {
                   ))
                 )}
               </div>
-              <button className="btn" onClick={addRoot}>
-                <IconFolderPlus size={14} /> 添加文献文件夹
-              </button>
+              <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                <button className="btn" onClick={pickFiles} title={FILE_PICK_HINT}>
+                  <IconFileText size={14} /> 选择文献文件（可多选）
+                </button>
+                <button className="btn" onClick={addByPath} title={PATH_HINT}>
+                  <IconFolderPlus size={14} /> 手动填写路径
+                </button>
+              </div>
+              <p className="set-desc" style={{ margin: '12px 0 0' }}>
+                系统对话框里选的是<b>文献文件</b>（可多选），文献架按文件所在的文件夹入库；文件夹里还没有文献时，用「手动填写路径」直接填文件夹。
+              </p>
               <div style={{ marginTop: 10 }}>
                 <button
                   className="btn"

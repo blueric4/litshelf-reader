@@ -584,9 +584,45 @@ html[data-theme='dark'] .rd-root[data-reader-theme='light'] {
   height: 100%;
 }
 
+/* 文本层的**宿主**（TextLayerBuilder 自己创建的 .rd-pdf-text 会挂进来）。
+   宿主只负责定位，真正的文本层样式在 PdfViewer 注入的 TEXT_LAYER_CSS 里。 */
+.rd-pdf-host {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+}
+
 .rd-pdf-text {
   z-index: 2;
   user-select: text;
+}
+
+/* PDF 链接热区（引用/目录/网址）：容器不吃事件，只有链接本身可点 —— 与 pdf.js 的
+   annotationLayer 同一套做法，这样链接能压在文本层之上而不影响其它位置的划词。 */
+.rd-links {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.rd-link {
+  position: absolute;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: auto;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.rd-link:hover {
+  background: rgba(0, 122, 255, 0.14);
+}
+
+.rd-link:focus-visible {
+  outline: 2px solid rgba(0, 122, 255, 0.6);
+  outline-offset: 1px;
 }
 
 .rd-pages-row {

@@ -182,7 +182,11 @@ export function Sidebar() {
       </div>
 
       <div className="sb-footer">
-        <button className="sb-item" onClick={addRoot} title="选择文献文件夹；对话框里也能直接选一个文献文件（自动用它的所在文件夹）">
+        <button
+          className="sb-item"
+          onClick={addRoot}
+          title="选择文献文件（可多选、可按类型筛选），会按文件所在的文件夹添加；也可以只加文件夹"
+        >
           <span className="sb-icon gray">
             <IconFolderPlus size={13} />
           </span>

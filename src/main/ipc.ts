@@ -48,41 +48,110 @@ function obj<T extends object>(v: unknown): T {
 }
 
 /**
- * 系统对话框：让用户选文献文件夹。
+ * 系统对话框：让用户挑文献。
  *
- * 关键点：**同时给出 openFile 与 openDirectory**。
- * 只给 `openDirectory` 时，Windows 的文件夹选择框里**一个文件都不列**（用户看到的是一片
- * "没有与搜索条件匹配的项"），很容易让人以为选错了文件夹；加上 `openFile` 之后，同一个
- * 对话框会像资源管理器一样列出文件（并按下面的 filters 过滤出文献类型），
- * 既能直接选文件夹，也能随手选一个 PDF —— 选文件时自动取它所在的文件夹。
+ * 为什么要用**文件对话框**而不是"选文件夹"：
+ *   - 只给 `openDirectory` 时，Windows 的选择框里**一个文件都不列**（用户看到的是
+ *     "没有与搜索条件匹配的项"，很容易以为找错文件夹了）；
+ *   - 同时给 `openFile + openDirectory` **也不行**：`openDirectory` 会把对话框变成
+ *     "只选文件夹"模式（FOS_PICKFOLDERS），文件照样不显示 —— 实测在 Windows 上就是如此。
+ * 所以这里给**纯文件**对话框 + 类型筛选：列表里能直接看到 PDF/Word/Markdown/TXT，
+ * 用户点一个（或多选），我们就用**它所在的文件夹**作为文献库。
+ * "只想选一个还没有文献的文件夹"的场景，界面里另有「手动填写路径」入口。
  */
 export interface PickedFolders {
   dirs: string[];
-  /** 用户是"直接选了文件"的个数（>0 时给个提示，让他知道按所在文件夹处理了） */
+  /** 用户选了几个文件（>0 时给个提示，让他知道按所在文件夹处理了） */
   pickedFiles: number;
 }
 
-export async function openFoldersDialog(): Promise<PickedFolders> {
+/** 上次成功选过的目录（本次会话内记住，用户再来一次时直接停在那儿） */
+let lastPickDir = '';
+
+/**
+ * 对话框的起始目录，按优先级：
+ *   ① 本次会话里上一次选过的目录；
+ *   ② 已有的第一个文献库（用户多半想加它旁边的东西）；
+ *   ③ **桌面**优先，其次「文档」，最后用户主目录。
+ *
+ * 为什么桌面优先：独立复现发现，全新用户（还没有任何文献库）时如果兜底在「文档」，
+ * 而他的文献其实放在桌面，打开对话框第一眼还是"什么都没有"，看起来就像功能没修好。
+ * 桌面上放文献/资料的人非常多，所以这里先桌面。
+ */
+export function fallbackStartDir(): string | undefined {
+  for (const key of ['desktop', 'documents', 'home'] as const) {
+    try {
+      const p = app.getPath(key);
+      if (p) return p;
+    } catch {
+      /* 试下一个 */
+    }
+  }
+  return undefined;
+}
+
+function rememberPickDir(host: { snapshot: () => { roots: { path: string }[] } }): string | undefined {
+  if (lastPickDir) return lastPickDir;
+  try {
+    const roots = host.snapshot().roots;
+    if (roots.length && roots[0].path) return roots[0].path;
+  } catch {
+    /* 拿不到就用系统目录 */
+  }
+  return fallbackStartDir();
+}
+
+/** 菜单/托盘那条路径也用同一套起始目录规则（导出给 main/index.ts） */
+export function defaultPickStartDir(host: { snapshot: () => { roots: { path: string }[] } }): string | undefined {
+  return rememberPickDir(host);
+}
+
+export async function openFoldersDialog(defaultPath?: string): Promise<PickedFolders> {
   const options: Electron.OpenDialogOptions = {
-    title: '选择文献文件夹（可直接选文件夹，也可以选一个文献文件）',
+    title: '选择文献（可多选；会按文件所在的文件夹添加）',
     buttonLabel: '添加',
-    properties: ['openFile', 'openDirectory', 'multiSelections'],
+    properties: ['openFile', 'multiSelections'],
     filters: [
       { name: '文献文件', extensions: ['pdf', 'docx', 'doc', 'md', 'markdown', 'txt', 'html', 'htm'] },
       { name: '所有文件', extensions: ['*'] },
     ],
+    // 关键：一定要给 defaultPath。不给的话 Windows 会记住"上一次用过的目录"，
+    // 很可能是一个空目录（实测会停在下 载/桌面这种地方）——用户打开对话框看到空列表，
+    // 就会以为"还是看不到文献"。
+    ...(defaultPath ? { defaultPath } : {}),
   };
   const win = BrowserWindow.getFocusedWindow();
   const result = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
   if (result.canceled || !result.filePaths.length) return { dirs: [], pickedFiles: 0 };
-  const dirs: string[] = [];
-  let pickedFiles = 0;
+  const picked: PickedPath[] = [];
   for (const p of result.filePaths) {
     const st = await stat(p).catch(() => null);
-    if (st?.isDirectory()) dirs.push(p);
-    else {
+    picked.push({ path: p, isDirectory: !!st?.isDirectory() });
+  }
+  return foldersFromPicked(picked);
+}
+
+export interface PickedPath {
+  path: string;
+  isDirectory: boolean;
+}
+
+/**
+ * 纯函数：把用户选中的路径折算成"要添加的文献库文件夹"。
+ *   - 选的是文件夹 → 就用它；
+ *   - 选的是文件 → 用**它所在的文件夹**（这就是"在对话框里直接看到 PDF 并点它"的语义）；
+ *   - 去重，保持顺序。
+ * 单独抽出来是为了能单测（对话框本身没法在 CI 里点）。
+ */
+export function foldersFromPicked(picked: PickedPath[]): PickedFolders {
+  const dirs: string[] = [];
+  let pickedFiles = 0;
+  for (const item of picked) {
+    if (item.isDirectory) {
+      dirs.push(item.path);
+    } else {
       pickedFiles += 1;
-      dirs.push(path.dirname(p));
+      dirs.push(path.dirname(item.path));
     }
   }
   return { dirs: [...new Set(dirs)], pickedFiles };
@@ -101,9 +170,10 @@ const HANDLERS: Record<string, Handler> = {
 
   // ---- 根目录 ----
   pickFolder: async ({ host }) => {
-    const { dirs, pickedFiles } = await openFoldersDialog();
+    const { dirs, pickedFiles } = await openFoldersDialog(rememberPickDir(host));
+    if (dirs[0]) lastPickDir = dirs[0];
     if (pickedFiles > 0 && dirs[0]) {
-      host.pushToast('info', '已按文件所在的文件夹添加', dirs[0], 6000);
+      host.pushToast('info', `已按文件所在的文件夹添加：${dirs[0]}`, undefined, 8000);
     }
     return dirs;
   },
@@ -189,6 +259,15 @@ const HANDLERS: Record<string, Handler> = {
       return false;
     }
     return true;
+  },
+  exportAnnotatedPdf: async ({ host }, [itemId]) => {
+    const result = await host.exportAnnotatedPdf(str(itemId));
+    if (result && result.written > 0) {
+      host.pushToast('success', `已导出带批注的 PDF 副本（${result.written} 条批注）`, result.path, 9000);
+    } else if (result) {
+      host.pushToast('info', '这篇还没有可写回的批注', result.path, 7000);
+    }
+    return result;
   },
   openDataDir: async ({ host }) => {
     const err = await shell.openPath(host.dataDir);

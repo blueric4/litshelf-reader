@@ -80,6 +80,11 @@ export interface Api {
   saveThumb(itemId: string, dataUrl: string, revision: number): Promise<string | null>;
   revealItem(itemId: string): Promise<boolean>;
   openExternal(itemId: string): Promise<boolean>;
+  /**
+   * 把这一篇的批注**写回 PDF 副本**（标准 PDF 注释，Acrobat / Zotero 也能看到；不碰原文件）。
+   * 返回新文件路径与写入/跳过条数；不支持或失败返回 null。
+   */
+  exportAnnotatedPdf(itemId: string): Promise<{ path: string; written: number; skipped: number } | null>;
   openDataDir(): Promise<boolean>;
 
   // ---- 元数据 ----

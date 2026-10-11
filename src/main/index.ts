@@ -10,7 +10,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { BrowserWindow, Menu, Tray, app, dialog, nativeImage, protocol, shell } from 'electron';
 import { Host } from '../core/host';
-import { openFoldersDialog, registerIpc } from './ipc';
+import { defaultPickStartDir, openFoldersDialog, registerIpc } from './ipc';
 
 /** 构建期由 scripts/build.mjs 的 define 注入 */
 declare const __APP_VERSION__: string;
@@ -341,7 +341,9 @@ function createTray(instance: Host): Tray | null {
       Menu.buildFromTemplate([
         { label: '显示主窗口', click: () => showMainWindow() },
         {
-          label: '添加文献文件夹…',
+          // 现在是**文件**对话框（能直接看到 PDF），选中后按文件所在文件夹入库，
+          // 所以标签不能再写"添加文献文件夹"，否则和实际行为对不上。
+          label: '添加文献（选择文件，按所在文件夹入库）…',
           click: () => {
             void addFolderViaDialog(instance);
           },
@@ -368,11 +370,13 @@ function createTray(instance: Host): Tray | null {
 // ---------------------------------------------------------------- 菜单动作
 
 async function addFolderViaDialog(instance: Host): Promise<void> {
-  // 与界面里的「添加文献文件夹」走同一条路径：对话框里既能看到文件夹、也能看到文献文件
-  const { dirs, pickedFiles } = await openFoldersDialog();
+  // 与界面里的「添加文献」走同一条路径：文件对话框里能直接看到 PDF 等文献文件，
+  // 选中后取它所在的文件夹。起始目录用同一套规则（上次选过的 → 已有文献库 → 桌面/文档），
+  // 否则 Windows 会停在上次用过的空目录里，用户一看是空的就以为功能没生效。
+  const { dirs, pickedFiles } = await openFoldersDialog(defaultPickStartDir(instance));
   if (!dirs.length) return;
   if (pickedFiles > 0) {
-    instance.pushToast('info', '已按文件所在的文件夹添加', dirs[0], 6000);
+    instance.pushToast('info', `已按文件所在的文件夹添加：${dirs[0]}`, undefined, 8000);
   }
   for (const dir of dirs) {
     try {
@@ -380,8 +384,8 @@ async function addFolderViaDialog(instance: Host): Promise<void> {
       instance.pushToast('success', `已添加「${added.root.name}」`, `发现 ${added.added} 篇文献`, 6000);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error('[litshelf] 添加文献文件夹失败', dir, err);
-      instance.pushToast('error', '添加文献文件夹失败', message, 8000);
+      console.error('[litshelf] 添加文献失败', dir, err);
+      instance.pushToast('error', '添加文献失败', message, 8000);
     }
   }
   showMainWindow();
@@ -416,7 +420,7 @@ function buildMenu(instance: Host): void {
     {
       label: '文件',
       submenu: [
-        { label: '添加文献文件夹…', accelerator: 'CmdOrCtrl+O', click: () => void addFolderViaDialog(instance) },
+        { label: '添加文献（选择文件，按所在文件夹入库）…', accelerator: 'CmdOrCtrl+O', click: () => void addFolderViaDialog(instance) },
         { label: '重新扫描', click: () => void instance.scanAll().catch((err) => console.error('[litshelf] 重新扫描失败', err)) },
         { label: '导出库…', click: () => void exportLibraryViaMenu(instance) },
         { type: 'separator' },

@@ -142,6 +142,8 @@ const HANDLERS: Record<string, Handler> = {
   saveThumb: (host, [itemId, dataUrl, revision]) => host.saveThumb(str(itemId), str(dataUrl), num(revision)),
   revealItem: () => false,
   openExternal: () => false,
+  // 浏览器形态没有"写回真实 PDF"这件事（文件在宿主磁盘上），明确返回 null，界面会给提示
+  exportAnnotatedPdf: () => null,
   openDataDir: () => false,
 
   completeMetadata: (host, [ids]) => host.completeMetadata(strList(ids)),

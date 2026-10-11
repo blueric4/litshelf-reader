@@ -7,7 +7,7 @@
  *     *.dll / *.pak / locales/   ← Electron 运行时
  *     resources/app/             ← 我们的程序
  *        package.json
- *        dist/**                 ← 构建产物（主进程/预加载/渲染层/pdf worker/cmaps/字体）
+ *        dist/**                 ← 构建产物（主进程/预加载/渲染层/pdf worker/cmaps/字体/wasm/iccs）
  *        node_modules/**         ← 主进程运行时需要的生产依赖（devDependencies 不入包）
  *     使用说明.txt
  *

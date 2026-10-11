@@ -492,6 +492,80 @@ export function ReaderView(): React.ReactElement | null {
 
   // ---------------------------------------------------------------- 跳转目标
   const lastToken = useRef(-1);
+  /**
+   * 找到 PDF 真正的滚动容器。
+   *
+   * 血泪教训（task-14 探针实测）：上一版写的是 `document.querySelector('.rd-scroll') ?? scrollRef.current`，
+   * 而 PDF 分支下**这两个都是空**：
+   *   · 类名写错了 —— 真正的容器在 PdfViewer 里叫 `.rd-pdf-scroll`（grep 全仓没有 `.rd-scroll` 这个元素）；
+   *   · `scrollRef` 只传给了 TextReader / EpubReader，PDF 分支下 `scrollRef.current` 是 null。
+   * 于是 `scrollToPageY()` 在第一行 `if (!scroll) return` 就静默退出：页面被 `goToPage()` 跳到页首，
+   * "那一句话"永远不滚进来（探针：批注距视口顶 1303px / 视口高 844px）。
+   *
+   * 所以这里不写死一个类名：先取 `.rd-pdf-scroll`，再从页槽往上找第一个"真的能滚"的祖先，
+   * 最后才退回 scrollRef —— 以后再改 DOM 结构也不会静默失效。
+   */
+  const findPdfScroller = useCallback((): HTMLElement | null => {
+    const canScroll = (el: HTMLElement | null): boolean =>
+      !!el && el.scrollHeight > el.clientHeight + 2 && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY);
+    const direct = document.querySelector<HTMLElement>('.rd-pdf-scroll');
+    if (canScroll(direct)) return direct;
+    let el: HTMLElement | null =
+      document.querySelector<HTMLElement>('.rd-page-slot') ?? document.querySelector<HTMLElement>('.rd-pdf-page');
+    while (el && el !== document.body) {
+      if (canScroll(el)) return el;
+      el = el.parentElement;
+    }
+    if (canScroll(scrollRef.current)) return scrollRef.current;
+    return direct; // 还没布局完（scrollHeight==clientHeight）：先返回它，让调用方下一拍再量
+  }, []);
+
+  /**
+   * 把某一页的某个**页内纵向位置**（0–1，y 向下）**一次**滚到视口约 35% 高处。
+   *
+   * 为什么必须"一次"：点批注的路径里**不能再先调 `goToPage()`**。
+   * `goToPage()` 会把页首对齐一次（`align(0)` + 80ms 后的复校），紧接着我们才把那句话抬到 35% 处，
+   * 用户看到的就是"先跳到页首、再跳到句子"两段位移。
+   * 实测（Lead 给的数字）：ΔscrollTop 2837 = 1829（页首对齐）+ 1008（句子校正），
+   * 而且第一段会被 +80ms 复校顶回去，绕着校到第 5 拍（≈650ms）才停。
+   *
+   * 改成：按页槽几何**直接算绝对目标**，只发一次 `scrollTo({behavior:'smooth'})`
+   *   target = 页槽在容器可视区内的偏移 + yRatio × 页槽高 − 0.35 × 视口高
+   * 页码与渲染集合不靠这里维护：滚动上报（PdfViewer 的 scroll 监听 → onPageChange → currentPage）
+   * 自然会跟上；调用方只需同时把 `page` / `pageInput` 设好。
+   *
+   * 只在"页槽/容器还没量出来"时短暂重试**测量**（60ms×≤10），绝不二次校正 —— 否则又是两段可见位移。
+   */
+  const scrollToPageY = useCallback(
+    (pageNumber: number, yRatio: number) => {
+      const ratio = Math.max(0, Math.min(1, Number.isFinite(yRatio) ? yRatio : 0));
+      const slotSelector = `.rd-page-slot[data-page-index="${pageNumber - 1}"], .rd-pdf-page[data-page-index="${pageNumber}"]`;
+      let tries = 0;
+      const tick = () => {
+        const scroll = findPdfScroller();
+        const slot = scroll ? scroll.querySelector<HTMLElement>(slotSelector) : null;
+        if (scroll && slot && slot.clientHeight > 0 && scroll.clientHeight > 0) {
+          const sr = scroll.getBoundingClientRect();
+          const pr = slot.getBoundingClientRect();
+          // 批注那句话相对容器可视区顶部的距离（口径与探针一致：clientTop + clientHeight）
+          const offsetInView = pr.top - (sr.top + scroll.clientTop) + ratio * slot.clientHeight;
+          const max = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
+          const target = Math.max(0, Math.min(max, scroll.scrollTop + offsetInView - scroll.clientHeight * 0.35));
+          const from = Math.round(scroll.scrollTop);
+          scroll.scrollTo({ top: target, behavior: 'smooth' });
+          console.debug(
+            `[reader] 批注跳转（一步到位）：第 ${pageNumber} 页 y=${ratio.toFixed(3)} → scrollTop ${from}→${Math.round(target)}（视口高 ${scroll.clientHeight}，页槽高 ${slot.clientHeight}）`,
+          );
+          return;
+        }
+        tries += 1;
+        if (tries < 10) window.setTimeout(tick, 60);
+      };
+      tick();
+    },
+    [findPdfScroller],
+  );
+
   useEffect(() => {
     if (!readerTarget || readerTarget.token === lastToken.current) return;
     lastToken.current = readerTarget.token;
@@ -501,7 +575,16 @@ export function ReaderView(): React.ReactElement | null {
         setTab('annotations');
         setPanelOpen(true);
         flash(found.id);
-        if (isPdf && pdf.doc) viewerRef.current?.goToPage(found.page);
+        if (isPdf && pdf.doc) {
+          // **不调 goToPage()**：它会把页首对齐一次，用户就看到"先跳页、再跳句"两段位移。
+          // 页码状态在这里直接摆正（工具条页码、书签位置都用它）；页面渲染集合与页码指示器
+          // 由滚动上报（PdfViewer 的 scroll 监听 → onPageChange → currentPage）自己跟上。
+          setPage(found.page);
+          setPageInput(String(found.page));
+          // 跳到"那一句话"而不只是那一页：按批注第一个矩形的 y 位置一次滚过去
+          const y = found.rects[0]?.y ?? 0;
+          scrollToPageY(found.page, y);
+        }
         return;
       }
     }
@@ -595,6 +678,33 @@ export function ReaderView(): React.ReactElement | null {
   }, [searchInput, searchOpen, searchQuery, runSearch]);
 
   // ---------------------------------------------------------------- 工具栏动作
+  /**
+   * 把批注写回 PDF 副本（标准 PDF 注释）。原文件不动，副本落在同一目录，
+   * 成功/失败都走 toast；成功后再问一句"要不要在文件夹里显示"——不，直接给个提示就行。
+   */
+  const exportAnnotated = useCallback(async () => {
+    if (!item) return;
+    if (capabilities.mode !== 'electron') {
+      pushToast({ kind: 'info', message: '浏览器形态不支持把批注写回 PDF', detail: '请用桌面版打开这一篇再导出' });
+      return;
+    }
+    pushToast({ kind: 'info', message: '正在写入批注…', detail: item.name });
+    const res = await api.exportAnnotatedPdf(item.id).catch(() => null);
+    if (!res) {
+      pushToast({ kind: 'warn', message: '没能写入批注副本', detail: '这一篇可能不是 PDF，或文件已不可读' });
+      return;
+    }
+    if (res.written === 0) {
+      pushToast({ kind: 'info', message: '这篇还没有可写回的批注', detail: res.path });
+      return;
+    }
+    pushToast({
+      kind: 'success',
+      message: `已导出副本（${res.written} 条批注${res.skipped ? `，跳过 ${res.skipped} 条` : ''}）`,
+      detail: res.path,
+    });
+  }, [item, capabilities.mode, pushToast]);
+
   const revealItem = useCallback(() => {
     if (!item) return;
     if (!capabilities.revealInFolder) {
@@ -769,13 +879,16 @@ export function ReaderView(): React.ReactElement | null {
   }, [item, page, createAnnotation]);
 
   const jumpTo = useCallback(
-    (targetPage?: number, annotationId?: string) => {
+    (targetPage?: number, annotationId?: string, pageOnlyState = false) => {
       if (annotationId) {
         flash(annotationId);
         setTab('annotations');
       }
       if (targetPage) {
         setPage(targetPage);
+        // pageOnlyState：只摆正页码状态，**不**把页首对齐（点批注那条路要一次滚到句子，
+        // 否则先页首、再句子 = 两段可见位移；见 onOutlineJump / scrollToPageY 的说明）
+        if (pageOnlyState) return;
         if (isPdf && pdf.doc) viewerRef.current?.goToPage(targetPage);
         else if (scrollRef.current && totalPages > 1) {
           const el = scrollRef.current;
@@ -795,7 +908,11 @@ export function ReaderView(): React.ReactElement | null {
         setTab('outline');
         return;
       }
-      jumpTo(targetPage, annotationId);
+      // 带 annotationId（点侧栏批注）时**不要**在这里跳页：
+      // `jumpTo` 会调 `goToPage()` 把页首对齐一次，紧接着 readerTarget effect 才滚到那句话，
+      // 用户看到的就是"先跳页首、再跳句子"两段位移。这时只摆正页码状态，
+      // 句子级的滚动交给 effect 里的 scrollToPageY（一次 smooth 到位）。
+      jumpTo(targetPage, annotationId, Boolean(annotationId));
       if (annotationId) jumpInReader(targetPage, annotationId);
     },
     [isPdf, jumpTo, jumpInReader],
@@ -1280,6 +1397,14 @@ export function ReaderView(): React.ReactElement | null {
               <div className="menu-sep" />
               <button type="button" className="menu-item" onClick={() => { setMenuOpen(false); void copyCitation(); }}>
                 复制引用
+              </button>
+              <button
+                type="button"
+                className="menu-item"
+                title="把这一篇的批注写成标准 PDF 注释，存成副本（原文件不动）；Acrobat / Zotero 里也能看到"
+                onClick={() => { setMenuOpen(false); void exportAnnotated(); }}
+              >
+                导出带批注的 PDF 副本
               </button>
               <button type="button" className="menu-item" onClick={() => { setMenuOpen(false); void rebuildIndex(); }}>
                 重建全文索引

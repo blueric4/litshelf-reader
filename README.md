@@ -223,13 +223,22 @@ docs/                 截图与本仓库的改动说明（docs/CHANGELOG.md）
 ## 自己验收（可复现）
 
 ```bash
-pnpm test                                                              # ① 209 个单元测试
+pnpm test                                                              # ① 268 个单元测试
 node tools/build-tools.mjs tools/verify-core.ts && node tools/verify-core.mjs   # ② 核心链路 51 项断言
 node tools/e2e-desktop.mjs                                             # ③ 桌面端到端 26 项断言
 node tools/acceptance.mjs                                              # ④ 补充验收 37 项断言
 node tools/acceptance-cjk.mjs                                          # ⑤ 中文划词与缩放专项 17 项断言
 node tools/acceptance-ux.mjs                                           # ⑥ UX 回归 90 项断言
+node tools/acceptance-selection.mjs                                    # ⑦ 划词手感 45 项断言（行间距/拖到空白/反向/批注）
+node tools/acceptance-stability.mjs                                    # ⑧ 渲染与文本层稳定性 70 项断言（含故障注入）
 ```
+
+⑦ 专门守"划词像 Word"这条线：指针停在**行间距**里只能在本行延伸、拖到页面空白不能全选、
+反向拖选与正向同量级，并同时验证工具条/批注链路。⑧ 守渲染与文本层生命周期：反复开关 12 轮、
+开关秒断、缩放风暴、跳页风暴、连续切换论文、canvas 不泄漏；最后一项是**故障注入**——
+让一次 `page.render()` 永不 settle，检查"超时取消 + 继续"这条兜底真的能救回来
+（改前会永久白屏、改后约 3 秒自愈）。两套都用真实中文期刊 PDF 与真实鼠标事件，跑完自动清进程。
+
 
 六套都跑真实代码：② 用真文件、真 PDF、真文件监听；③④⑤⑥ 启动真窗口并用 CDP 派发真实的鼠标与键盘事件；① 里的原子写、指纹、文件对账用例也在真实临时目录上跑。③④⑤⑥ 用 `LITSHELF_DATA_DIR` 把库索引、笔记、批注、缓存写进隔离数据目录（`tmp/e2e-data`、`tmp/acceptance-data`、`tmp/cjk-acceptance-data`、`tmp/ux-acceptance-data`），② 直接把 `Host` 的数据目录指向 `tmp/verify-<时间戳>/data`——五套都不会碰你真实的文献库。三个约定：③ 与 ④ 都用调试端口 9222，**必须串行跑**（⑤ 用 9111、⑥ 用 9444）；④ 复用 ③ 生成的示例 PDF，缺夹具时会直接提示先跑 ③；⑤ 与 ⑥ 各自现场造夹具（中文 PDF / 3 页 PDF），不依赖别的脚本，也不往 `文档` 目录写东西。
 

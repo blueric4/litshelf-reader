@@ -144,6 +144,7 @@ export const api: Api = {
   saveThumb: (itemId, dataUrl, revision) => call('saveThumb', [itemId, dataUrl, revision]),
   revealItem: (itemId) => call('revealItem', [itemId]).catch(() => false),
   openExternal: (itemId) => call('openExternal', [itemId]).catch(() => false),
+  exportAnnotatedPdf: (itemId) => call('exportAnnotatedPdf', [itemId]).catch(() => null),
   openDataDir: () => call('openDataDir', []).catch(() => false),
 
   completeMetadata: (ids) => call('completeMetadata', [ids]),

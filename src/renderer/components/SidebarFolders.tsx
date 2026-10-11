@@ -1,5 +1,9 @@
 /**
  * 侧边栏的文献库文件夹树：每个根目录一棵可展开的树，节点右侧是在该目录下的文献数。
+ *
+ * 添加入口有两条（系统文件对话框选不了文件夹，两条都得留着）：
+ *   1. 「选择文献文件」→ 原生**文件**对话框（多选），按文件所在的文件夹入库；
+ *   2. 「手动填写路径」→ 直接填文件夹路径，文件夹里还没有文献时用这条。
  */
 import { useMemo } from 'react';
 import type { Item } from '@shared/types';
@@ -7,7 +11,11 @@ import { useStore } from '../state/store';
 import { isFolderMatch } from '../state/selectors';
 import { api } from '../bridge';
 import { confirmDialog, promptDialog, usePopup } from './Overlays';
-import { IconChevronRight, IconFolder, IconFolderPlus, IconRefresh, IconTrash, IconWarning, IconX } from './Icons';
+import { IconChevronRight, IconFileText, IconFolder, IconFolderPlus, IconRefresh, IconTrash, IconWarning, IconX } from './Icons';
+
+/** 两个添加入口的悬停提示：空库与有库两处都用同一份文案 */
+const FILE_PICK_HINT = '选择文献文件（可多选、可按类型筛选）；会按文件所在的文件夹添加';
+const PATH_HINT = '手动填写路径：文件夹里还没有文献时用这个';
 
 interface TreeNode {
   name: string;
@@ -67,15 +75,9 @@ export function SidebarFolders() {
     [roots, folderTree, items],
   );
 
-  const addRoot = async () => {
-    const caps = useStore.getState().capabilities;
-    let picked: string[] = [];
-    if (caps.nativeDialogs) picked = await api.pickFolder().catch(() => []);
-    else {
-      const typed = await promptDialog({ title: '添加文献文件夹', message: '请填写文件夹完整路径', placeholder: 'D:\\文献', confirmLabel: '添加' });
-      if (typed) picked = [typed];
-    }
-    for (const dir of picked) {
+  /** 把文件夹加入文献库（同一个目录只加一次） */
+  const addDirs = async (dirs: string[]) => {
+    for (const dir of [...new Set(dirs)]) {
       try {
         await api.addRoot(dir, { depth: 8 });
         pushToast({ kind: 'success', message: '已添加文献库', detail: dir });
@@ -86,12 +88,43 @@ export function SidebarFolders() {
     }
   };
 
+  /**
+   * 手动填写路径：系统文件对话框只能选文件，"只想加一个文件夹"
+   * （尤其是文件夹里还没有文献）必须留这条入口，不能藏在 nativeDialogs 的 else 分支里。
+   */
+  const addByPath = async () => {
+    const typed = await promptDialog({
+      title: '手动填写路径',
+      message: (
+        <>
+          填写文献文件夹的完整路径，例如 <b>D:\文献</b>。文件夹里暂时还没有文献也可以，之后放进去的会自动入库。
+        </>
+      ),
+      placeholder: 'D:\\文献',
+      confirmLabel: '添加',
+    });
+    if (typed) await addDirs([typed]);
+  };
+
+  /** 选文献文件：桌面版走原生文件对话框（多选，按文件所在文件夹入库），浏览器形态退化成手填路径 */
+  const pickFiles = async () => {
+    const caps = useStore.getState().capabilities;
+    if (!caps.nativeDialogs) {
+      await addByPath();
+      return;
+    }
+    await addDirs(await api.pickFolder().catch(() => []));
+  };
+
   if (!roots.length) {
     return (
       <div className="sb-section">
         <div className="sb-section-title">文献库</div>
-        <button className="sb-add" onClick={addRoot}>
-          <IconFolderPlus size={13} /> 选择文献文件夹
+        <button className="sb-add" onClick={pickFiles} title={FILE_PICK_HINT}>
+          <IconFileText size={13} /> 选择文献文件（可多选）
+        </button>
+        <button className="sb-add" style={{ color: 'var(--text-2)' }} onClick={addByPath} title={PATH_HINT}>
+          <IconFolderPlus size={13} /> 手动填写路径
         </button>
       </div>
     );
@@ -101,9 +134,14 @@ export function SidebarFolders() {
     <div className="sb-section">
       <div className="sb-section-title">
         <span>文献库</span>
-        <button className="icon-btn" style={{ width: 20, height: 20 }} title="添加文件夹" onClick={addRoot}>
-          <IconFolderPlus size={12} />
-        </button>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+          <button className="icon-btn" style={{ width: 20, height: 20 }} title={FILE_PICK_HINT} onClick={pickFiles}>
+            <IconFileText size={12} />
+          </button>
+          <button className="icon-btn" style={{ width: 20, height: 20 }} title={PATH_HINT} onClick={addByPath}>
+            <IconFolderPlus size={12} />
+          </button>
+        </span>
       </div>
       {trees.map(({ root, nodes, count }) => (
         <RootRow key={root.id} rootId={root.id} name={root.name} path={root.path} count={count} available={root.available} enabled={root.enabled}>

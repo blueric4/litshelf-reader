@@ -36,6 +36,14 @@ import { searchItems, parseQuery } from './search';
 import { reanchorAnnotation } from './reanchor';
 import { exportContent, formatCitation, EXPORT_EXT } from './export';
 
+/** 批注颜色名 → 0–1 RGB（写回 PDF 时用；名字与界面上的高亮色一致） */
+const HIGHLIGHT_RGB: Record<string, [number, number, number]> = {
+  yellow: [1, 0.85, 0.2],
+  green: [0.45, 0.85, 0.4],
+  blue: [0.35, 0.68, 1],
+  pink: [1, 0.55, 0.72],
+  purple: [0.68, 0.55, 1],
+};
 export interface HostOptions {
   dataDir: string;
   mode: 'electron' | 'web';
@@ -903,12 +911,52 @@ export class Host {
     }
   }
 
-  // ------------------------------------------------------------ 文件访问
+  
+// ------------------------------------------------------------ 文件访问
 
-  resolveFile(itemId: string): { path: string; size: number; ext: string; revision: number; kind: string } | null {
-    const item = this.library.get(itemId);
+  resolveFile(itemId: string): { path: string; size: number; ext: string; revision: number; kind: string } | null {    const item = this.library.get(itemId);
     if (!item || item.missing) return null;
     return { path: item.path, size: item.size, ext: item.ext, revision: item.revision, kind: item.kind };
+  }
+
+  /**
+   * 把这一篇的批注**写回 PDF 副本**（不碰原文件）。
+   *
+   * 目的：批注不再只锁在我们自己的库里 —— 导出的副本里是标准 PDF 注释，
+   * Acrobat / Zotero / 浏览器都能直接看到。文件名默认 `<原名>（LitShelf 批注）.pdf`，
+   * 已存在就加 ` (2)`、` (3)`…；返回实际写出的路径与条数。
+   */
+  async exportAnnotatedPdf(itemId: string): Promise<{ path: string; written: number; skipped: number } | null> {
+    const resolved = this.resolveFile(itemId);
+    if (!resolved) return null;
+    // 注意：条目里的 `ext` 是**不带点**的（"pdf"），别拿 ".pdf" 去比 —— 踩过：那样永远返回 null。
+    if (resolved.ext.toLowerCase().replace(/^\./, '') !== 'pdf') return null;
+    const list = this.annotations.list(itemId).filter((a) => a.type !== 'bookmark' && a.type !== 'note' && a.rects.length);
+    const stat = await statSafe(resolved.path);
+    if (!stat?.isFile) return null;
+
+    const source = new Uint8Array(await fs.readFile(resolved.path));
+    const { writeAnnotationsIntoPdf } = await import('./pdf-annotate');
+    const { bytes, written, skipped } = await writeAnnotationsIntoPdf(
+      source,
+      list.map((a) => ({
+        page: a.page,
+        kind: a.type as 'highlight' | 'underline' | 'squiggly' | 'strikeout',
+        rects: a.rects.map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h })),
+        color: HIGHLIGHT_RGB[a.color] ?? HIGHLIGHT_RGB.yellow,
+        note: a.comment ?? undefined,
+        quote: a.text ?? undefined,
+      })),
+    );
+
+    const dir = path.dirname(resolved.path);
+    const base = path.basename(resolved.path, path.extname(resolved.path));
+    let target = path.join(dir, `${base}（LitShelf 批注）.pdf`);
+    for (let i = 2; i < 50 && (await exists(target)); i += 1) {
+      target = path.join(dir, `${base}（LitShelf 批注）(${i}).pdf`);
+    }
+    await fs.writeFile(target, bytes);
+    return { path: target, written, skipped };
   }
 
   async readTextFile(itemId: string): Promise<{ text: string; encoding: string } | null> {
@@ -989,7 +1037,10 @@ export class Host {
   }
 
   addAnnotation(input: Omit<Annotation, 'id' | 'createdAt' | 'updatedAt' | 'reanchored' | 'needsReview'> & { id?: string }): Annotation {
-    const a = this.annotations.add(input);
+    // 兜底：批注面板取色是 `HIGHLIGHT_COLORS[color].light`，color 缺失会让整棵面板渲染树崩掉
+    // （独立验证用 IPC 造批注时踩到过：TypeError: Cannot read properties of undefined (reading 'light')）。
+    // 界面自己的路径永远带 color，这里只是不让非法输入把界面带崩。
+    const a = this.annotations.add({ ...input, color: input.color ?? 'yellow' });
     this.syncAnnotationCounts(a.itemId);
     const item = this.library.get(a.itemId);
     if (item) this.emitItems([item]);

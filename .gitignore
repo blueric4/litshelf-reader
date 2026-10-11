@@ -18,6 +18,9 @@ tmp/
 src/renderer/public/pdf.worker.min.mjs
 src/renderer/public/cmaps/
 src/renderer/public/standard_fonts/
+# 图片解码资源：CMYK JPEG 的 ICC（qcms）与 JPEG2000/JBIG2 解码器，缺了图片会变灰块
+src/renderer/public/wasm/
+src/renderer/public/iccs/
 
 # 编辑器 / 系统
 .vscode/

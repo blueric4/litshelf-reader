@@ -28,11 +28,20 @@ const abs = (...parts) => path.join(ROOT, ...parts);
 
 // ---------------------------------------------------------------- 资源同步
 
-/** pdf.js 的 worker / cmaps / 标准字体：阅读器离线渲染（尤其是中文 PDF）的关键资源 */
+/**
+ * pdf.js 的离线渲染资源。
+ *
+ * **wasm/ 与 iccs/ 千万别漏**：pdf.js v5 用它们解码 JPEG2000（openjpeg.wasm）、
+ * JBIG2（jbig2.wasm），以及给 **CMYK JPEG 套 ICC 色彩配置**（qcms_bg.wasm + iccs/）。
+ * 少了它们，中文期刊里那种 CMYK 照片会渲染成**一块灰色**（用户报的"图片显示不出来"），
+ * JPX/JBIG2 图则直接不画。
+ */
 const ASSETS = [
   { from: abs('node_modules/pdfjs-dist/build/pdf.worker.min.mjs'), to: abs('src/renderer/public/pdf.worker.min.mjs') },
   { from: abs('node_modules/pdfjs-dist/cmaps'), to: abs('src/renderer/public/cmaps') },
   { from: abs('node_modules/pdfjs-dist/standard_fonts'), to: abs('src/renderer/public/standard_fonts') },
+  { from: abs('node_modules/pdfjs-dist/wasm'), to: abs('src/renderer/public/wasm') },
+  { from: abs('node_modules/pdfjs-dist/iccs'), to: abs('src/renderer/public/iccs') },
 ];
 
 /** 目标已存在且不比源旧 → 跳过（幂等） */
