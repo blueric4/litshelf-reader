@@ -18,7 +18,14 @@ import { buildAnchorFromNormalized, buildPageTextMap, normIndexFromNode, type Pa
 import type { TextLayerBuilder as TextLayerBuilderType } from 'pdfjs-dist/web/pdf_viewer.mjs';
 import { loadPageLinks, resolveInternalPage, type PageLink } from './links';
 import { findHighlightStrips, hitCountOfStrips, type HighlightStrip } from './search';
-import { bandIndexOf, columnBandsFromItems, columnRegionsFromItems, nearestBandIndexOf } from './columnBands';
+import {
+  bandIndexOf,
+  columnBandsFromItems,
+  columnRegionsFromItems,
+  itemsInViewSpace,
+  itemXRangesFromItems,
+  nearestBandIndexOf,
+} from './columnBands';
 import { orderTextSpans } from './textOrder';
 
 /**
@@ -36,6 +43,12 @@ interface RegionRatio {
   /** 重排时是否按本区的栏排序（整页模型多栏才为 true；单栏页保持老的 orderTextSpans 路径） */
   orderByBands?: boolean;
 }
+
+/**
+ * 取文本项的参数与 TextLayerBuilder（`streamTextContent`）保持一致：文本层的 span 就是按这一份
+ * 文本项一个一个建的，栏带与打标都要和它一一对应（不一致时 span 序号与文本项序号错位）。
+ */
+const TEXT_LAYER_PARAMS = { includeMarkedContent: true, disableNormalization: true } as const;
 
 /** 某个 y 比例落在哪个分区；落在分区之间的缝隙时取最近的一个 */
 function regionIndexAtY(regions: readonly RegionRatio[], y: number): number {
@@ -443,10 +456,10 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     void (async () => {
       try {
         const page = await doc.getPage(pageNumber);
-        const content = await page.getTextContent();
+        const content = await page.getTextContent(TEXT_LAYER_PARAMS);
         const viewport = page.getViewport({ scale: 1 });
         // pdf.js 的 items 里混有 TextMarkedContent（只有 type、没有几何），没有 str 的一律丢掉
-        const textItems = content.items.filter((it) => 'str' in it);
+        const textItems = itemsInViewSpace(content.items.filter((it) => 'str' in it), page.view);
         /**
          * 分区**始终**算（不再用"整页单栏"这种页面级结论关掉夹取 —— 有整幅图/图注/表格的页面上，
          * 图注/表格行会把栏缝覆盖统计压过、全局模型误判成 1 栏，夹取被整个关掉，于是正文里拖 2~3 行
@@ -709,6 +722,30 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     };
 
     /**
+     * 把每个 span 与它的文本项横向范围绑在一起（写进 dataset，夹取时直接读）。
+     *
+     * pdf.js 对每个 `str` 非空的文本项恰好建一个 span，且按项序建（见 TextLayer#processItems / #appendText）；
+     * 而 DOM 之后会被 reorderTextLayer 重排，所以**只能在第一次挂上、重排之前**按创建顺序打标，
+     * 并用 `layer.dataset.spanGeom` 记住"已经打过"，重绘（update 路径）时不再按（已乱序的）DOM 重打。
+     * 数量对不上就整层不打标——夹取会退回 DOM 判据，而不是按错位的映射去夹。
+     */
+    const tagTextSpans = (layer: HTMLElement, xs: readonly ({ x0: number; x1: number } | null)[]): void => {
+      if (layer.dataset.spanGeom) return;
+      layer.dataset.spanGeom = '1';
+      const leaves = [...layer.querySelectorAll<HTMLElement>('span:not(.markedContent)')];
+      if (!xs.length || leaves.length !== xs.length) {
+        console.debug(`[reader] 第 ${pageNumber} 页 span 与文本项数量不一致（${leaves.length}/${xs.length}），不打横向标记`);
+        return;
+      }
+      leaves.forEach((s, i) => {
+        const g = xs[i];
+        if (!g) return;
+        s.dataset.x0 = String(g.x0);
+        s.dataset.x1 = String(g.x1);
+      });
+    };
+
+    /**
      * 把文本层的 span 按**视觉阅读顺序**重排（见 textOrder.ts 的说明）。
      *
      * 为什么必须做：pdf.js 按内容流顺序追加 span，多栏页面上它不等于阅读顺序；
@@ -825,15 +862,20 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       if (!host) return false;
       /**
        * 重排用的**版式分区**（页宽/页高比例 0~1）：来自 pdf.js 文本项，见 columnBands.ts。
-       * `getTextContent()` 刚被 TextLayerBuilder 拉过，pdf.js 会缓存，这里几乎不花时间。
+       * 取文本项用的参数与 TextLayerBuilder 完全一致（TEXT_LAYER_PARAMS），两边的文本项才一一对应。
        * 拿不到就退化成"按行横跨"的旧排序——不会更糟。
        */
       let regions: RegionRatio[] = [];
+      /** 每个 span（按文本项序）对应的文本项横向范围，页宽比例；拿不到就留空，夹取退回 DOM 判据 */
+      let itemXs: ({ x0: number; x1: number } | null)[] = [];
       try {
-        const content = await page.getTextContent();
-        const items = content.items.filter((it) => 'str' in it);
+        const content = await page.getTextContent(TEXT_LAYER_PARAMS);
+        const items = itemsInViewSpace(content.items.filter((it) => 'str' in it), page.view);
         const unscaledW = viewport.width / viewport.scale;
         const unscaledH = viewport.height / viewport.scale;
+        // pdf.js 只给 str 非空的项挂 span（见 TextLayer 的 #appendText：hasText 为假不入 DOM），打标与之对齐
+        const drawn = items.filter((it) => (it.str ?? '') !== '');
+        itemXs = itemXRangesFromItems(drawn).map((g) => (g ? { x0: g.x0 / unscaledW, x1: g.x1 / unscaledW } : null));
         // 分区照算（夹取用）；重排是否按栏排序看整页模型是否多栏（见 reorderTextLayer 的门）
         const orderBands = columnBandsFromItems(items as Parameters<typeof columnBandsFromItems>[0], {
           pageWidth: unscaledW,
@@ -884,6 +926,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         if (cancelled) return false;
         const layer = textLayerEl();
         if (layer?.querySelector('span')) {
+          tagTextSpans(layer, itemXs);
           reorderTextLayer(layer, regions);
           return true;
         }
@@ -1775,7 +1818,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           // 同栏的正常选区不动它（**强制重算时例外**：DOM 变动后它"看起来同栏"正是被重新解释的结果）；
           // 焦点定不到 span（容器）时按"跨栏"处理
           if (!force && focusSpan && focusBand === anchorBand) return false;
-          const spans = [...page.querySelectorAll<HTMLElement>('.rd-pdf-text span')].filter(
+          const spans = [...page.querySelectorAll<HTMLElement>('.rd-pdf-text span:not(.markedContent)')].filter(
             (s) => (s.textContent ?? '').trim().length > 0,
           );
           /**
@@ -1801,9 +1844,20 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
             const rr = r.right - pageRect.left;
             return rr <= safeHi && l >= safeLo;
           };
-          // 本栏的 span 用**严格判定**（中心点确实落在锚点栏里）+ 安全区，别用"最近栏"兜底，
-          // 否则栏缝外那一列的第一个 span 会被算进来，夹取结果会多出半栏。
-          const inAnchor = spans.filter((s) => bandIndexOf(bands, ratioOf(s)) === anchorBand && safeEndpoint(s));
+          /**
+           * 端点归属**只认文本项几何**（span 上打的 data-x0/x1，见 tagTextSpans）：文本项整段落在本栏
+           * （容差 2px）才是候选。两端对齐时行末的汉字可能被推进栏缝，它的文本项会越过本栏右界，
+           * 于是不是候选 —— 这正是 613 泄漏的真因（DOM 中心/rect 判会把它算进本栏）。
+           * 打标失败的页（没有 x0/x1）才退回上面的 DOM 判据。
+           */
+          const endpointInBand = (s: HTMLElement): boolean => {
+            if (s.dataset.x0 !== undefined && s.dataset.x1 !== undefined) {
+              const tol = 2 / pageRect.width;
+              return Number(s.dataset.x0) >= band.start - tol && Number(s.dataset.x1) <= band.end + tol;
+            }
+            return bandIndexOf(bands, ratioOf(s)) === anchorBand && safeEndpoint(s);
+          };
+          const inAnchor = spans.filter(endpointInBand);
           if (!inAnchor.length) return false;
           // 往前拖（按下点在前）夹到本栏末尾，往回拖夹到本栏开头；焦点不在 span 上时用指针 x 判方向。
           // 强制重算时用上次记下的方向（DOM 变动后 compareDocumentPosition 已经不可信）。
@@ -2028,6 +2082,9 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           null;
         if (!host) return;
         layerObserver = new MutationObserver(() => {
+          // 拖动期间不干预：pdf.js 自己拖动时会搬 `.endOfContent` 触发这里，
+          // 一旦回写旧区间就会把用户正在拖的选区打碎（用户实测的"1~3 字小选区"）
+          if (pressed) return;
           if (!lockedRange || Date.now() > guardUntil) {
             stopGuard();
             return;
@@ -2128,6 +2185,12 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
         watchLayer();
         if (relockTimer) return;
         relockTimer = window.setInterval(() => {
+          /**
+           * **拖动期间绝对不许改写选区**（用户实测：按着鼠标一次性快拖时，会出现"1 个、2 个、3 个字"
+           * 的小选区 —— 就是因为看护窗口没结束用户又开始拖，这个 120ms 的定时器把**上一次锁定的旧区间**
+           * 写回选区，把人正在拖的选区打碎）。看护只服务于"松手之后"。
+           */
+          if (pressed) return;
           if (Date.now() > guardUntil || !lockedRange) {
             stopGuard();
             return;
@@ -2139,6 +2202,8 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
 
       /** 看护窗口内：把选区套回锁定的那个（锁失效则返回 false，交回正常流程） */
       const applyLocked = (): boolean => {
+        // 拖动中一律不改写选区：任何"套回旧区间"的动作都会和用户正在进行的拖动打架
+        if (pressed) return false;
         if (!lockedRange) return false;
         if (!document.contains(lockedRange.startContainer) || !document.contains(lockedRange.endContainer)) {
           stopGuard(); // 边界节点已脱离文档：锁没意义了，定时器/监听一起收掉

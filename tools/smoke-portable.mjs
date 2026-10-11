@@ -124,7 +124,7 @@ try {
   await sleep(1200);
 
   // 库是否加载（打包后路径/资源有问题的话这里就空了）
-  const snap = await cdp.eval(`(async () => { const s = await window.litshelf.invoke('getSnapshot', []); return { items: s.items.length, roots: s.roots.length, version: s.app?.version ?? '?' }; })()`);
+  const snap = await cdp.eval(`(async () => { const s = await window.litshelf.invoke('getSnapshot', []); return { items: s.items.length, roots: s.roots.length, version: s.version ?? '?' }; })()`);
   console.log(`  库：条目 ${snap.items} / 库 ${snap.roots} / 版本 ${snap.version}`);
   check(snap.items > 0, `库加载正常（${snap.items} 条）`);
 

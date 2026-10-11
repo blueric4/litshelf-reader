@@ -116,8 +116,9 @@ const MODEL = (pageNo) => `
     const page = document.querySelector('.rd-pdf-page[data-page-index="${pageNo}"]');
     if (!page) return null;
     const pr = page.getBoundingClientRect();
+    // 单字 span 也要计入：行末单字正好决定栏的右界，排除它们会把栏切窄（实测宁德时代 p2 栏 1 被切到 523，真实为 554）
     const spans = [...page.querySelectorAll('.rd-pdf-text span')]
-      .filter((s) => (s.textContent || '').trim().length > 1)
+      .filter((s) => (s.textContent || '').trim().length > 0)
       .map((s) => ({ s, r: s.getBoundingClientRect() }))
       .filter((x) => x.r.width > 1 && x.r.height > 1);
     if (spans.length < 8) return null;

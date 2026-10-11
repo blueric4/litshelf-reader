@@ -157,6 +157,48 @@ export function bandItemsFromItems(
 }
 
 /**
+ * 把文本项的基线原点平移到页面可视区（`page.view` = [x0, y0, x1, y1]）的左下角。
+ *
+ * 为什么必须做：CropBox/MediaBox 的左下角不一定是 (0, 0)（真实 CNKI 论文 x0≈28、y0≈14）。
+ * pdf.js 的 viewport 会把它减掉再缩放，所以 DOM 里的 span 坐标 = (e - x0) × scale；
+ * 若直接拿原始 e 算栏带，整套栏带会整体右移 x0×scale（实测约 54px），span 一落进"栏外"
+ * 的桶就被排到整页的最后，夹取与重排全部错位。
+ */
+export function itemsInViewSpace(items: readonly PdfTextItemLike[], view: ArrayLike<number> | null | undefined): PdfTextItemLike[] {
+  const x0 = num(view?.[0], 0);
+  const y0 = num(view?.[1], 0);
+  if (!x0 && !y0) return [...items];
+  return items.map((it) => {
+    const tf = it?.transform;
+    if (!tf || tf.length < 6) return it;
+    return { ...it, transform: [tf[0], tf[1], tf[2], tf[3], Number(tf[4]) - x0, Number(tf[5]) - y0] };
+  });
+}
+
+/**
+ * 每个文本项在页面上的横向范围（PDF 用户空间、未缩放），与入参**同序一一对应**。
+ * 几何与 bandItemsFromItems 一致（旋转项投到 x 轴上），但**不丢项**：拿不到几何的项返回 null。
+ * 夹取端点时用它判"这个字整段在哪一栏"，不再用 DOM 的 rect 判。
+ */
+export function itemXRangesFromItems(items: readonly PdfTextItemLike[] | null | undefined): ({ x0: number; x1: number } | null)[] {
+  return (items ?? []).map((it) => {
+    const tf = it?.transform;
+    if (!tf || tf.length < 6) return null;
+    const a = Number(tf[0]);
+    const b = Number(tf[1]);
+    const e = Number(tf[4]);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(e)) return null;
+    const rawW = Math.abs(num(it.width, 0));
+    const rawH = Math.abs(num(it.height, 0));
+    const theta = Math.atan2(b, a);
+    const sin = Math.abs(Math.sin(theta));
+    const w = sin > 0.05 ? rawW * Math.abs(Math.cos(theta)) + rawH * sin : rawW;
+    if (!(w > 0)) return null;
+    return { x0: e, x1: e + w };
+  });
+}
+
+/**
  * 找栏缝：x 方向上**在多数 y 带上都没有正文**的通道，且缝的左右两侧都在多个 y 带上都有正文。
  *
  * 三个约束缺一不可（都是真实页面逼出来的）：
