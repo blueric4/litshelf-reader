@@ -97,6 +97,22 @@ function hasMultiColumnRegion(regions: readonly RegionRatio[] | undefined): bool
 }
 
 /**
+ * 取元素里第一个**文字节点**（含后代）。
+ *
+ * R6 的关键修复：夹取要用"按下点那个 span 的文字节点"和"候选 span 的文字节点"建 Range，
+ * 而 pdf.js 在带标记内容（`includeMarkedContent: true`）的页面上会把文字放进**嵌套元素**里 ——
+ * 只扫 `childNodes` 里的直接子节点会拿到 `null`，于是 604 个候选**一个都建不出 Range**，
+ * 夹取永远"无端点"（实测苏敬勤 p2 末栏：`Range建不出=604`；用户侧表现就是"选不中/一选就断"）。
+ */
+function firstTextNodeOf(el: Element | null): Text | null {
+  if (!el) return null;
+  const direct = [...el.childNodes].find((n) => n.nodeType === Node.TEXT_NODE) as Text | undefined;
+  if (direct) return direct;
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  return (walker.nextNode() as Text | null) ?? null;
+}
+
+/**
  * pdf.js 文本层的样式契约（逐条对齐 pdfjs-dist/web/pdf_viewer.css，v5.7）。
  *
  * 关键：`--font-height` 由 pdf.js 写在每个 span 上（单位 px，PDF 用户单位下的字高），
@@ -827,8 +843,18 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
             return [ri < 0 ? regions.length : ri, 0, boxes[i].top, boxes[i].left];
           }
           const bi = bandIndexOf(r.bands, x);
-          // 落在栏缝里的项排在该区所有栏之后（视觉上仍按 top）
-          return [ri, bi >= 0 ? bi : r.bands.length, boxes[i].top, boxes[i].left];
+          /**
+           * R6（用户亲口要求："遇到数字和标点符号或者英文什么的，不要中断选取"）：
+           * 落在**栏缝**里的项不能排到"该区所有栏之后"。
+           *
+           * 两端对齐的中文正文会把**行末的数字/标点/西文 run** 推进栏缝（`bandIndexOf` 返回 -1），
+           * 老写法把它们统一排到该区末尾 → DOM 里这些字跑到几十行之外，于是同一次拖动选出来的文字
+           * 会被"跳过/拼接"（实测苏敬勤 p2：23 字 / 34 rect / **行内断档=4**，选出来的头是
+           * 「获取理论合法性－同时尽管已有研究尝［］、１５试」—— 数字和标点被搬到了末尾）。
+           * 改成按**最近栏**归属，它们就留在本行视觉位置上，选区连续。
+           */
+          const bi2 = bi >= 0 ? bi : nearestBandIndexOf(r.bands, x);
+          return [ri, bi2 >= 0 ? bi2 : r.bands.length, boxes[i].top, boxes[i].left];
         };
         const keys = spans.map((_, i) => keyOf(i));
         order = spans.map((_, i) => i).sort((p, q) => {
@@ -1932,14 +1958,62 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
             return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
           };
           /**
-           * 必须用 `sel.anchorNode`（**按下点**）而不是 `range.startContainer`：
-           * range 的 start/end 是按 DOM 顺序归一化过的，反方向拖（从右栏往左拖）时会被对调，
-           * 于是"锚点栏"会算成指针那一栏，夹取反而把选区锁到了错误的一栏。
-           * 强制重算时优先用上次记下的那个按下点节点（DOM 变动后 `sel.anchorNode` 可能已落到容器上）。
+           * 锚点栏必须按**按下点**定，不能信 `sel.anchorNode`。
+           *
+           * R6 实测（苏敬勤 p2 末栏，按下 x=820 在栏 2）：浏览器把排队的 mousemove 应用完之后，
+           * 整个 range 是从**页面开头**拉出来的，`sel.anchorNode` 因此落在**栏 1** 的第一个字上 ——
+           * 于是夹取把选区"夹回"了栏 1（量到 `x=[144~563] 1024 字`，用户按的却是栏 2）。
+           * 按下点的坐标 `downRef` 是唯一没被浏览器改写的东西，所以优先用它来命中最内层 span；
+           * 命中不到（按在空白/图上）才退回 `sel.anchorNode`（强制重算时先用记住的那个文字节点）。
            */
+          const pressSpan = ((): HTMLElement | null => {
+            try {
+              const el = document.elementFromPoint(downRef.x, downRef.y) as HTMLElement | null;
+              return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
+            } catch {
+              return null;
+            }
+          })();
+          /**
+           * 按下点没压在任何字形上时（**行间距/字间空隙**，实测 (820,655) 就是这种），
+           * 按几何找**离按下点最近的非空 span** —— 那才是用户"想选"的那个字所在的行。
+           * 不这么做的话：浏览器会从容器起拉 range，`sel.anchorNode` 落到页首的空白 span 上，
+           * 夹取就把选区夹到了**第 1 栏**（实测 `anchorSpan「      」anchorBand=0` → x=[144~563] 1025 字）。
+           */
+          const nearestSpanTo = (x: number, y: number): HTMLElement | null => {
+            let layer: Element | null = null;
+            try {
+              const hit = document.elementFromPoint(x, y);
+              layer = hit?.closest?.('.rd-pdf-text') ?? hit?.closest?.('.rd-pdf-page')?.querySelector('.rd-pdf-text') ?? null;
+            } catch {
+              layer = null;
+            }
+            if (!layer) {
+              const firstPage = document.querySelector('.rd-pdf-page .rd-pdf-text');
+              layer = firstPage;
+            }
+            if (!layer) return null;
+            let best: HTMLElement | null = null;
+            let bestD = Number.POSITIVE_INFINITY;
+            for (const s of layer.querySelectorAll<HTMLElement>('span:not(.markedContent)')) {
+              if (!(s.textContent ?? '').trim()) continue;
+              const r = s.getBoundingClientRect();
+              if (r.width <= 0 || r.height <= 0) continue;
+              const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0;
+              const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0;
+              const d = dx * dx + dy * dy;
+              if (d < bestD) {
+                bestD = d;
+                best = s;
+              }
+            }
+            return best;
+          };
           const anchorSpan =
-            spanOf(sel.anchorNode) ??
-            (force && anchorNodeRef && document.contains(anchorNodeRef) ? spanOf(anchorNodeRef) : null);
+            (force && anchorNodeRef && document.contains(anchorNodeRef) ? spanOf(anchorNodeRef) : null) ??
+            pressSpan ??
+            nearestSpanTo(downRef.x, downRef.y) ??
+            spanOf(sel.anchorNode);
           if (!anchorSpan) return bail('按下点定不到 span（anchorNode 落在容器上）'); // 交给 fixContainerBoundary
           /**
            * 焦点**可能不在任何 span 上**：横向拖过栏缝时，浏览器的选区扩展会按 DOM 顺序一路吃到
@@ -2008,6 +2082,9 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           };
           const anchorBand = force && lockedBand >= 0 ? lockedBand : bandFor(anchorSpan);
           if (anchorBand < 0) return false;
+          console.debug(
+            `[diag] 锚点解析：press=(${Math.round(downRef.x)},${Math.round(downRef.y)}) pressSpan=${pressSpan ? `有「${(pressSpan.textContent ?? '').slice(0, 4)}」` : '无'}｜anchorSpan「${(anchorSpan.textContent ?? '').slice(0, 6)}」｜anchorBand=${anchorBand}｜栏带(px)=${bands.map((b) => `${Math.round(b.start * pageRect.width)}~${Math.round(b.end * pageRect.width)}`).join(',')}｜选区=${range.toString().length}字`,
+          );
           const focusBand = focusSpan ? bandFor(focusSpan) : -1;
           /**
            * 同栏的正常选区不动它（**强制重算时例外**：DOM 变动后它"看起来同栏"正是被重新解释的结果）；
@@ -2131,41 +2208,35 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
            * `rectsInAnchorBand`（每一段都必须整段在本栏内）保证，不靠"不许变长"。
            */
           const candidates = inAnchor.slice().sort((p, q) => edgeY(p) - edgeY(q));
-          /** 这个 range 的每一段是否都**整段**落在锚点栏里（用 rect 的两端判栏，不是只看中心） */
-          const rectsInAnchorBand = (r: Range): boolean => {
+          /**
+           * 候选端点是否"整段在本栏内"。
+           *
+           * ⚠ R6 改法（用户亲口要求"跨过数字/标点/英文不要中断" + 修掉 R5 的副作用）：
+           * **只看候选 span 自己的 rect**，不再拿"锚点→候选"整段 Range 的 rects 去判。
+           * 原因（实测苏敬勤 p2 末栏）：DOM 已按栏重排，而 Range 会跨越中间那些"伸出栏缝"的内容
+           * —— 行末被推进栏缝的单字、西文/数字 run、以及 pdf.js 那个整页大小的 `.endOfContent` ——
+           * 于是**每一个候选**都被判失败 → 夹取一个端点都没有 → R5 只能"永远等下一拍"，
+           * 把"偶发 1 字碎片"变成"稳定留下 869 字跨栏选区"（对用户更糟）。
+           * 只判候选自己那一格：既保证"夹到的端点确实在本栏"，又不会被中间内容连坐；
+           * ghost（`.endOfContent` / `.selecting`）的整页矩形属于**别的元素**，从此不再进入判定。
+           */
+          const rectsInAnchorBand = (cand: HTMLElement): boolean => {
             const band = bands[anchorBand];
             if (!band) return false;
-            let rects: DOMRect[];
+            const pad = pageRect.width * 0.01; // 1% 容差：字距/抗锯齿的零点几像素别误杀
+            const lo = band.start * pageRect.width - pad;
+            const hi = band.end * pageRect.width + pad;
+            let rects: DOMRect[] = [];
             try {
-              rects = [...r.getClientRects()];
+              rects = [...cand.getClientRects()].filter((x) => x.width > 0.5 && x.height > 0.5);
             } catch {
               return false;
             }
             if (!rects.length) return false;
-            const pad = pageRect.width * 0.01; // 1% 容差：字距/抗锯齿的零点几像素别误杀
-            const lo = band.start * pageRect.width - pad;
-            const hi = band.end * pageRect.width + pad;
-            let aRects: DOMRect[] = [];
-            try {
-              aRects = [...anchorSpan.getClientRects()];
-            } catch {
-              aRects = [];
-            }
             return rects.every((x) => {
               const l = x.left - pageRect.left;
               const rr = x.right - pageRect.left;
-              if (l >= lo && rr <= hi) return true;
-              /**
-               * 唯一的例外：**按下点自己那一行**的 rect（就是 anchorSpan 自己的 client rect）。
-               * 用户按在这行上，任何选区都必然包含它；这行若伸出栏带（真实页面上不少，比如横跨
-               * 栏缝的公告行），严格判定会让**所有**候选都过不了 → 一个都不夹 → 跨栏选区原样留下
-               * （实测样本文献 A p4 反向 650 字横跨整页）。
-               * 必须按 rect 精确比对，不能只判"与锚点 rect 相交"：pdf.js 的 span 有时很高，
-               * 那样等于给整页开了后门（183/184 个候选全过、最佳 650 字还是横跨整页）。
-               */
-              return aRects.some(
-                (a) => Math.abs(a.left - x.left) < 2 && Math.abs(a.right - x.right) < 2 && Math.abs(a.top - x.top) < 4,
-              );
+              return l >= lo && rr <= hi;
             });
           };
           const before = range.toString();
@@ -2173,6 +2244,11 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           let bestLen = -1;
           let tried = 0;
           let passed = 0;
+          /** [diag] 排查用：候选为什么一个都没过（build 失败 / 栏判据失败分开计数） */
+          let failNoNode = 0;
+          let failBuild = 0;
+          let failBand = 0;
+          const failSamples: string[] = [];
           const buildFromAnchor = (node: Node | null, off: number): Range | null => {
             if (!node) return null;
             /**
@@ -2186,7 +2262,15 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
              * 实测：夹取刚把选区锁成右栏 650 字 x590~997，16ms 后同一对边界点变成横跨整页 x1~1147。
              * 换成 span 内部的文字节点后，pdf.js 动它自己的节点就影响不到我们的区间了。
              */
-            const tn = [...anchorSpan.childNodes].find((n) => n.nodeType === Node.TEXT_NODE) ?? null;
+            /**
+             * ⚠ R6 关键修复：取**后代**里第一个文字节点，而不是只看 `childNodes` 里的直接子节点。
+             *
+             * 实测（苏敬勤 p2 末栏）：`candidates=604 tried=0 passed=0 Range建不出=604` —— 604 个候选
+             * **一个都没能建出 Range**，因为 pdf.js 在带标记内容的页面上会把文字放在嵌套元素里，
+             * `anchorSpan.childNodes` 里没有直接 TEXT_NODE → `tn === null` → 每个候选都 `return null`。
+             * 结果：夹取永远"无端点"（R5 之后表现为"永远等下一拍"），用户侧就是"选不中/一选就断"。
+             */
+            const tn = firstTextNodeOf(anchorSpan);
             if (!tn) return null;
             const r = anchorSpan.getBoundingClientRect();
             const aOff = pointerRef.x >= r.left + r.width / 2 ? (tn.textContent ?? '').length : 0;
@@ -2197,14 +2281,33 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
             );
           };
           for (const cand of candidates) {
-            const node = cand.firstChild;
-            if (!node) continue;
+            const node = firstTextNodeOf(cand);
+            if (!node) {
+              failNoNode += 1;
+              continue;
+            }
             const offset = forward ? (node.textContent ?? '').length : 0;
             const r = buildFromAnchor(node, offset);
-            if (!r) continue;
+            if (!r) {
+              failBuild += 1;
+              if (failSamples.length < 3) {
+                const cr = cand.getBoundingClientRect();
+                failSamples.push(`build=null cand[${Math.round(cr.left - pageRect.left)}~${Math.round(cr.right - pageRect.left)}]「${(cand.textContent ?? '').slice(0, 6)}」`);
+              }
+              continue;
+            }
             tried += 1;
-            // **硬条件**：每一段都得整段留在锚点栏里（这就是"不许跨栏"的保证）
-            if (!rectsInAnchorBand(r)) continue;
+            // **硬条件**：端点在锚点栏里（只看候选自己的 rect，见上面 R6 的说明）
+            if (!rectsInAnchorBand(cand)) {
+              failBand += 1;
+              if (failSamples.length < 3) {
+                const cr = cand.getBoundingClientRect();
+                failSamples.push(
+                  `band=${band.start.toFixed(3)}~${band.end.toFixed(3)} cand=[${Math.round(cr.left - pageRect.left)}~${Math.round(cr.right - pageRect.left)}]「${(cand.textContent ?? '').slice(0, 6)}」`,
+                );
+              }
+              continue;
+            }
             passed += 1;
             const len = r.toString().length;
             // 在"不出栏"的候选里挑**最长**的：往前拖就一路夹到本栏末尾。
@@ -2236,6 +2339,9 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
              * 空窗期补夹（7 拍）以及 selectionchange 那条路。宁可晚一拍夹对，也不产出碎片。
              */
             console.debug(`[diag] 第 ${pageNo} 页没有任何候选过"整段在本栏内"（端点未就绪）→ 本拍不夹，等下一拍`);
+            console.debug(
+              `[diag] 候选诊断：candidates=${candidates.length} tried=${tried} passed=${passed} 无文字节点=${failNoNode} Range建不出=${failBuild} 栏判据失败=${failBand}｜样本：${failSamples.join('；') || '（无）'}`,
+            );
             return false;
           }
           const fixed = bestRange;
