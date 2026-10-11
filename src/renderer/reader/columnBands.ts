@@ -57,6 +57,11 @@ export interface ColumnBandOptions {
   minBandRatio?: number;
   /** y 直方图的带高（同一坐标系，可选）；不给按正文行高的中位数推 */
   rowBandSize?: number;
+  /**
+   * 分区判定：某一 y 行的横向跨度 ≥ 内容宽 × 该比例就视为"通栏行"（默认 0.6）。
+   * 连续同类行合成区域：通栏区只有一条栏带（不夹取、不按栏重排），其余区域各跑一次栏缝检测。
+   */
+  wideRowRatio?: number;
 }
 
 /** 页面坐标下的一个文本盒（y 向下、已乘 scale） */
@@ -260,8 +265,18 @@ export function columnBandsFromItems(
     if (b.x + b.w > maxX) maxX = b.x + b.w;
   }
   const pageW = num(opts?.pageWidth, 0) > 0 ? num(opts?.pageWidth, 0) * scale : Math.max(1, maxX - minX);
+  return bandsFromBandItems(all, opts ?? {}, pageW, minX, maxX);
+}
 
-  const gutters = findBandGutters(all, opts ?? {}, pageW, minX, maxX);
+/** 由**已经归一好的**文本项（BandItem）算栏带；区域分区与整页检测共用这一份逻辑 */
+function bandsFromBandItems(
+  all: readonly BandItem[],
+  opts: ColumnBandOptions,
+  pageW: number,
+  minX: number,
+  maxX: number,
+): BandRange[] {
+  const gutters = findBandGutters(all, opts, pageW, minX, maxX);
   if (!gutters.length) return [{ start: minX, end: maxX }];
 
   // 过窄的"栏"不要（真实数据里没有 <15% 页宽的正文栏，那种缝多半是页边注/行号造成的）
@@ -286,9 +301,162 @@ export function columnBandsFromItems(
   return bands;
 }
 
+/**
+ * 页面纵向分区。**混排页**（上整幅通栏摘要 + 下双栏正文）必须分区看：
+ * 整页一套栏带会让"本来就横跨整幅的摘要行"被判成跨栏 → 夹成碎块，也会让重排按栏把一行拆开。
+ */
+export interface BandRegion {
+  /** 区域在页面 y 上的范围（与 items 同一坐标系，已乘 scale，y 向下） */
+  top: number;
+  /** 区域底边（不含） */
+  bottom: number;
+  /** 该区域内的栏带（左→右）；通栏区域只有一条 */
+  bands: BandRange[];
+  /** 该区域是不是"通栏"（区域里的行基本都横跨整幅内容宽） */
+  full: boolean;
+}
+
+/** 一行（y 行带）的横向跨度是否算"横跨整幅" */
+const DEFAULTS_WIDE_ROW_RATIO = 0.6;
+
+/**
+ * 把页面按 y 切成若干**版式一致**的区域，每个区域各给一套栏带。
+ *
+ * 为什么必须做（用户报的真实 bug，样本文献 B 第 1 页）：那一页上半是整幅通栏的标题/摘要/关键词/
+ * 中图分类号，下半才是正文。整页一套栏带时会切出 3 条"栏"（0.09~0.36 / 0.38~0.67 / 0.69~0.96），
+ * 于是**每一行摘要都被拆进 3 条栏**：重排按"栏优先"把同一行的左中右三段排到相隔几十个位置上，
+ * 原生选区一渲染就是"零散的蓝色碎块"（实测一次摘要区纵向拖出 16 个 rect，右端正好停在 0.31/0.375
+ * 这类栏边界上），夹取还会再把选区切进某一栏。
+ *
+ * 判定很直接：按 y 行带逐行算"这一行文字横向跨了内容宽的多少"，多数行都横跨 → 该段是**通栏区**
+ * （一条栏带 = 整幅内容宽，夹取与"按栏重排"都不适用）；否则在该段内部**重新**跑一次栏缝检测
+ * （真正双栏/三栏的正文段照样能切出多栏）。
+ */
+export function columnRegionsFromItems(
+  items: readonly PdfTextItemLike[] | null | undefined,
+  opts: ColumnBandOptions,
+): BandRegion[] {
+  const all = bandItemsFromItems(items, opts);
+  if (!all.length) return [];
+  const scale = num(opts?.scale, 1);
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  for (const b of all) {
+    if (b.x < minX) minX = b.x;
+    if (b.x + b.w > maxX) maxX = b.x + b.w;
+    if (b.y < minY) minY = b.y;
+    const bottom = b.y + Math.max(b.h, 1);
+    if (bottom > maxY) maxY = bottom;
+  }
+  const contentW = Math.max(1, maxX - minX);
+  const contentH = Math.max(1, maxY - minY);
+  // 与整页检测一致的"页宽"口径（栏缝最小宽度按页宽算）
+  const pageW = num(opts?.pageWidth, 0) > 0 ? num(opts?.pageWidth, 0) * scale : contentW;
+  const heights = all.map((b) => b.h).filter((h) => h > 0).sort((p, q) => p - q);
+  const medH = heights.length ? heights[Math.floor(heights.length / 2)] : 10;
+  const rowSize = Math.max(
+    1,
+    num(opts?.rowBandSize, 0) > 0 ? num(opts.rowBandSize, 0) * scale : Math.max(medH * 2, contentH / 32),
+  );
+  const rowCount = Math.max(1, Math.ceil(contentH / rowSize));
+  const rowOf = (y: number): number => Math.min(rowCount - 1, Math.max(0, Math.floor((y - minY) / rowSize)));
+
+  // 每一行带：把该行所有 item 的 x 区间并起来，看并成**几段**、总跨度多宽。
+  //
+  // 判定"通栏行"必须看**段数**，不能只看跨度：双栏页面的一个行带里左右两栏各有一行，
+  // 跨度天然是整幅宽（实测把只看跨度的版本跑上去，红筹 p4 与员工持股 p2 的正文全被判成"通栏"，
+  // 于是夹取完全不触发、跨栏选区又回来了）。按"栏缝宽度"把区间切开后：
+  //   · 整幅通栏的一行 → 并成 1 段（行内词距远小于栏缝阈值）；
+  //   · 双栏页面的一行 → 并成 2 段。
+  const gapMin = Math.max(1, pageW * num(opts?.minGutterRatio, DEFAULTS.minGutterRatio));
+  const rowSpan = new Float64Array(rowCount);
+  const rowClusters = new Uint8Array(rowCount);
+  const rowEmpty = new Uint8Array(rowCount).fill(1);
+  {
+    const byRow: { x: number; r: number }[][] = Array.from({ length: rowCount }, () => []);
+    for (const b of all) {
+      const k = rowOf(b.y);
+      rowEmpty[k] = 0;
+      byRow[k].push({ x: b.x, r: b.x + b.w });
+    }
+    for (let k = 0; k < rowCount; k += 1) {
+      const segs = byRow[k];
+      if (!segs.length) continue;
+      segs.sort((p, q) => p.x - q.x);
+      let clusters = 1;
+      let right = segs[0].r;
+      for (let i = 1; i < segs.length; i += 1) {
+        if (segs[i].x - right >= gapMin) clusters += 1;
+        if (segs[i].r > right) right = segs[i].r;
+      }
+      rowClusters[k] = Math.min(255, clusters);
+      rowSpan[k] = right - segs[0].x;
+    }
+  }
+  const wideRatio = num(opts?.wideRowRatio, DEFAULTS_WIDE_ROW_RATIO);
+  const rowWide = new Uint8Array(rowCount);
+  for (let k = 0; k < rowCount; k += 1) {
+    if (rowEmpty[k]) continue;
+    rowWide[k] = rowClusters[k] === 1 && rowSpan[k] >= contentW * wideRatio ? 1 : 0;
+  }
+
+  // 连续同类行合成区域；空行并入上一区（页脚/页眉的孤立行自然形成一个小区域）
+  const regions: BandRegion[] = [];
+  let cur: { top: number; bottom: number; wide: boolean; rows: number[] } | null = null;
+  const flush = (): void => {
+    if (!cur || !cur.rows.length) {
+      cur = null;
+      return;
+    }
+    const keep = new Set(cur.rows);
+    const members = all.filter((b) => keep.has(rowOf(b.y)));
+    if (!members.length) {
+      cur = null;
+      return;
+    }
+    const wide = cur.wide;
+    let mMinX = Number.POSITIVE_INFINITY;
+    let mMaxX = Number.NEGATIVE_INFINITY;
+    for (const b of members) {
+      if (b.x < mMinX) mMinX = b.x;
+      if (b.x + b.w > mMaxX) mMaxX = b.x + b.w;
+    }
+    // 通栏区：一条栏带＝整幅内容宽；否则在**这一段内部**重跑栏缝检测（真正多栏的正文段照样切栏）
+    const bands = wide
+      ? [{ start: mMinX, end: mMaxX }]
+      : bandsFromBandItems(members, opts ?? {}, pageW, mMinX, mMaxX);
+    regions.push({
+      top: cur.top,
+      bottom: cur.bottom,
+      bands: bands.length ? bands : [{ start: mMinX, end: mMaxX }],
+      full: wide,
+    });
+    cur = null;
+  };
+  for (let k = 0; k < rowCount; k += 1) {
+    const rowTop = minY + k * rowSize;
+    const rowBottom = rowTop + rowSize;
+    if (rowEmpty[k]) {
+      if (cur) cur.bottom = rowBottom; // 空行并入上一区（不另起区域）
+      continue;
+    }
+    const wide = rowWide[k] === 1;
+    if (!cur || cur.wide !== wide) {
+      flush();
+      cur = { top: rowTop, bottom: rowBottom, wide, rows: [k] };
+      continue;
+    }
+    cur.bottom = rowBottom;
+    cur.rows.push(k);
+  }
+  flush();
+  return regions.filter((r) => r.bands.length > 0);
+}
+
 /** 某个 x 落在第几栏；落在栏缝/页边（不属于任何栏）返回 -1 */
-export function bandIndexOf(bands: readonly BandRange[] | null | undefined, x: number): number {
-  if (!bands?.length || !Number.isFinite(x)) return -1;
+export function bandIndexOf(bands: readonly BandRange[] | null | undefined, x: number): number {  if (!bands?.length || !Number.isFinite(x)) return -1;
   for (let i = 0; i < bands.length; i += 1) {
     if (x >= bands[i].start && x <= bands[i].end) return i;
   }

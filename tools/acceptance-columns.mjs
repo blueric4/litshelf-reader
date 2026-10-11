@@ -43,6 +43,8 @@ class Cdp {
     this.id = 0;
     this.pending = new Map();
     this.consoleErrors = [];
+    /** 全部 console 文本（用来查产品有没有打印"选区跨栏，已夹回…"这类夹取日志） */
+    this.consoleLogs = [];
     ws.addEventListener('message', (ev) => {
       const m = JSON.parse(ev.data);
       if (m.id && this.pending.has(m.id)) {
@@ -51,8 +53,10 @@ class Cdp {
         m.error ? reject(new Error(m.error.message)) : resolve(m.result);
         return;
       }
-      if (m.method === 'Runtime.consoleAPICalled' && m.params.type === 'error') {
-        this.consoleErrors.push((m.params.args ?? []).map((a) => a.value ?? a.description ?? '').join(' '));
+      if (m.method === 'Runtime.consoleAPICalled') {
+        const text = (m.params.args ?? []).map((a) => a.value ?? a.description ?? '').join(' ');
+        this.consoleLogs.push(text);
+        if (m.params.type === 'error') this.consoleErrors.push(text);
       }
       if (m.method === 'Runtime.exceptionThrown') {
         this.consoleErrors.push(m.params.exceptionDetails?.exception?.description ?? 'exception');
@@ -136,7 +140,7 @@ const readPage = (cdp) =>
       const spans = [...page.querySelectorAll('.rd-pdf-text span')]
         .map((s) => ({ r: s.getBoundingClientRect(), t: (s.textContent || '').trim() }))
         .filter((x) => x.t.length > 0)
-        .map((x) => ({ x0: x.r.left - pr.left, x1: x.r.right - pr.left }));
+        .map((x) => ({ x0: x.r.left - pr.left, x1: x.r.right - pr.left, top: x.r.top, bot: x.r.bottom }));
       const base = { pageNo: Number(page.dataset.pageIndex), spanCount: spans.length, cols: [], gaps: [], rect: { left: Math.round(pr.left), top: Math.round(pr.top), width: Math.round(pr.width), height: Math.round(pr.height) } };
       if (spans.length < 20) return base;
       const use = spans.filter((s) => s.x1 - s.x0 <= pr.width * 0.62);
@@ -148,16 +152,60 @@ const readPage = (cdp) =>
         if (g && s.x0 - g.last <= 25) { g.items.push(s); g.last = s.x0; } else groups.push({ items: [s], last: s.x0 });
       }
       const strong = groups.filter((g) => g.items.length >= 6).map((g) => ({
-        x0: Math.round(Math.min(...g.items.map((i) => i.x0))),
-        x1: Math.round(Math.max(...g.items.map((i) => i.x1))),
+        x0: Math.min(...g.items.map((i) => i.x0)),
+        x1: Math.max(...g.items.map((i) => i.x1)),
         n: g.items.length,
       }));
       const contentW = Math.max(...src.map((s) => s.x1)) - Math.min(...src.map((s) => s.x0));
-      const cols = strong
-        .filter((c) => c.x1 - c.x0 > Math.max(80, contentW * 0.25))
-        .sort((a, b) => a.x0 - b.x0)
-        .map((c, i, arr) => ({ x0: c.x0, x1: i + 1 < arr.length ? Math.min(c.x1, arr[i + 1].x0 - 4) : c.x1, n: c.n }));
-      return { ...base, contentW: Math.round(contentW), cols, gaps: strong.map((c) => [c.x0, c.x1, c.n]) };
+      // ① 行首簇里既有"真栏"，也有段落缩进/长行造成的碎片。规则：按 x0 排序后贪心保留，
+      //    只有与**上一个被保留的栏**的 x0 相差 >= max(120, 内容宽 15%) 才算新栏；
+      //    否则视为同一栏的碎片而丢弃（这样既不会把 241~935 与 338~971 切成 93px 假栏，
+      //    也不会把真实的双栏 138 / 557 合并掉）。
+      const minGap = Math.max(120, contentW * 0.15);
+      const kept = [];
+      for (const c of strong.filter((x) => x.x1 - x.x0 > Math.max(80, contentW * 0.25)).sort((a, b) => a.x0 - b.x0)) {
+        const prev = kept[kept.length - 1];
+        if (prev && c.x0 - prev.x0 < minGap) continue;
+        kept.push({ ...c });
+      }
+      // ② 每栏都要有**足够的可见 span**（视口纵向带内 + 水平落在该栏带内），否则不算真栏
+      const visOf = (c) => src.filter((s) => s.top > 150 && s.bot < window.innerHeight - 80 && s.x0 >= c.x0 - 6 && s.x1 <= c.x1 + 6).length;
+      const cols = kept.map((c, i, arr) => ({
+        x0: Math.round(c.x0),
+        x1: Math.round(i + 1 < arr.length ? Math.min(c.x1, arr[i + 1].x0 - 4) : c.x1),
+        n: c.n,
+        vis: visOf(c),
+      }));
+      // ③ 行结构：这一页是不是"**整页全多栏**"（不存在通栏区/单栏区）。
+      //    通栏行 = 该视觉行 x 覆盖 > 80% 内容宽；连续 >=2 条通栏行算一个"通栏区"。
+      const allW = Math.max(...spans.map((s) => s.x1)) - Math.min(...spans.map((s) => s.x0));
+      const yLines = [];
+      for (const s of [...spans].sort((a, b) => a.top - b.top)) {
+        const L = yLines[yLines.length - 1];
+        if (L && s.top - L.top < 6) L.items.push(s);
+        else yLines.push({ top: s.top, items: [s] });
+      }
+      // 关键：真通栏 = **单个 x 簇**就宽 >=80% 内容宽。双栏页里左右栏的行 y 几乎相同，
+      // 若按整行最左到最右量宽度，会把它误判成"通栏行"（早先 20+ 条假通栏就是这么来的）。
+      const isFull = yLines.map((L) => {
+        const xs = L.items.map((i) => [i.x0, i.x1]).sort((a, b) => a[0] - b[0]);
+        let s0 = xs[0][0];
+        let e0 = xs[0][1];
+        let widest = 0;
+        for (let i = 1; i < xs.length; i += 1) {
+          if (xs[i][0] - e0 > 20) { widest = Math.max(widest, e0 - s0); s0 = xs[i][0]; e0 = xs[i][1]; } else e0 = Math.max(e0, xs[i][1]);
+        }
+        widest = Math.max(widest, e0 - s0);
+        return widest > allW * 0.8;
+      });
+      let run = 0;
+      let fullCount = 0;
+      let maxRun = 0;
+      for (const f of isFull) {
+        if (f) { run += 1; fullCount += 1; maxRun = Math.max(maxRun, run); } else run = 0;
+      }
+      const uniformMulti = cols.length >= 2 && fullCount <= 1 && maxRun <= 1;
+      return { ...base, contentW: Math.round(contentW), cols, colsVisOk: cols.length >= 2 && cols.every((c) => c.vis >= 15), uniformMulti, fullCount, maxRun, gaps: kept.map((c) => [Math.round(c.x0), Math.round(c.x1), c.n]) };
     })()
   `);
 
@@ -230,6 +278,44 @@ async function snapshotSource() {
   return out;
 }
 
+/** 回到文献库：阅读器在就按 Esc（最多 5 次）；不要依赖"返回"按钮是否存在 */
+async function backToLibrary(cdp) {
+  for (let i = 0; i < 5; i += 1) {
+    const st = await cdp.eval(`({ reader: !!document.querySelector('.rd-pdf-page'), title: (document.querySelector('.topbar-title')?.textContent || '').trim() })`);
+    if (!st.reader && st.title !== '设置') return true;
+    cdp.fire('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    cdp.fire('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 });
+    await sleep(700);
+  }
+  return false;
+}
+
+/** 在库里按关键词过滤并双击打开；返回 {opened, title} */
+async function openByName(cdp, name) {
+  const key = name.replace(/\.pdf$/i, '').split(/[——_（(]/)[0].slice(0, 10);
+  await cdp.eval(`(() => { const i=document.getElementById('litshelf-search'); if (i) { i.focus(); i.select(); } return true; })()`);
+  await cdp.send('Input.insertText', { text: key });
+  await sleep(900);
+  const opened = await cdp.eval(`
+    (() => {
+      const rows = [...document.querySelectorAll('.row')];
+      const r = rows.find((x) => (x.textContent || '').includes(${JSON.stringify(key)})) ?? rows[0];
+      if (!r) return { ok: false, rows: rows.length };
+      r.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      return { ok: true, rows: rows.length, text: (r.textContent || '').slice(0, 30) };
+    })()
+  `);
+  if (!opened?.ok) return { opened: false, rows: opened?.rows ?? 0 };
+  for (let i = 0; i < 60; i += 1) {
+    if (await cdp.eval('document.querySelectorAll(".rd-pdf-text span").length > 5')) {
+      const title = await cdp.eval(`(document.querySelector('.topbar-title')?.textContent || '').trim()`);
+      return { opened: true, title, key };
+    }
+    await sleep(500);
+  }
+  return { opened: true, title: '(文本层未就绪)', key };
+}
+
 async function main() {
   await fs.rm(DATA, { recursive: true, force: true }).catch(() => undefined);
   await fs.rm(LIB, { recursive: true, force: true }).catch(() => undefined);
@@ -260,56 +346,56 @@ async function main() {
     // 逐篇找「真的有栏」的页；想让特定文件先试，用 LITSHELF_PREFER=<文件名正则> 指定
     const preferRe = process.env.LITSHELF_PREFER ? new RegExp(process.env.LITSHELF_PREFER, 'i') : null;
     const prefer = (n) => (preferRe && preferRe.test(n) ? 0 : 1);
-    const candidates = [...items].sort((a, b) => prefer(a.name) - prefer(b.name) || (b.pages ?? 0) - (a.pages ?? 0)).slice(0, 4);
+    const candidates = [...items].sort((a, b) => prefer(a.name) - prefer(b.name) || (b.pages ?? 0) - (a.pages ?? 0)).slice(0, 6);
     let best = null;
     let openedName = null;
+    const tried = [];
     for (const cand of candidates) {
-      await cdp.eval(`(() => { const b=[...document.querySelectorAll('.icon-btn')].find((x)=>(x.title||'')==='返回'); b?.click(); return true; })()`);
-      await cdp.eval(`(() => { const i=document.getElementById('litshelf-search'); if (i) { i.focus(); i.select(); } return true; })()`);
-      await cdp.send('Input.insertText', { text: cand.name });
-      await sleep(800);
-      const opened = await cdp.eval(`
-        (() => {
-          const rows = [...document.querySelectorAll('.row')];
-          const r = rows.find((x) => (x.textContent || '').includes('PDF')) ?? rows[0];
-          if (!r) return false;
-          r.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
-          return true;
-        })()
-      `);
-      if (!opened) continue;
-      let ready = false;
-      for (let i = 0; i < 60; i += 1) {
-        ready = await cdp.eval('document.querySelectorAll(".rd-pdf-text span").length > 5');
-        if (ready) break;
-        await sleep(500);
+      if (best) break;
+      await backToLibrary(cdp);
+      const res = await openByName(cdp, cand.name);
+      if (!res.opened) {
+        console.log(`  · 跳过「${cand.name.slice(0, 12)}…」：库里没打开（rows=${res.rows}，key=${res.key}）`);
+        continue;
       }
-      if (!ready) continue;
+      if (!/span/.test(res.title) && !res.title) {
+        console.log(`  · 跳过「${cand.name.slice(0, 12)}…」：文本层未就绪`);
+        continue;
+      }
+      console.log(`  · 打开「${res.title.slice(0, 16)}…」（关键词 ${res.key}）`);
       openedName = cand.name;
-      for (let p = 1; p <= Math.min(cand.pages ?? 1, 6); p += 1) {
+      for (let p = 1; p <= Math.min(cand.pages ?? 1, 8); p += 1) {
         const info = await readPage(cdp);
         if (info && info.spanCount >= 20) {
-          console.log(`  · ${cand.name.slice(0, 16)}… P${info.pageNo}：span ${info.spanCount}，行首簇 ${JSON.stringify(info.gaps)} -> ${info.cols.length} 栏`);
-          if (info.cols.length >= 2) {
-            if (!best || info.cols.length > best.cols.length) best = info;
+          const desc = info.cols.map((c) => `#${c.x0}-${c.x1}(vis ${c.vis})`).join(' ');
+          console.log(`  · ${cand.name.slice(0, 14)}… P${info.pageNo}：span ${info.spanCount}，行首簇 ${JSON.stringify(info.gaps)} -> ${info.cols.length} 栏 ${desc}；通栏行 ${info.fullCount}(最长连续 ${info.maxRun}) ${info.uniformMulti ? '⇒ 整页全多栏 ✓' : '⇒ 混排/单栏，不用于[1]'}`);
+          // **自校验**：>=2 栏、每栏可见 span 足够、且**整页都是多栏**（跨栏断言只在纯多栏页上做）
+          if (info.cols.length >= 2 && info.colsVisOk && info.uniformMulti) {
+            if (!best || info.cols.length > best.cols.length) { best = info; }
             break;
+          }
+          if (info.cols.length >= 2) {
+            tried.push(`${cand.name.slice(0, 10)}…P${info.pageNo}（栏 ${info.cols.length}，vis ${info.cols.map((c) => c.vis).join('/')}，通栏行 ${info.fullCount} 连${info.maxRun}）`);
           }
         }
         cdp.fire('Input.dispatchKeyEvent', { type: 'keyDown', key: ']', code: 'BracketRight', windowsVirtualKeyCode: 221 });
         cdp.fire('Input.dispatchKeyEvent', { type: 'keyUp', key: ']', code: 'BracketRight', windowsVirtualKeyCode: 221 });
         await sleep(900);
       }
-      if (best) break;
     }
     ok(!!openedName, `打开论文：${openedName ?? '（没打开任何候选）'}`);
+    if (tried.length) console.log(`  自校验跳过 ${tried.length} 处：${tried.slice(0, 6).join('；')}`);
     if (!best) {
-      ok(false, '没有找到任何「有栏」的正文页（cols >= 2）');
+      ok(false, `没有找到任何"自校验通过"的多栏页（试了 ${candidates.length} 篇）`);
       return;
+    }
+    if (openedName !== candidates[0].name) {
+      console.log(`  选页自校验：首选「${candidates[0].name.slice(0, 14)}…」未通过，改用「${openedName.slice(0, 14)}…」`);
     }
     const page = best;
     const colCount = page.cols.length;
-    console.log(`\n[栏位] 第 ${page.pageNo} 页：${colCount} 栏 ` + page.cols.map((c, i) => `#${i + 1}[${c.x0}-${c.x1}]`).join(' ') + `（页宽 ${page.rect.width}，内容宽 ${page.contentW}，span ${page.spanCount}）`);
-    ok(colCount >= 2, `正文页至少 2 栏（实测 ${colCount} 栏；任务描述写「三栏」，若为 2 栏说明该论文是双栏排版，判据不变）`);
+    console.log(`\n[栏位] 「${openedName.slice(0, 18)}…」第 ${page.pageNo} 页：${colCount} 栏 ` + page.cols.map((c, i) => `#${i + 1}[${c.x0}-${c.x1}] vis=${c.vis}`).join(' ') + `（页宽 ${page.rect.width}，内容宽 ${page.contentW}，span ${page.spanCount}）`);
+    ok(colCount >= 2 && page.colsVisOk === true, `正文页自校验通过：${colCount} 栏且每栏可见 span 足够（阈值 15；实测 ${page.cols.map((c) => c.vis).join('/')}）`);
 
     const c1 = page.cols[0];
     const cLast = page.cols[colCount - 1];
@@ -321,11 +407,36 @@ async function main() {
         const page = document.querySelector('.rd-pdf-page[data-page-index="${page.pageNo}"]');
         if (!page) return { none: true, why: 'no page' };
         const pr = page.getBoundingClientRect();
-        const spans = [...page.querySelectorAll('.rd-pdf-text span')]
+        const spans0 = [...page.querySelectorAll('.rd-pdf-text span')]
           .map((s) => ({ r: s.getBoundingClientRect(), t: (s.textContent || '').trim() }))
           .filter((x) => x.t.length > 4 && x.r.top > 150 && x.r.bottom < window.innerHeight - 80)
           .map((x) => ({ l: x.r.left - pr.left, rr: x.r.right - pr.left, cy: x.r.top + x.r.height / 2, t: x.t }))
           .sort((a, b) => a.cy - b.cy);
+        // 锚点必须来自**多栏行簇**：同一视觉行内有 >=1 处 >20px 断档、且行宽 < 55% 内容宽。
+        // 这样标题/刊名页眉（产品按 y 分区判为通栏区、本来就不夹取）不会被选成锚点。
+        const contentW = Math.max(...spans0.map((s) => s.rr)) - Math.min(...spans0.map((s) => s.l));
+        const lineGroups = [];
+        for (const s of spans0) {
+          const L = lineGroups[lineGroups.length - 1];
+          if (L && Math.abs(s.cy - L.cy) < 6) L.items.push(s);
+          else lineGroups.push({ cy: s.cy, items: [s] });
+        }
+        const lineMeta = new Map();
+        for (const L of lineGroups) {
+          const xs = L.items.map((i) => [i.l, i.rr]).sort((a, b) => a[0] - b[0]);
+          // 同上：宽度取"最宽 x 簇"，否则双栏页的左右栏会被当成一整行
+          let s0 = xs[0][0];
+          let e0 = xs[0][1];
+          let widest = 0;
+          for (let i = 1; i < xs.length; i += 1) {
+            if (xs[i][0] - e0 > 20) { widest = Math.max(widest, e0 - s0); s0 = xs[i][0]; e0 = xs[i][1]; } else e0 = Math.max(e0, xs[i][1]);
+          }
+          widest = Math.max(widest, e0 - s0);
+          let gaps = 0;
+          for (let i = 1; i < xs.length; i += 1) if (xs[i][0] - xs[i - 1][1] > 20) gaps += 1;
+          for (const i of L.items) lineMeta.set(i, { w: widest, gaps });
+        }
+        const spans = spans0.filter((s) => { const m = lineMeta.get(s); return m && m.gaps >= 1 && m.w < contentW * 0.55; });
         const inCol = (s, c) => s.l >= c.x0 - 8 && s.rr <= c.x1 + 8;
         const n1 = spans.filter((s) => inCol(s, ${JSON.stringify(c1)})).length;
         const n2 = spans.filter((s) => inCol(s, ${JSON.stringify(cLast)})).length;
@@ -347,7 +458,7 @@ async function main() {
         return { none: true, vis: spans.length, n1, n2 };
       })()
     `);
-    console.log(`  左栏 x 区间（页面局部）：${c1.x0}-${c1.x1}；末栏：${cLast.x0}-${cLast.x1}；容差 6px`);
+      ok(!!pair && !!pair.t1, `锚点页自校验后 [1] 落在：「${openedName?.slice(0, 20) ?? '?'}…」第 ${page.pageNo} 页（整页全多栏）`);
     if (!pair || pair.none) {
       ok(false, '找不到「同一视觉行、栏 1 与末栏各一个可见 span」的锚点，无法做横向拖动', `可见 span=${pair?.vis ?? '?'}，栏 1 内=${pair?.n1 ?? '?'}，末栏内=${pair?.n2 ?? '?'}`);
     } else {
@@ -364,8 +475,147 @@ async function main() {
       ok(!!selX && selX.startPage === page.pageNo && selX.endPage === page.pageNo, `选区只在第 ${page.pageNo} 页内（${selX?.startPage}/${selX?.endPage}）`);
     }
 
+    // ---------------- [1b] 混排页（整幅通栏区 + 多栏区）：本轮修复的回归保护
+    console.log('\n[1b] 混排页：通栏区拖选行内不得被拆开；多栏区仍须留在按下那一栏');
+    const readMixed = () => cdp.eval(`
+      (() => {
+        const sc = document.querySelector('.rd-pdf-scroll');
+        const pages = [...document.querySelectorAll('.rd-pdf-page')];
+        const cy = sc ? sc.getBoundingClientRect().top + sc.clientHeight / 2 : window.innerHeight / 2;
+        const page = pages.find((p) => { const r = p.getBoundingClientRect(); return r.top <= cy && r.bottom >= cy; }) ?? pages[0];
+        if (!page) return null;
+        const pr = page.getBoundingClientRect();
+        const spans = [...page.querySelectorAll('.rd-pdf-text span')]
+          .map((s) => ({ r: s.getBoundingClientRect(), t: (s.textContent || '').trim() }))
+          .filter((x) => x.t.length > 0)
+          .map((x) => ({ x0: x.r.left - pr.left, x1: x.r.right - pr.left, cy: x.r.top + x.r.height / 2, vx0: x.r.left, vx1: x.r.right, vy: x.r.top + x.r.height / 2, t: x.t }));
+        if (spans.length < 20) return null;
+        const contentW = Math.max(...spans.map((s) => s.x1)) - Math.min(...spans.map((s) => s.x0));
+        // 按视觉行分组（cy 相差 < 5px 视为同一行）
+        const lines = [];
+        for (const s of [...spans].sort((a, b) => a.cy - b.cy)) {
+          const L = lines[lines.length - 1];
+          if (L && Math.abs(s.cy - L.cy) < 5) { L.items.push(s); L.cy = (L.cy * (L.items.length - 1) + s.cy) / L.items.length; }
+          else lines.push({ cy: s.cy, items: [s] });
+        }
+        const lineStats = lines.map((L) => {
+          const xs = L.items.map((i) => [i.x0, i.x1]).sort((a, b) => a[0] - b[0]);
+          // 宽度取"最宽 x 簇"（真通栏=单簇就宽），否则双栏页左右栏会被当成通栏行
+          let s0 = xs[0][0];
+          let e0 = xs[0][1];
+          let widest = 0;
+          for (let i = 1; i < xs.length; i += 1) {
+            if (xs[i][0] - e0 > 20) { widest = Math.max(widest, e0 - s0); s0 = xs[i][0]; e0 = xs[i][1]; } else e0 = Math.max(e0, xs[i][1]);
+          }
+          widest = Math.max(widest, e0 - s0);
+          let gaps = 0;
+          for (let i = 1; i < xs.length; i += 1) if (xs[i][0] - xs[i - 1][1] > 20) gaps += 1;
+          return { cy: L.cy, n: L.items.length, w: widest, gaps, x0: Math.min(...xs.map((x) => x[0])), x1: Math.max(...xs.map((x) => x[1])) };
+        });
+        const inView = (y) => y > 175 && y < window.innerHeight - 90;
+        const full = lineStats.filter((l) => l.w >= contentW * 0.9 && l.n >= 2 && inView(l.cy));
+        const multi = lineStats.filter((l) => l.gaps >= 1 && l.w < contentW * 0.55 && inView(l.cy));
+        if (full.length < 2 || !multi.length) return { pageNo: Number(page.dataset.pageIndex), contentW: Math.round(contentW), fullCount: full.length, multiCount: multi.length, isMixed: false };
+        const f0 = full[0];
+        const f1 = full[Math.min(1, full.length - 1)];
+        const m = multi[multi.length - 1];
+        return {
+          pageNo: Number(page.dataset.pageIndex),
+          contentW: Math.round(contentW),
+          isMixed: true,
+          fullCount: full.length,
+          multiCount: multi.length,
+          full: { y1: Math.round(f0.cy), y2: Math.round(f1.cy), x0: Math.round(f0.x0), x1: Math.round(f0.x1), w: Math.round(f0.w) },
+          multiY: Math.round(m.cy),
+          multiBand: { x0: Math.round(m.x0), x1: Math.round(m.x1) },
+          pageLeft: Math.round(pr.left),
+        };
+      })()
+    `);
+    // [1] 的锚点页现在保证"整页全多栏"，所以混排页要**翻页去找**（通栏行 >= 90% 内容宽、且下方有多栏区）
+    let mixed = null;
+    const mixedScanned = [];
+    for (let i = 0; i < 6; i += 1) {
+      mixed = await readMixed();
+      mixedScanned.push(`P${mixed?.pageNo ?? '?'}(通栏行 ${mixed?.fullCount ?? 0}/多栏行 ${mixed?.multiCount ?? 0})`);
+      if (mixed?.isMixed) break;
+      cdp.fire('Input.dispatchKeyEvent', { type: 'keyDown', key: ']', code: 'BracketRight', windowsVirtualKeyCode: 221 });
+      cdp.fire('Input.dispatchKeyEvent', { type: 'keyUp', key: ']', code: 'BracketRight', windowsVirtualKeyCode: 221 });
+      await sleep(900);
+    }
+    console.log(`  混排页扫描：${mixedScanned.join(' -> ')}`);
+    if (!mixed?.isMixed) {
+      ok(false, `找不到"通栏区 + 多栏区"的混排页（当前页 通栏行 ${mixed?.fullCount ?? 0} / 多栏行 ${mixed?.multiCount ?? 0}）`);
+    } else {
+      console.log(`  混排页 P${mixed.pageNo}：通栏行 ${mixed.fullCount} 行（首行 x ${mixed.full.x0}-${mixed.full.x1}，宽 ${mixed.full.w}/${mixed.contentW}），多栏行 ${mixed.multiCount} 行`);
+      // (a) 通栏区纵向拖 1~2 行
+      const logsBefore = cdp.consoleLogs.length;
+      await leftDrag(cdp, mixed.pageLeft + mixed.full.x0 + 4, mixed.full.y1, mixed.pageLeft + mixed.full.x1 - 4, mixed.full.y2, 6);
+      const sFull = await cdp.eval(`
+        (() => {
+          const sel = window.getSelection();
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0) return { none: true };
+          const range = sel.getRangeAt(0);
+          const asEl = (n) => (n && n.nodeType === 3 ? n.parentElement : n);
+          const pr = asEl(range.startContainer)?.closest?.('.rd-pdf-page')?.getBoundingClientRect();
+          const rects = [...range.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5).map((r) => ({ x0: r.left - (pr?.left ?? 0), x1: r.right - (pr?.left ?? 0), cy: (r.top + r.bottom) / 2 }));
+          if (!rects.length) return { none: true };
+          // 按视觉行分组后统计"行内断档"：同一行内相邻块间隔 > 12px 记 1 次
+          const lines = [];
+          for (const r of [...rects].sort((a, b) => a.cy - b.cy)) {
+            const L = lines[lines.length - 1];
+            if (L && Math.abs(r.cy - L.cy) < 5) L.items.push(r);
+            else lines.push({ cy: r.cy, items: [r] });
+          }
+          let breaks = 0;
+          for (const L of lines) {
+            const xs = L.items.map((i) => [i.x0, i.x1]).sort((a, b) => a[0] - b[0]);
+            for (let i = 1; i < xs.length; i += 1) if (xs[i][0] - xs[i - 1][1] > 12) breaks += 1;
+          }
+          const covX0 = Math.min(...rects.map((r) => r.x0));
+          const covX1 = Math.max(...rects.map((r) => r.x1));
+          return { len: sel.toString().length, rects: rects.length, lines: lines.length, breaks, cov: Math.round(covX1 - covX0), text: sel.toString().slice(0, 30) };
+        })()
+      `);
+      const newLogs = cdp.consoleLogs.slice(logsBefore).filter((t) => /跨栏|夹回|clamp/i.test(t));
+      console.log(`  通栏区拖选：${sFull?.len ?? 0} 字 / ${sFull?.rects ?? 0} rect / ${sFull?.lines ?? 0} 行；**行内断档 = ${sFull?.breaks ?? '?'}**；x 覆盖 ${sFull?.cov ?? '?'}px（内容宽 ${mixed.contentW}，占 ${sFull?.cov ? Math.round((sFull.cov / mixed.contentW) * 100) : '?'}%）`);
+      ok(!!sFull && sFull.len > 0, `通栏区拖出选区（${sFull?.len ?? 0} 字）`);
+      ok(!!sFull && sFull.breaks === 0, `通栏区**行内断档 = 0**（同一视觉行不被拆开；实测 ${sFull?.breaks ?? '?'}）—— 待产品侧定性：selharness 正在查该页摘要区是否仍被按栏重排；口径未改（固定 12px 行内间隔），拿到其原始数据前不放宽`);
+      ok(!!sFull && sFull.cov >= mixed.contentW * 0.8, `通栏区 x 覆盖接近整幅内容宽（${sFull?.cov ?? '?'} / ${mixed.contentW} ≥ 80%）`);
+      ok(newLogs.length === 0, `通栏区没有出现"选区跨栏，已夹回…"日志（${newLogs.length} 条）`, newLogs.slice(0, 2).join(' | '));
+      // (b) 多栏区里再拖一次：必须完全落在按下那一栏内
+      const logsBefore2 = cdp.consoleLogs.length;
+      await leftDrag(cdp, mixed.pageLeft + mixed.multiBand.x0 + 4, mixed.multiY, mixed.pageLeft + mixed.multiBand.x1 - 4, mixed.multiY + 18, 6);
+      const sMulti = await cdp.eval(`
+        (() => {
+          const sel = window.getSelection();
+          if (!sel || sel.isCollapsed || sel.rangeCount === 0) return { none: true };
+          const range = sel.getRangeAt(0);
+          const asEl = (n) => (n && n.nodeType === 3 ? n.parentElement : n);
+          const pr = asEl(range.startContainer)?.closest?.('.rd-pdf-page')?.getBoundingClientRect();
+          const rects = [...range.getClientRects()].filter((r) => r.width > 0.5 && r.height > 0.5).map((r) => ({ x0: r.left - (pr?.left ?? 0), x1: r.right - (pr?.left ?? 0) }));
+          if (!rects.length) return { none: true };
+          return { len: sel.toString().length, minX: Math.round(Math.min(...rects.map((r) => r.x0))), maxX: Math.round(Math.max(...rects.map((r) => r.x1))) };
+        })()
+      `);
+      const newLogs2 = cdp.consoleLogs.slice(logsBefore2).filter((t) => /跨栏|夹回|clamp/i.test(t));
+      console.log(`  多栏区拖选：${sMulti?.len ?? 0} 字，x ${sMulti?.minX ?? '?'}-${sMulti?.maxX ?? '?'}（按下那一栏 x ${mixed.multiBand.x0}-${mixed.multiBand.x1}）`);
+      ok(!!sMulti && sMulti.len > 0, `多栏区拖出选区（${sMulti?.len ?? 0} 字）`);
+      ok(!!sMulti && sMulti.maxX <= mixed.multiBand.x1 + 6, `多栏区选区完全落在按下那一栏内（最右 ${sMulti?.maxX ?? '?'} ≤ ${mixed.multiBand.x1}+6）`);
+      ok(newLogs2.length === 0, `多栏区也没有出现"跨栏已夹回"日志（${newLogs2.length} 条）`, newLogs2.slice(0, 2).join(' | '));
+    }
+
     // ---------------- [2] 栏内正常
+    // [1b] 为了找混排页翻过页，先回到 [1] 那一页再做栏内/跳句等用例
     console.log('\n[2] 栏内正常：同一栏内纵向拖 3~4 行');
+    for (let i = 0; i < 8; i += 1) {
+      const cur = await cdp.eval(`(() => { const sc=document.querySelector('.rd-pdf-scroll'); const p=[...document.querySelectorAll('.rd-pdf-page')].find((x)=>{const r=x.getBoundingClientRect(); return r.top<=window.innerHeight/2 && r.bottom>=window.innerHeight/2;}); return p ? Number(p.dataset.pageIndex) : null; })()`);
+      if (cur === page.pageNo) break;
+      const back = cur !== null && cur > page.pageNo;
+      cdp.fire('Input.dispatchKeyEvent', { type: 'keyDown', key: back ? '[' : ']', code: back ? 'BracketLeft' : 'BracketRight', windowsVirtualKeyCode: back ? 219 : 221 });
+      cdp.fire('Input.dispatchKeyEvent', { type: 'keyUp', key: back ? '[' : ']', code: back ? 'BracketLeft' : 'BracketRight', windowsVirtualKeyCode: back ? 219 : 221 });
+      await sleep(800);
+    }
     await cdp.eval('window.getSelection()?.removeAllRanges()');
     const lineInfo = await cdp.eval(`
       (() => {
@@ -382,7 +632,7 @@ async function main() {
         return { x: Math.round(a.r.left + 4), y1: Math.round(a.r.top + a.r.height / 2), y2: Math.round(b.r.top + b.r.height / 2), lines: spans.length, t1: a.t.slice(0, 12), t2: b.t.slice(0, 12) };
       })()
     `);
-    const hasLines = !!lineInfo && !lineInfo.few;
+    const hasLines = !!lineInfo && !('few' in lineInfo) && typeof lineInfo.x === 'number';
     ok(hasLines, `在第一栏里取到可纵向拖的 3~4 行${hasLines ? `（共 ${lineInfo.lines} 行：「${lineInfo.t1}」->「${lineInfo.t2}」）` : `（可用行 ${lineInfo?.few ?? 0}）`}`);
     if (hasLines) {
       const annBefore = await anns(cdp);

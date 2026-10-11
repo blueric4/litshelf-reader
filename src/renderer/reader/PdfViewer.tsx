@@ -18,8 +18,45 @@ import { buildAnchorFromNormalized, buildPageTextMap, normIndexFromNode, type Pa
 import type { TextLayerBuilder as TextLayerBuilderType } from 'pdfjs-dist/web/pdf_viewer.mjs';
 import { loadPageLinks, resolveInternalPage, type PageLink } from './links';
 import { findHighlightStrips, hitCountOfStrips, type HighlightStrip } from './search';
-import { bandIndexOf, columnBandsFromItems, nearestBandIndexOf } from './columnBands';
+import { bandIndexOf, columnBandsFromItems, columnRegionsFromItems, nearestBandIndexOf } from './columnBands';
 import { orderTextSpans } from './textOrder';
+
+/**
+ * 页宽/页高**比例**坐标下的版式分区（0~1），供夹取与重排共用。
+ *
+ * 混排页（上整幅通栏摘要 + 下双栏正文）必须按 y 分区看：整页一套栏带会把本来就横跨整幅的
+ * 摘要行判成"跨栏"，夹成碎块、重排还会把同一行拆到 DOM 的两头（用户看到的"零散蓝块"）。
+ */
+interface RegionRatio {
+  top: number;
+  bottom: number;
+  /** 通栏区（区内一条栏带＝整幅内容宽）：既不夹取，也不按栏重排 */
+  full: boolean;
+  bands: { start: number; end: number }[];
+}
+
+/** 某个 y 比例落在哪个分区；落在分区之间的缝隙时取最近的一个 */
+function regionIndexAtY(regions: readonly RegionRatio[], y: number): number {
+  if (!regions.length) return -1;
+  for (let i = 0; i < regions.length; i += 1) {
+    if (y >= regions[i].top && y < regions[i].bottom) return i;
+  }
+  let best = -1;
+  let bestD = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < regions.length; i += 1) {
+    const d = y < regions[i].top ? regions[i].top - y : y - regions[i].bottom;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** 这一页是否存在"真正的多栏分区"（只有它才值得按栏重排/夹取） */
+function hasMultiColumnRegion(regions: readonly RegionRatio[] | undefined): boolean {
+  return !!regions?.some((r) => r.bands.length >= 2);
+}
 
 /**
  * pdf.js 文本层的样式契约（逐条对齐 pdfjs-dist/web/pdf_viewer.css，v5.7）。
@@ -222,7 +259,7 @@ interface PdfPageProps {
   /** 这一页 6 秒还没挂上文本层（疑似 pdf.js 卡住）→ 请求父级换 key 重挂 */
   onStuck?: (page: number) => void;
   /** 这一页的栏带（按页宽比例）算好了，上报给父级做"划词禁止跨栏" */
-  onBands?: (page: number, bands: { start: number; end: number }[]) => void;
+  onBands?: (page: number, regions: RegionRatio[]) => void;
   /** 拖选结束后由父级读取选区；这里只上报"页面元素" */
   onPageElement: (page: number, el: HTMLElement | null) => void;
   /** 文内跳转（PDF 里的引用/目录链接）用：跳到指定页 */
@@ -408,16 +445,49 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         const viewport = page.getViewport({ scale: 1 });
         // pdf.js 的 items 里混有 TextMarkedContent（只有 type、没有几何），没有 str 的一律丢掉
         const textItems = content.items.filter((it) => 'str' in it);
-        const bands = columnBandsFromItems(textItems as Parameters<typeof columnBandsFromItems>[0], {
+        /**
+         * 先看**整页**是不是多栏：不是的话一律走老路径（不分区、不夹取、`orderTextSpans` 重排），
+         * 行为与改动前一模一样（45 条划词手感的场景 3「拖到空白」正是靠这条不变）。
+         * 只有整页确实多栏的页面，才用"按 y 分区"去细化：通栏段自成 1 栏区（不夹），
+         * 正文段在各段内部重新切栏（混排页的关键，见 columnBands.ts 的 columnRegionsFromItems）。
+         */
+        const globalBands = columnBandsFromItems(textItems as Parameters<typeof columnBandsFromItems>[0], {
           pageWidth: viewport.width,
           pageHeight: viewport.height,
           scale: 1,
           styles: content.styles,
         });
-        if (cancelled || !bands.length) return;
-        const rel = bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width }));
+        const regions =
+          globalBands.length < 2
+            ? []
+            : columnRegionsFromItems(textItems as Parameters<typeof columnRegionsFromItems>[0], {
+                pageWidth: viewport.width,
+                pageHeight: viewport.height,
+                scale: 1,
+                styles: content.styles,
+              });
+        if (cancelled) return;
+        if (!regions.length) {
+          console.debug(`[reader] 第 ${pageNumber} 页版式分区：整页单栏（不分区、不做跨栏夹取）`);
+          cbRef.current.onBands?.(pageNumber, []);
+          return;
+        }
+        const rel: RegionRatio[] = regions.map((r) => ({
+          top: r.top / viewport.height,
+          bottom: r.bottom / viewport.height,
+          full: r.full,
+          bands: r.bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width })),
+        }));
         console.debug(
-          `[reader] 第 ${pageNumber} 页栏带：${rel.length} 栏 ${rel.map((b) => `[${b.start.toFixed(2)}~${b.end.toFixed(2)}]`).join(' ')}`,
+          `[reader] 第 ${pageNumber} 页版式分区：${rel.length} 区 ` +
+            rel
+              .map(
+                (r) =>
+                  `${r.full ? '通栏' : `${r.bands.length}栏`}[y ${r.top.toFixed(2)}~${r.bottom.toFixed(2)}]${r.bands
+                    .map((b) => `(${b.start.toFixed(2)}~${b.end.toFixed(2)})`)
+                    .join('')}`,
+              )
+              .join(' '),
         );
         cbRef.current.onBands?.(pageNumber, rel);
       } catch {
@@ -653,7 +723,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
      *      所以有栏带时优先按栏带排（栏带来自 pdf.js 文本项，见 columnBands.ts），
      *      拿不到栏带（单栏/取不到文本项）才退回 `orderTextSpans`。
      */
-    const reorderTextLayer = (container: HTMLElement, bands: { start: number; end: number }[]): void => {
+    const reorderTextLayer = (container: HTMLElement, regions: RegionRatio[]): void => {
       const spans = [...container.querySelectorAll<HTMLElement>('span')].filter(
         (s) => (s.textContent ?? '').trim().length > 0,
       );
@@ -671,26 +741,37 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       //    `selectionchange`**，看护逻辑完全没机会纠正 —— 实测夹取已经把选区锁成右栏 650 字
       //    x590~997，约 0.7 秒后同一段文字变成横跨整页 x1~1147（span 数不变、零条 selectionchange）。
       const pageRect = rootRef.current?.getBoundingClientRect();
-      const canBand = bands.length >= 2 && !!pageRect && pageRect.width > 0;
-      if (!canBand && !sameParent) return; // wrapper + 没有栏带：保持旧行为，别动 DOM
+      /**
+       * 按**分区**排序（混排页的关键）：`columnRegionsFromItems` 会把整幅通栏的标题/摘要/关键词
+       * 划成"通栏区"，把正文划成"多栏区"。若整页一套栏带，通栏行会被三条栏带切成三截、DOM 里
+       * 排到相隔几十个位置，选区一渲染就是零散碎块（用户截图那一片蓝块）。
+       * 规则：分区（上→下）→ 区内（多栏区按栏、通栏/单栏区按行）→ top → left。
+       */
+      const useRegions = hasMultiColumnRegion(regions) && !!pageRect && pageRect.width > 0 && pageRect.height > 0;
+      if (!useRegions && !sameParent) return; // wrapper + 没有可用分区：保持旧行为，别动 DOM
       let order: number[];
-      if (canBand && pageRect) {
-        /** 第 i 个 span 落在第几栏；栏缝/跨栏返回 -1 */
-        const bandOf = (i: number): number =>
-          bandIndexOf(bands, (boxes[i].left + boxes[i].width / 2 - pageRect.left) / pageRect.width);
-        const normal: number[] = [];
-        const crossing: number[] = [];
-        for (let i = 0; i < spans.length; i += 1) (bandOf(i) >= 0 ? normal : crossing).push(i);
-        normal.sort((p, q) => bandOf(p) - bandOf(q) || boxes[p].top - boxes[q].top || boxes[p].left - boxes[q].left);
-        crossing.sort((p, q) => boxes[p].top - boxes[q].top);
-        // 通栏项（标题/图注/落在栏缝上的盒子）按 top 插回，保持整体从上到下的观感
-        order = [];
-        let e = 0;
-        for (const i of normal) {
-          while (e < crossing.length && boxes[crossing[e]].top <= boxes[i].top) order.push(crossing[e++]);
-          order.push(i);
-        }
-        while (e < crossing.length) order.push(crossing[e++]);
+      if (useRegions && pageRect) {
+        const keyOf = (i: number): [number, number, number, number] => {
+          const cy = boxes[i].top + boxes[i].height / 2;
+          const cx = boxes[i].left + boxes[i].width / 2;
+          const y = (cy - pageRect.top) / pageRect.height;
+          const x = (cx - pageRect.left) / pageRect.width;
+          const ri = regionIndexAtY(regions, y);
+          const r = ri >= 0 ? regions[ri] : null;
+          if (!r || r.bands.length < 2) {
+            // 通栏区/单栏区：区内一律按行（top→left），绝不按栏拆行
+            return [ri < 0 ? regions.length : ri, 0, boxes[i].top, boxes[i].left];
+          }
+          const bi = bandIndexOf(r.bands, x);
+          // 落在栏缝里的项排在该区所有栏之后（视觉上仍按 top）
+          return [ri, bi >= 0 ? bi : r.bands.length, boxes[i].top, boxes[i].left];
+        };
+        const keys = spans.map((_, i) => keyOf(i));
+        order = spans.map((_, i) => i).sort((p, q) => {
+          const a = keys[p];
+          const b = keys[q];
+          return a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || a[3] - b[3];
+        });
       } else {
         order = orderTextSpans(boxes);
       }
@@ -705,7 +786,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       console.debug(
         `[reader] 第 ${pageNumber} 页文本层按阅读顺序重排（${spans.length} 个 span` +
           `${sameParent ? '' : `，从 ${wrappers.size} 个 markedContent 提到容器下`}` +
-          `${canBand ? `，按 ${bands.length} 栏` : ''}）`,
+          `${useRegions ? `，按 ${regions.length} 个版式分区` : ''}）`,
       );
     };
 
@@ -739,23 +820,38 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       const host = textRef.current;
       if (!host) return false;
       /**
-       * 重排用的**栏带**（页宽比例 0~1）：来自 pdf.js 文本项，见 columnBands.ts。
+       * 重排用的**版式分区**（页宽/页高比例 0~1）：来自 pdf.js 文本项，见 columnBands.ts。
        * `getTextContent()` 刚被 TextLayerBuilder 拉过，pdf.js 会缓存，这里几乎不花时间。
        * 拿不到就退化成"按行横跨"的旧排序——不会更糟。
        */
-      let bands: { start: number; end: number }[] = [];
+      let regions: RegionRatio[] = [];
       try {
         const content = await page.getTextContent();
         const items = content.items.filter((it) => 'str' in it);
         const unscaledW = viewport.width / viewport.scale;
-        bands = columnBandsFromItems(items as Parameters<typeof columnBandsFromItems>[0], {
+        const unscaledH = viewport.height / viewport.scale;
+        // 整页不是多栏 → 不给分区（重排退回 orderTextSpans、夹取不触发），与改动前一致
+        const globalBands = columnBandsFromItems(items as Parameters<typeof columnBandsFromItems>[0], {
           pageWidth: unscaledW,
-          pageHeight: viewport.height / viewport.scale,
+          pageHeight: unscaledH,
           scale: viewport.scale,
           styles: content.styles,
-        }).map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width }));
+        });
+        if (globalBands.length >= 2) {
+          regions = columnRegionsFromItems(items as Parameters<typeof columnRegionsFromItems>[0], {
+            pageWidth: unscaledW,
+            pageHeight: unscaledH,
+            scale: viewport.scale,
+            styles: content.styles,
+          }).map((r) => ({
+            top: r.top / viewport.height,
+            bottom: r.bottom / viewport.height,
+            full: r.full,
+            bands: r.bands.map((b) => ({ start: b.start / viewport.width, end: b.end / viewport.width })),
+          }));
+        }
       } catch {
-        bands = [];
+        regions = [];
       }
       for (let attempt = 0; attempt < 2; attempt += 1) {
         if (cancelled) return false;
@@ -785,7 +881,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         if (cancelled) return false;
         const layer = textLayerEl();
         if (layer?.querySelector('span')) {
-          reorderTextLayer(layer, bands);
+          reorderTextLayer(layer, regions);
           return true;
         }
         dropTextLayer();
@@ -1154,9 +1250,9 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   const [, forceRedraw] = useState(0);
 
   const reloadRef = useRef(false);
-  /** 各页上报栏带：只写 ref，回调身份必须稳定（否则会带着页面 effect 一起重订阅） */
-  const handleBands = useCallback((page: number, bands: { start: number; end: number }[]) => {
-    bandsByPageRef.current.set(page, bands);
+  /** 各页上报版式分区：只写 ref，回调身份必须稳定（否则会带着页面 effect 一起重订阅） */
+  const handleBands = useCallback((page: number, regions: RegionRatio[]) => {
+    regionsByPageRef.current.set(page, regions);
   }, []);
 
   const onStuck = useCallback((page: number) => {
@@ -1362,7 +1458,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
    * 每页的"栏带"（按**页宽比例** 0–1 存，抗缩放与手势 transform）：由各页 PdfPage 用 pdf.js 的
    * 文本项算好（见 columnBands.ts）后上报，划词夹取据此**硬性禁止跨栏**。
    */
-  const bandsByPageRef = useRef(new Map<number, { start: number; end: number }[]>());
+  const regionsByPageRef = useRef(new Map<number, RegionRatio[]>());
   /**
    * 最后一次非空选区的文字（只增不清）。
    *
@@ -1642,14 +1738,29 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
           // 别再 +1：那会去取下一页的栏带。实测症状就是"夹取日志打了、选区却还横跨两栏"——
           // 拿错页的栏带会让跨栏的右端恰好落回锚点栏里，于是直接判定"没跨栏"而不夹。
           const pageNo = Number(page.dataset.pageIndex ?? '0');
-          const bands = bandsByPageRef.current.get(pageNo);
-          if (!bands || bands.length < 2) return false; // 单栏页面不用管
+          const regions = regionsByPageRef.current.get(pageNo);
+          if (!regions?.length) return false; // 拿不到版式：不夹（行为退回上一版）
           const pageRect = page.getBoundingClientRect();
-          if (pageRect.width <= 0) return false;
+          if (pageRect.width <= 0 || pageRect.height <= 0) return false;
           const ratioOf = (span: HTMLElement): number => {
             const r = span.getBoundingClientRect();
             return (r.left + r.width / 2 - pageRect.left) / pageRect.width; // 0–1：抗缩放与 transform
           };
+          /**
+           * **按锚点所在的纵向分区取栏带**（不是整页一套）。
+           *
+           * 混排页（上整幅通栏摘要 + 下双栏正文）里，摘要行本身就横跨整幅；整页一套栏带会把它
+           * 判成跨栏 → 夹成碎块（用户截图那一片零散蓝块）。所以：
+           *   · 锚点在**通栏区/单栏区**（该区栏带只有一条）→ **根本不夹**：那一段横跨整幅是版式事实；
+           *   · 锚点在**多栏区** → 用该区自己的栏带夹（正文照旧硬性禁止跨栏）。
+           */
+          const anchorRatioY = ((): number => {
+            const r = anchorSpan.getBoundingClientRect();
+            return (r.top + r.height / 2 - pageRect.top) / pageRect.height;
+          })();
+          const region = regions[regionIndexAtY(regions, anchorRatioY)];
+          if (!region || region.bands.length < 2) return false; // 通栏/单栏区：不夹
+          const bands = region.bands;
           const bandFor = (span: HTMLElement): number => {
             const x = ratioOf(span);
             const i = bandIndexOf(bands, x);
