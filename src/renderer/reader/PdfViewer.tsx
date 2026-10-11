@@ -831,30 +831,57 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       if (!useRegions && !sameParent) return; // wrapper + 没有可用分区：保持旧行为，别动 DOM
       let order: number[];
       if (useRegions && pageRect) {
+        /**
+         * R7：**视觉行分桶**（用户亲口要求"遇到数字和标点符号或者英文什么的，不要中断选取"）。
+         *
+         * 为什么必须做：人眼"同一行"的 span，y 中心可以差不少 —— 引文上标数字（`１１` `１２`）、
+         * 行末被推进栏缝的标点、混排的西文 run。老排序键用的是 `(region, band, 原始 top)`：
+         * 上标因为 y 略高就落进**相邻的行/分区桶**，在 DOM 里跑到几十个位置之外 →
+         * DOM 顺序 ≠ 视觉顺序 → 原生拖选跨过这一行时会**跳过数字标点、把远处的字拼进来**
+         * （实测苏敬勤 p2：23 字 / 34 rect / **行内断档=4**，慢拖快拖一致）。
+         *
+         * 做法：先按"竖直重叠"把 span 归到**视觉行**（行高 0.6 倍以内算同一行），
+         * 然后 region 也用**这一行的 y** 去定（上标因此跟着它所属的那一行走），
+         * 排序键变成 `(region, band, 行号, left)` —— DOM 顺序即视觉顺序。
+         * 判据没有放宽：夹取那边一个字都没动。
+         */
+        const cyOf = (i: number): number => boxes[i].top + boxes[i].height / 2;
+        const heightsSorted = boxes
+          .map((b) => b.height)
+          .filter((h) => h > 0)
+          .sort((p, q) => p - q);
+        const medH = heightsSorted.length ? heightsSorted[Math.floor(heightsSorted.length / 2)] : 10;
+        const rowOf = new Array<number>(spans.length).fill(0);
+        const rowCy: number[] = [];
+        const rowN: number[] = [];
+        for (const i of spans.map((_, idx) => idx).sort((a, b) => cyOf(a) - cyOf(b))) {
+          const k = rowCy.length - 1;
+          if (k >= 0 && Math.abs(cyOf(i) - rowCy[k]) <= medH * 0.6) {
+            rowOf[i] = k;
+            rowCy[k] = (rowCy[k] * rowN[k] + cyOf(i)) / (rowN[k] + 1);
+            rowN[k] += 1;
+          } else {
+            rowOf[i] = rowCy.length;
+            rowCy.push(cyOf(i));
+            rowN.push(1);
+          }
+        }
         const keyOf = (i: number): [number, number, number, number] => {
-          const cy = boxes[i].top + boxes[i].height / 2;
+          const k = rowOf[i];
           const cx = boxes[i].left + boxes[i].width / 2;
-          const y = (cy - pageRect.top) / pageRect.height;
           const x = (cx - pageRect.left) / pageRect.width;
-          const ri = regionIndexAtY(regions, y);
+          // 分区用**这一行**的 y（不是这个 span 自己的 y）：上标跟它所属的行同区
+          const yRow = (rowCy[k] - pageRect.top) / pageRect.height;
+          const ri = regionIndexAtY(regions, yRow);
           const r = ri >= 0 ? regions[ri] : null;
           if (!r || r.bands.length < 2) {
-            // 通栏区/单栏区：区内一律按行（top→left），绝不按栏拆行
-            return [ri < 0 ? regions.length : ri, 0, boxes[i].top, boxes[i].left];
+            // 通栏区/单栏区：区内一律按行（行号→left），绝不按栏拆行
+            return [ri < 0 ? regions.length : ri, 0, k, boxes[i].left];
           }
           const bi = bandIndexOf(r.bands, x);
-          /**
-           * R6（用户亲口要求："遇到数字和标点符号或者英文什么的，不要中断选取"）：
-           * 落在**栏缝**里的项不能排到"该区所有栏之后"。
-           *
-           * 两端对齐的中文正文会把**行末的数字/标点/西文 run** 推进栏缝（`bandIndexOf` 返回 -1），
-           * 老写法把它们统一排到该区末尾 → DOM 里这些字跑到几十行之外，于是同一次拖动选出来的文字
-           * 会被"跳过/拼接"（实测苏敬勤 p2：23 字 / 34 rect / **行内断档=4**，选出来的头是
-           * 「获取理论合法性－同时尽管已有研究尝［］、１５试」—— 数字和标点被搬到了末尾）。
-           * 改成按**最近栏**归属，它们就留在本行视觉位置上，选区连续。
-           */
+          // 栏缝里的项（行末被推进栏缝的数字/标点）按**最近栏**归属，不再排到该区所有栏之后
           const bi2 = bi >= 0 ? bi : nearestBandIndexOf(r.bands, x);
-          return [ri, bi2 >= 0 ? bi2 : r.bands.length, boxes[i].top, boxes[i].left];
+          return [ri, bi2 >= 0 ? bi2 : r.bands.length, k, boxes[i].left];
         };
         const keys = spans.map((_, i) => keyOf(i));
         order = spans.map((_, i) => i).sort((p, q) => {
