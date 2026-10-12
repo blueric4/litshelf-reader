@@ -46,7 +46,7 @@ import type {
   TextPosition,
 } from './selectionTypes';
 import { getSelectionRanges, getTextFromSelectionRanges } from './zoteroSelection';
-import { selectionDebugLog, selectionDebugState } from './selectionTypes';
+import { rectsDist, selectionDebugLog, selectionDebugState } from './selectionTypes';
 
 /**
  * DOM 端点 → 字符位置。由接线方提供（它手里有每页的 `SelectionModel`）。
@@ -133,7 +133,7 @@ export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
   const computeRanges = (pair: EndpointPair): { ranges: ResolvedRangeLike[]; head: TextPosition } | null => {
     const anchorEntry = pageEntry(pair.anchorPage);
     if (!anchorEntry) return null;
-    const head = clampToAnchorFlow(anchorEntry.model, pair.anchor, pair.head, log);
+    const head = clampToAnchorColumn(anchorEntry.model, pair.anchor, pair.head, log);
     const lo = Math.min(pair.anchorPage, head.pageIndex);
     const hi = Math.max(pair.anchorPage, head.pageIndex);
     const list: (PageCharModel | null | undefined)[] = [];
@@ -440,6 +440,90 @@ function resolveEndpointsFor(
     return null;
   }
   return { anchor, head, anchorPage: anchor.pageIndex, headPage: head.pageIndex };
+}
+
+/**
+ * 跨栏硬禁止：把焦点收窄到**锚点所在的那一栏**。
+ *
+ * ## 为什么不用"锚点流的连续区间"（我做过，错的）
+ *
+ * 我原来是"取锚点字符的流 → 沿数组向两侧扩成连续区间 → 把焦点夹进区间"。
+ * 这依赖一个隐含假设：**模型里的字符顺序 = 版面顺序**。而真实 PDF 的内容流顺序、
+ * pdf.js 渲染后的 DOM 顺序、我建模型时的顺序**三者并不总是一致**，于是：
+ * 真实窗口实测 —— 在栏 1 里横拖到栏 2，写回去的选区变成"**页眉 17 个字**"、矩形横跨整页。
+ * 也就是说：夹取的方向对，但**夹到了完全不同的地方**。
+ *
+ * ## 现在的判据（纯几何，不依赖任何顺序）
+ *
+ * 1. 锚点字符在**哪一栏**（`flowClass`，由字符中心的 x 落在哪条栏带决定）→ `anchorBand`；
+ * 2. 焦点字符不在同一栏 → 把焦点挪到**离它最近的、且属于 anchorBand 的字符边界**：
+ *    · 优先"焦点所在的横向位置"那一侧（选到哪就夹到哪，不会把选区反向拉回去）；
+ *    · 找不到就退化成"离焦点最近的那个同栏字符"。
+ * 3. 拿不到栏信息（单栏页整页一个 flowClass）→ 原样返回，一个字节都不动。
+ *
+ * 这条判据只看"每个字符属于哪一栏"，与字符在数组里的先后无关 —— 顺序再乱也不会夹到别处去。
+ */
+function clampToAnchorColumn(
+  model: PageCharModel,
+  anchor: TextPosition,
+  head: TextPosition,
+  log: (...a: unknown[]) => void,
+): TextPosition {
+  const chars = model.chars;
+  if (!chars.length) return head;
+  const last = chars.length - 1;
+  const clampIdx = (v: number): number => (v < 0 ? 0 : v > last ? last : v);
+  const anchorIdx = clampIdx(anchor.offset);
+  const anchorFlow = chars[anchorIdx]?.flowClass;
+  if (anchorFlow === undefined || anchorFlow === null) return head;
+  if (head.pageIndex !== model.pageIndex) {
+    // 跨页：焦点收回到锚点栏里离它最近的字（用户的"不许跨栏"优先于"跨页"）
+    const near = nearestSameColumn(chars, anchorFlow, chars[anchorIdx]);
+    log('跨页焦点收回到锚点栏', { anchor: anchorIdx, headPage: head.pageIndex, to: near });
+    return { pageIndex: model.pageIndex, offset: near };
+  }
+  const headIdx = clampIdx(head.offset >= chars.length ? last : head.offset);
+  if (chars[headIdx]?.flowClass === anchorFlow) return head; // 同栏：不动
+  const near = nearestSameColumn(chars, anchorFlow, chars[headIdx], chars[anchorIdx]);
+  if (near < 0) return head;
+  log('焦点不在锚点栏 → 收回到同栏最近的字', {
+    anchor: anchorIdx,
+    head: headIdx,
+    anchorFlow,
+    headFlow: chars[headIdx]?.flowClass,
+    to: near,
+  });
+  return { pageIndex: model.pageIndex, offset: near };
+}
+
+/**
+ * 找"属于 `flow` 的、离 `from` 最近"的字符边界。
+ * 用**字符盒子的距离**（`rectsDist`）算，不看数组下标，所以顺序无关。
+ * @returns 字符序号；找不到返回 -1
+ */
+function nearestSameColumn(
+  chars: PageCharModel['chars'],
+  flow: string,
+  from: { rect: [number, number, number, number] },
+  prefer?: { rect: [number, number, number, number] },
+): number {
+  let best = -1;
+  let bestD = Number.POSITIVE_INFINITY;
+  let bestPreferred = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < chars.length; i += 1) {
+    if (chars[i].flowClass !== flow) continue;
+    // 用该字符所在行的 inlineRect 比距离（单个字的盒子太窄，容易比出奇怪的结果）
+    const box = chars[i].inlineRect ?? chars[i].rect;
+    const d = rectsDist(from.rect, box);
+    const dp = prefer ? rectsDist(prefer.rect, box) : 0;
+    // 先比"离焦点近"，再比"离锚点近"（避免夹到栏里离焦点很远的那一头）
+    if (d < bestD - 1e-6 || (Math.abs(d - bestD) <= 1e-6 && dp < bestPreferred)) {
+      bestD = d;
+      bestPreferred = dp;
+      best = i;
+    }
+  }
+  return best;
 }
 
 /**

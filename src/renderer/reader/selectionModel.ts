@@ -919,23 +919,36 @@ export function charModelFromItems(
   const unordered = pairSpansWithItems(items, spans, geo);
   if (!unordered || !unordered.length) return null;
 
+  /**
+   * ## 阅读顺序：**按几何排序，并且 DOM 与字符模型一起搬**（这是唯一安全的做法）
+   *
+   * 为什么必须排：pdf.js 按**内容流顺序**建 span，而中文期刊的内容流常常"左右栏交替"
+   * （这一篇实测：栏 1 的中间几行排在栏 2 的后面）。不排的后果是**选区碎片化** ——
+   * 用户看到的高亮被切成一堆小矩形、跨数字/标点/英文时"跳过并拼接"（他最初的投诉之一）。
+   *
+   * 为什么必须"一起搬"（我在这里错过两轮）：
+   *   ① 只按阅读顺序建**模型**、不动 DOM → 内核按字符序号写回去的选区落到完全不同的位置
+   *      （真实窗口实测：栏 1 横拖到栏 2，写回去变成"页眉 17 个字"、矩形横跨整页）；
+   *   ② 只搬 **DOM**、不动模型 → "第 i 个字符 ↔ 第 i 个 span"断裂，模型整页建不起来。
+   * 所以：**同一个置换同时作用于 pairs（→ span 顺序 + 字符顺序）**，二者永远同序。
+   * 置换算不出来（几何缺失等）就保持原顺序 —— 那时"顺序不完美"但**不会错位**。
+   */
   const order = readingOrderOfPairs(unordered, geo, regions);
   let pairs = unordered;
   if (order && !order.every((v, i) => v === i)) {
-    const orderedPairs = order.map((i) => unordered[i]);
-    const orderedSpans = orderedPairs.map((p) => p.span);
+    pairs = order.map((i) => unordered[i]);
+    const orderedSpans = pairs.map((p) => p.span);
     const host = orderedSpans[0]?.parentElement;
     if (host && orderedSpans.every((s) => s.parentElement === host)) {
       try {
         const frag = host.ownerDocument.createDocumentFragment();
         for (const s of orderedSpans) frag.appendChild(s);
         host.appendChild(frag);
+        selectionDebugLog('按阅读顺序重排文本层与字符模型', { pairs: pairs.length });
       } catch {
-        /* 拿不到 DOM（单测环境）→ 只重排数组，模型顺序仍与传入的 spans 对齐 */
+        /* 拿不到 DOM（单测环境）→ 只排数组，模型顺序仍与传入的 spans 对齐 */
       }
     }
-    pairs = orderedPairs;
-    selectionDebugLog('按阅读顺序重排文本层', { pairs: pairs.length });
   }
 
   if (!pairs || !pairs.length) return null;
