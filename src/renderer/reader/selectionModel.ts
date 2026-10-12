@@ -60,15 +60,17 @@ export interface SelectionModelInput {
   pageIndex: number;
   /** 页面元素 .rd-pdf-page：模型 rect 全部相对它左上角（CSS 像素） */
   pageEl: HTMLElement;
-  /** 文本层容器 .rd-pdf-text（懒建 DOM↔字符对齐表用） */
+  /** 文本层容器 .rd-pdf-text（取 span、懒建 DOM↔字符对齐表都用它） */
   textLayer: HTMLElement;
-  /** 与 TextLayerBuilder 完全同参拿到的文本项（page.getTextContent({includeMarkedContent:true, disableNormalization:true}).items） */
+  /** 与 TextLayerBuilder 完全同参拿到的文本项（`page.getTextContent({includeMarkedContent:true, disableNormalization:true}).items`） */
   items: readonly unknown[];
   /**
-   * 文本层里**按 DOM 顺序**排列的非空 span（文字取自它，几何与 items 按顺序一一配对）。
-   * 必须按 DOM 顺序传：产品重排过文本层，这个顺序才是选区偏移量的顺序。
+   * 建模型时用的 span 列表（按 DOM 顺序、排除 `.markedContent`、**含空串 span**）。
+   * **可以不传**：不传时由 `buildSelectionModel` 自己从 `textLayer` 里按同一条规则取
+   * （推荐不传 —— 让"配对规则"只有一处实现，接线方不会因为过滤条件不同把整页模型搞没）。
+   * 传的话必须与 `items` 同源同序，否则 `buildSelectionModel` 直接返回 null（宁可不建也不错位）。
    */
-  spans: readonly HTMLElement[];
+  spans?: readonly HTMLElement[];
   /** 该页的 viewport（pdf.js）：用 scale / width / height */
   viewport: { scale: number; width: number; height: number; transform: number[] };
   /** page.view = [x0, y0, x1, y1]（PDF 用户空间，CropBox 可能不是 0 原点） */
@@ -209,20 +211,40 @@ function resolvePageGeometry(
 
 /**
  * 文本项 → CSS 像素几何。**必须减 viewBox 原点、y 必须翻转**（文件头 ①）。
- * 拿不到 transform 就返回 null：宁可整页不建模型（调用方退回老行为），也不要错位。
+ *
+ * `strict = true` 时拿不到 transform 返回 null（排序键用）；
+ * 建**字符**时用 `strict = false`：拿不到就退化成"一个贴页面左上的小盒子"。
+ *
+ * 为什么建字符不能因为一项几何缺失就整页放弃（踩过）：真实 PDF 里会有个别项
+ * （标记残留、零宽 run）没有可用的 transform/尺寸，而一页有 1200+ 项 —— 为它一个人
+ * 把整页模型废掉，等于**整篇论文的夹取全失效**（实测：p1 有 1221 个正常项 + 1 个病项，
+ * 结果这一页夹取完全不工作）。退化盒子只影响这一项的字符位置，
+ * 它附近的字符照旧正确；而"字符序号 ↔ DOM 顺序"的一一对应关系不受影响。
  */
-function itemGeometry(item: PdfTextItemLike, geo: PageGeometry, textLength: number): ItemGeometry | null {
+function itemGeometry(
+  item: PdfTextItemLike,
+  geo: PageGeometry,
+  textLength: number,
+  strict = true,
+): ItemGeometry | null {
   const tf = item.transform;
-  if (!tf || tf.length < 6) return null;
-  const a = num(tf[0], NaN);
-  const b = num(tf[1], NaN);
-  const e = num(tf[4], NaN);
-  const f = num(tf[5], NaN);
-  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(e) || !Number.isFinite(f)) return null;
+  const hasTf = !!tf && tf.length >= 6;
+  const a = hasTf ? num(tf[0], NaN) : NaN;
+  const b = hasTf ? num(tf[1], NaN) : NaN;
+  const e = hasTf ? num(tf[4], NaN) : NaN;
+  const f = hasTf ? num(tf[5], NaN) : NaN;
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(e) || !Number.isFinite(f)) {
+    if (strict) return null;
+    return { x: 0, baselineY: 0, length: 1, size: 1, rotation: 0 };
+  }
 
-  const sizePdf = Math.abs(num(item.height, 0)) || Math.abs(num(tf[3], 0)) || Math.abs(a) || 0;
+  const sizePdf =
+    Math.abs(num(item.height, 0)) || Math.abs(hasTf ? num(tf[3], 0) : 0) || Math.abs(a) || 0;
   const size = sizePdf * geo.scale;
-  if (!(size > 0)) return null;
+  if (!(size > 0)) {
+    if (strict) return null;
+    return { x: (e - geo.x0) * geo.scale, baselineY: (geo.y1 - f) * geo.scale, length: 1, size: 1, rotation: 0 };
+  }
 
   let length = Math.abs(num(item.width, 0)) * geo.scale;
   if (!(length > 0)) {
@@ -318,100 +340,41 @@ function itemSortKey(item: PdfTextItemLike, geo: PageGeometry, index: number): S
 const multisetKey = (texts: readonly string[]): string => [...texts].sort().join('\u0000');
 
 /**
- * 把"DOM 顺序的非空 span"与"`str !== ''` 的文本项"配对（pdf.js 对每个非空 `str` 项恰好挂一个 span）。
- * **数量不等就返回 null** —— 这是"模型第 i 个字符 ↔ DOM 第 i 个字符"的前提。
- * 空 str 的项必须跳过：pdf.js 的 `#appendText` 只在 `hasText`（`str !== ''`）时把 span 挂进 DOM。
+ * 把"DOM 顺序的 span"与"同序的文本项"配对 —— **同号即同项**，所以这个函数几乎是恒等的。
  *
- * 两条路径：
- *   ① **顺序一致（绝大多数页面）**：直接按下标配对，与契约一致。
- *   ② **文本层被 `reorderTextLayer` 物理重排过**（多栏/有 markedContent wrapper 的页面会真的
- *      搬 DOM 节点：`frag.appendChild(spans[i])`）：这时按下标配对会把"栏 2 的几何"安到
- *      "栏 1 的文字"上 —— 字符 rect 与 flowClass 全错，跨栏夹取会夹到隔壁栏去。
- *      重排只是**置换**，所以先要求文字的多重集合完全一致（硬证据），再按文字分组、
- *      组内用同一套几何键（上→下、左→右）排序后一一对应，把置换还原回来。
- *      拿不到 span 的视觉位置（未布局 / node 环境）就整体返回 null：宁可不建，也不能错位。
+ * 为什么可以这么简单（以及为什么以前不是）：
+ *   · pdf.js `TextLayer#processItems` 对**每个 `str !== undefined` 的项**都 `#appendText()`，
+ *     所以"第 i 个 span ↔ 第 i 个 `str` 已定义的项"是一一对应，连空串项也一样（空串 span 没文字）。
+ *     按"非空 str"配对会永远差几个（实测每页差 2 个），整页模型建不起来 —— 这个坑踩过一个版本。
+ *   · 模型现在自己从 `textLayer` 里**按 DOM 顺序**取 span（`collectTextSpans`），
+ *     与 items 的顺序天然一致，不需要"按文字分组还原置换"那套东西（也就没有配错的风险）。
+ *
+ * 仍然保留两条硬校验：数量不等、或文字对不上 → 返回 null（宁可不建，也不能让字符与 DOM 错位，
+ * 因为错位的后果是**静默夹错栏**）。
  */
 function pairSpansWithItems(
   items: readonly unknown[],
   spans: readonly HTMLElement[],
-  geo: PageGeometry,
+  _geo: PageGeometry,
 ): SpanPair[] | null {
-  const visible: PdfTextItemLike[] = [];
+  const defined: PdfTextItemLike[] = [];
   for (const raw of items ?? []) {
     const it = asTextItem(raw);
-    if (it && it.str !== '') visible.push(it);
+    if (it && it.str !== undefined) defined.push(it);
   }
   if (!spans?.length) return null;
-  if (visible.length !== spans.length) return null;
+  if (defined.length !== spans.length) return null;
 
-  const texts: string[] = [];
+  const pairs: SpanPair[] = [];
   for (let i = 0; i < spans.length; i += 1) {
     const text = spans[i]?.textContent ?? '';
-    if (!text) return null; // 传进来的必须是"非空 span"
-    texts.push(text);
+    const item = defined[i];
+    if (!item) return null;
+    if ((item.str ?? '') !== text) return null; // 同号不同文 → 不是同一份渲染，放弃
+    if (!text) continue; // 空串项：贡献 0 个字符
+    pairs.push({ item, text });
   }
-
-  let identity = true;
-  for (let i = 0; i < visible.length; i += 1) {
-    if (visible[i].str !== texts[i]) {
-      identity = false;
-      break;
-    }
-  }
-  if (identity) return texts.map((text, i) => ({ item: visible[i], text }));
-
-  if (multisetKey(texts) !== multisetKey(visible.map((it) => it.str ?? ''))) return null;
-
-  const spanGroups = new Map<string, number[]>();
-  for (let i = 0; i < texts.length; i += 1) {
-    const g = spanGroups.get(texts[i]);
-    if (g) g.push(i);
-    else spanGroups.set(texts[i], [i]);
-  }
-  const itemGroups = new Map<string, number[]>();
-  for (let i = 0; i < visible.length; i += 1) {
-    const t = visible[i].str ?? '';
-    const g = itemGroups.get(t);
-    if (g) g.push(i);
-    else itemGroups.set(t, [i]);
-  }
-
-  const out: (SpanPair | null)[] = new Array<SpanPair | null>(spans.length).fill(null);
-  for (const [text, spanIdx] of spanGroups) {
-    const itemIdx = itemGroups.get(text);
-    if (!itemIdx || itemIdx.length !== spanIdx.length) return null;
-    const spanKeys: SortKey[] = [];
-    for (const i of spanIdx) {
-      const k = spanSortKey(spans[i], i);
-      if (!k) return null;
-      spanKeys.push(k);
-    }
-    const itemKeys: SortKey[] = [];
-    for (const i of itemIdx) {
-      const k = itemSortKey(visible[i], geo, i);
-      if (!k) return null;
-      itemKeys.push(k);
-    }
-    spanKeys.sort(byTopLeft);
-    itemKeys.sort(byTopLeft);
-    /**
-     * 组内一一对应。**不要在这里加"排序键必须唯一"之类的自检**（我加过，又删了）：
-     *
-     * 同一组 = 文字完全相同。当两个同样的字在 span 侧与 item 侧的**先后不一致**时
-     * （例如同一个字在栏 1 与栏 2 各出现一次，因为跨栏共线，y 相同、x 不同），
-     * 任意一种配对在几何上都**说得通**：p 配 q 就给 p 用 q 的盒子，q 配 p 就给 q 用 p 的盒子，
-     * 而 p、q 的文字本来就一样，所以选区文字永远正确，只是"哪个盒子属于哪个字符"两种解释都自洽。
-     * 这跟"配对本身错了"是两回事 —— 真正的错配是**文字**配错（张冠李戴），那个由上面的
-     * 多重集合校验挡掉；号码层面还有接线方 `domTotal === total` 的对照兜底。
-     * 若在这里因为"键不够唯一"就返回 null，等于把本来能用的多栏页夹取**关掉**，
-     * 那才是真正的回归。
-     */
-    for (let k = 0; k < spanKeys.length; k += 1) {
-      out[spanKeys[k].index] = { item: visible[itemKeys[k].index], text };
-    }
-  }
-  for (const p of out) if (!p) return null;
-  return out as SpanPair[];
+  return pairs.length ? pairs : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -646,6 +609,37 @@ function assignBreakFlags(chars: ZoteroChar[], infos: readonly PairInfo[], lines
 }
 
 // ---------------------------------------------------------------------------
+// 诊断（只在排查"模型为什么建不起来"时用；不参与产品逻辑）
+// ---------------------------------------------------------------------------
+
+/**
+ * 把建模型的每一步单独跑一遍，返回每一步的结论。
+ *
+ * 为什么要这个：`buildSelectionModel` 失败只返回 null，而"哪一步失败的"（配对 / 几何 / 字符）
+ * 从外面看不出来 —— 上一版就是因为分不清这三种失败，把"全篇失效"误当成"差不多能用"。
+ */
+export function __debugModelStages(
+  items: readonly unknown[],
+  spans: readonly HTMLElement[],
+  viewport: SelectionModelInput['viewport'],
+  viewBox: readonly number[],
+): Record<string, unknown> {
+  const geo = resolvePageGeometry(viewport, viewBox);
+  const stage: Record<string, unknown> = { geo: geo ? { scale: geo.scale, x0: geo.x0, y1: geo.y1, pw: geo.pageWidth, ph: geo.pageHeight } : null };
+  if (!geo) return stage;
+  const pairs = pairSpansWithItems(items, spans, geo);
+  stage.pairs = pairs ? pairs.length : null;
+  if (!pairs) return stage;
+  const bad: number[] = [];
+  for (let i = 0; i < pairs.length; i += 1) {
+    if (!itemGeometry(pairs[i].item, geo, pairs[i].text.length)) bad.push(i);
+  }
+  stage.geometryFailures = bad.slice(0, 10);
+  stage.geometryFailureCount = bad.length;
+  return stage;
+}
+
+// ---------------------------------------------------------------------------
 // 模型构建（纯几何，不碰 DOM 布局）
 // ---------------------------------------------------------------------------
 
@@ -669,8 +663,9 @@ export function charModelFromItems(
   const chars: ZoteroChar[] = [];
   const infos: PairInfo[] = [];
   for (const pair of pairs) {
-    const itemGeo = itemGeometry(pair.item, geo, pair.text.length);
-    if (!itemGeo) return null; // 几何缺失 → 整页不建（否则字符与 DOM 会错位）
+    // 非 strict：个别项几何残缺时给它一个退化盒子，**不要因为一个人废掉整页**（见 itemGeometry）
+    const itemGeo = itemGeometry(pair.item, geo, pair.text.length, false);
+    if (!itemGeo) return null;
     const boxes = charBoxesOf(itemGeo, pair.text);
     const lo = chars.length;
     let minX = Number.POSITIVE_INFINITY;
@@ -751,28 +746,52 @@ interface DomRefs {
 
 const domRefsByModel = new WeakMap<PageCharModel, DomRefs>();
 
-/** 文本层里 document order 的非空 span */
+/**
+ * 文本层里 **document order 的全部文字 span**。
+ *
+ * 规则必须与 pdf.js 建 span 的规则**同源**（这是配对的唯一依据）：
+ * `TextLayer#processItems` 对每个 `str !== undefined` 的项都建 span（空串项也建，但没有文字节点）。
+ * 所以这里取"排除 `.markedContent` wrapper 之后的所有 span"：
+ *   · 空串项的 span 也留着 —— 它在下标上与 items 一一对应，是"同号即同项"的保证；
+ *   · 它没有文字节点，对字符总数贡献 0，不影响 `domTotal === total`。
+ *
+ * 排除 `.markedContent`：它是 pdf.js 用来包标记内容的容器 span，里面才装着真正的文字 span；
+ * 重排（`reorderTextLayer`）之后文字 span 会被提到容器下，wrapper 就空了，但**没重排过**的页面上
+ * 它仍然存在且 `textContent` 非空 —— 不排除它会让 span 数比 items 多，整页模型建不起来。
+ */
 function collectTextSpans(textLayer: HTMLElement): HTMLElement[] {
-  const out: HTMLElement[] = [];
   try {
-    for (const el of Array.from(textLayer.querySelectorAll('span'))) {
-      if ((el.textContent ?? '') !== '') out.push(el as HTMLElement);
-    }
+    return Array.from(textLayer.querySelectorAll<HTMLElement>('span:not(.markedContent)'));
   } catch {
-    /* 拿不到就当空：退回建模型时记下的 spans */
+    return [];
   }
-  return out;
 }
 
 /**
  * 建字符模型。除了模型本体，还会把 DOM 引用记进 WeakMap 供 `SelectionModel` 懒建对齐表。
+ *
+ * ## 顺序（这一整套的命门，**只在这里做一次**）
+ *
+ * pdf.js 按**内容流顺序**建 span，而中文期刊的内容流经常"左右栏交替"，不等于阅读顺序；
+ * 而跨栏硬禁止依赖"字符序号连续 = 版面上连续"。所以这里：
+ *   ① 按阅读顺序算出置换（`selectionReadingOrder`，用"分区 → 栏 → 视觉行 → x"）；
+ *   ② **按同一个置换重排 DOM**（span 绝对定位，改顺序不影响外观）；
+ *   ③ **按同一个置换重排 items**（`E = perm(I)`）；
+ *   ④ 一一配对建模型。
+ *
+ * ⚠️ ②只搬 DOM、③忘了搬 items，就是一手实测过的血案：DOM 变成阅读顺序、items 还是内容流顺序，
+ * 于是"同号不同文"处处不匹配 → 12/13 页模型建不起来（`DOM 前 8 个 span` 与 `items 前 8 个 str`
+ * 完全不同）。两者必须一起搬。
+ *
+ * `spans` 不传时自己从 `textLayer` 里取（按 DOM 顺序、排除 `.markedContent`、含空串 span）。
  */
 export function buildSelectionModel(input: SelectionModelInput): PageCharModel | null {
   if (!input) return null;
-  const local = input.spans ? [...input.spans] : [];
+  const spans = input.spans?.length ? [...input.spans] : collectTextSpans(input.textLayer);
+  if (!spans.length) return null;
   const model = charModelFromItems(
     input.items,
-    local,
+    spans,
     input.viewport,
     input.viewBox,
     input.regions,
@@ -790,7 +809,7 @@ export function buildSelectionModel(input: SelectionModelInput): PageCharModel |
       win,
       pageEl: input.pageEl,
       textLayer: input.textLayer,
-      spans: local,
+      spans,
       boundaryTried: false,
     });
   }

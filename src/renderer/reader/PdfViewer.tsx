@@ -104,6 +104,17 @@ function pageElByIndex(pageIndex: number): HTMLElement | null {
 }
 
 /**
+ * 取文本层里 **DOM 顺序**的全部文字 span —— 必须与 pdf.js 建 span 的规则同源，也必须与
+ * `selectionModel.ts::collectTextSpans` 完全相同（顺序是"第 i 个字符 ↔ 第 i 个 span"的依据）：
+ *   · 排除 `.markedContent` 容器 span（里面才装着真正的文字 span）；
+ *   · **空串项的 span 也要留着**（pdf.js 对每个 `str !== undefined` 的项都建 span，空串只是没文字）
+ *     —— 少一个就与文本项数量对不上，整页模型建不起来。
+ */
+function collectSpansInDomOrder(layer: HTMLElement): HTMLElement[] {
+  return Array.from(layer.querySelectorAll<HTMLElement>('span:not(.markedContent)'));
+}
+
+/**
  * pdf.js 文本层的样式契约（逐条对齐 pdfjs-dist/web/pdf_viewer.css，v5.7）。
  *
  * 关键：`--font-height` 由 pdf.js 写在每个 span 上（单位 px，PDF 用户单位下的字高），
@@ -922,23 +933,10 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       if (!report) return;
       let model: PageCharModel | null = null;
       try {
-        /**
-         * 三个细节都踩过（model-builder 的自检 T2 复现过第一个）：
-         *   ① 排除 `.markedContent` wrapper：它也是 `span`、`textContent` 也非空，但里面包着真正的文字 span。
-         *      只有在 reorderTextLayer 把 span 提到容器下（拍平）之后才没有 wrapper；没拍平时把 wrapper
-         *      当文字 span 传进去，数量就对不上 → 整页模型 null（安全，但夹取会静默关闭）。
-         *   ② 判空用 `length > 0` 而**不是** `trim().length > 0`：pdf.js 的 `hasText = str !== ''`，
-         *      纯空格项会挂 span，用 trim 又会让两边数量对不上。模型那边也是按 `str !== ''` 配对的。
-         *   ③ 顺序必须是**此刻 DOM 的顺序**（模型要按它和文字一一对应地写回选区端点）。
-         */
-        const spans = [...layer.querySelectorAll<HTMLElement>('span:not(.markedContent)')].filter(
-          (s) => (s.textContent ?? '').length > 0,
-        );
         model = buildSelectionModel({
           pageIndex: pageNumber - 1,
           pageEl: rootRef.current ?? layer,
           textLayer: layer,
-          spans,
           items,
           viewport: {
             scale: viewport.scale,
@@ -1788,14 +1786,17 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       /**
        * DOM 端点 → （页号, 字符序号）。
        *
-       * 页号从 DOM 反查（`.rd-pdf-page[data-page-index]` 是 1 起的，模型是 0 起）——
-       * 这样不依赖任何"页号 → 元素"注册表，翻页 / 重建文本层都不会错位。
+       * ⚠️ **页号基准**：`.rd-pdf-page[data-page-index]` 是 **1 起**的，而模型一律是 **0 起**
+       * （`PageCharModel.pageIndex = pageNumber - 1`）。这里必须减 1 —— 我曾经漏掉这一步，
+       * 结果 `get(1)` 取不到页 1 的模型（它存在 0 号键上），`resolveDomPosition` 永远返回 null、
+       * 端点从头到尾映射不出来，**夹取一次都没运行过**（用户实测：一项都不符合）。
+       * 模型映射表 `selectionModelsRef` 的键**统一 0 起**，任何地方要用都得先换算。
        */
       resolveDomPosition: (node, offset, affinity) => {
         const pageEl = pageElementOf(node);
         const pageNo = Number(pageEl?.dataset.pageIndex ?? '0');
         if (!pageNo) return null;
-        const model = selectionModelsRef.current.get(pageNo);
+        const model = selectionModelsRef.current.get(pageNo - 1);
         if (!model) return null;
         return model.resolveDomPosition(node, offset, affinity);
       },
@@ -1810,12 +1811,15 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
 
   /** 各页上报的划词模型：**先包成 SelectionModel** 再存（内核只认模型本身，方法在包装层上） */
   const handleSelectionModel = useCallback((page: number, model: PageCharModel | null) => {
-    selectionKernelRef.current?.invalidate(page);
+    // ⚠️ 键用 **0 起页号**（`page` 是 1 起的渲染页号）—— 与模型内部、内核的一致，
+    // 漏掉这个换算会让后面所有 `get()` 全部落空（踩过，见 deps 里的注释）。
+    const pageIndex = page - 1;
+    selectionKernelRef.current?.invalidate(pageIndex);
     if (!model) {
-      selectionModelsRef.current.delete(page);
+      selectionModelsRef.current.delete(pageIndex);
       return;
     }
-    selectionModelsRef.current.set(page, new SelectionModel(model));
+    selectionModelsRef.current.set(pageIndex, new SelectionModel(model));
   }, []);
 
 
@@ -1840,7 +1844,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     if (startIdx === endIdx) {
       endpoints.push({
         pageIndex: startIdx - 1,
-        scale: selectionModelsRef.current.get(startIdx)?.model?.scale ?? 1,
+        scale: selectionModelsRef.current.get(startIdx - 1)?.model.scale ?? 1,
         start: { node: range.startContainer, offset: range.startOffset },
         end: { node: range.endContainer, offset: range.endOffset },
         pageEl: startPage,
@@ -1852,7 +1856,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       if (startTail) {
         endpoints.push({
           pageIndex: startIdx - 1,
-          scale: selectionModelsRef.current.get(startIdx)?.model?.scale ?? 1,
+          scale: selectionModelsRef.current.get(startIdx - 1)?.model.scale ?? 1,
           start: { node: range.startContainer, offset: range.startOffset },
           end: startTail,
           pageEl: startPage,
@@ -1861,7 +1865,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       if (endHead) {
         endpoints.push({
           pageIndex: endIdx - 1,
-          scale: selectionModelsRef.current.get(endIdx)?.model?.scale ?? 1,
+          scale: selectionModelsRef.current.get(endIdx - 1)?.model.scale ?? 1,
           start: endHead,
           end: { node: range.endContainer, offset: range.endOffset },
           pageEl: endPage,
