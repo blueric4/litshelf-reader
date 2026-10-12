@@ -188,6 +188,59 @@ export interface SelectionKernel {
   invalidate(pageIndex?: number): void;
 }
 
+/**
+ * 运行时的诊断开关与环形日志。
+ *
+ * 为什么要有：用户报告"划词不对"时，我们**没有办法**在他机器上开控制台（实测他按 F12 打不开），
+ * 而"我这边构造的探针全绿、他那边全废"这种情况已经发生过一次 —— 没有现场数据就只能猜。
+ * 用法（Electron 里通过远程调试端口注入，或用户自己开 DevTools 执行）：
+ *   `__litshelfSelDebug(true)`  → 打开日志
+ *   `__litshelfSelLog`          → 读出最近 200 条
+ */
+export const selectionDebugState: { enabled: boolean; lines: string[] } = { enabled: false, lines: [] };
+
+if (typeof window !== 'undefined') {
+  (window as unknown as { __litshelfSelDebug?: (on?: boolean) => boolean }).__litshelfSelDebug = (on = true) => {
+    selectionDebugState.enabled = !!on;
+    if (!on) selectionDebugState.lines.length = 0;
+    return selectionDebugState.enabled;
+  };
+  Object.defineProperty(window, '__litshelfSelLog', {
+    configurable: true,
+    get: () => selectionDebugState.lines.slice(),
+  });
+}
+
+/** 诊断输出：控制台 + 环形日志（两者都要，现场取证靠后者） */
+export function selectionDebugLog(...args: unknown[]): void {
+  if (!selectionDebugState.enabled) return;
+  const line = args
+    .map((a) => {
+      if (typeof a === 'string') return a;
+      try {
+        return JSON.stringify(a);
+      } catch {
+        return String(a);
+      }
+    })
+    .join(' ');
+  selectionDebugState.lines.push(`${new Date().toISOString().slice(11, 23)} ${line}`);
+  if (selectionDebugState.lines.length > 200) selectionDebugState.lines.shift();
+  // eslint-disable-next-line no-console
+  console.debug('[zsel]', ...args);
+}
+
+/** 字符序号 → 该页文本层里的 DOM 端点（靠"文本层里的文字 = 模型里的字符"这一一对应关系） */
+interface DomIndex {
+  pageIndex: number;
+  /** 按 DOM 顺序摊平的每个文字节点：它覆盖的字符区间 [start, end) */
+  nodes: { node: Text; start: number; end: number }[];
+  /** 模型字符总数 */
+  total: number;
+  /** DOM 摊平出来的字符总数（与 total 不一致 → 索引不可信） */
+  domTotal: number;
+}
+
 export interface Rect {
   left: number;
   top: number;

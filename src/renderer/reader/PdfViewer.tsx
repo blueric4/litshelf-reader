@@ -38,6 +38,7 @@ import type {
   SelSnapshotInput,
   SelectionKernel,
 } from './selectionTypes';
+import { selectionDebugLog } from './selectionTypes';
 
 /**
  * 页宽/页高**比例**坐标下的版式分区（0~1），供夹取与重排共用。
@@ -933,6 +934,12 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       if (!report) return;
       let model: PageCharModel | null = null;
       try {
+        /**
+         * ⚠️ **不要传 `spans`**：让模型构建器自己从 `textLayer` 里采（它按 pdf.js 的建 span 规则
+         * 采"全部 `span:not(.markedContent)`"，**含空串项的 span**）。
+         * 这里手写过滤条件的话，很容易过滤成"只留非空 span"，于是与"str 已定义的文本项"
+         * 每页差几个 → 整页模型 null → 夹取从未运行（真实窗口实测：p2 是 1780 vs 1849）。
+         */
         model = buildSelectionModel({
           pageIndex: pageNumber - 1,
           pageEl: rootRef.current ?? layer,
@@ -951,6 +958,12 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         if (!cancelled) console.warn(`[reader] 第 ${pageNumber} 页划词字符模型建失败`, err);
         model = null;
       }
+      selectionDebugLog('上报划词模型', {
+        page: pageNumber,
+        model: model ? `${model.chars.length}字` : 'null',
+        spans: layer.querySelectorAll('span:not(.markedContent)').length,
+        items: items.length,
+      });
       report(pageNumber, model);
     };
 
@@ -1053,12 +1066,17 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         const layer = textLayerEl();
         if (layer?.querySelector('span')) {
           tagTextSpans(layer, itemXs);
-          reorderTextLayer(layer, regions);
           /**
-           * 挂完 + **重排完之后**才建划词字符模型（顺序不能反）：
-           * 模型必须反映"此刻 DOM 里 span 的实际顺序"，否则字符区间写回 DOM 会错位。
-           * 模型只在 span 文本与文本项逐字对得上时才建得出来，对不上就上报 null（内核会放弃纠正，
-           * 让浏览器原生选区原样留着 —— 宁可不夹，也不乱夹）。
+           * ⚠️ **不要再调 `reorderTextLayer(layer, regions)`**（保留函数体只为诊断，见它的注释）。
+           *
+           * 这里曾经先按"DOM span 的 rect + 视觉行分桶"重排一次 DOM，然后字符模型又按
+           * "文本项几何 + 分区/栏带"重排一次 —— **两套排序器互相不一致**，结果 DOM 顺序 ≠ 模型顺序：
+           * 模型认为"第 0 个字符"在栏尾、DOM 里第 0 个 span 却是页眉，夹取按模型算出来的端点
+           * 落到**页眉**上（真实窗口实测：在栏 1 里纵向拖，选区从「第４期 李 妍等：…」开始）。
+           *
+           * 顺序现在**只有一处权威**：`selectionModel.buildSelectionModel()` 内部的
+           * `selectionReadingOrder()`（它用的是 columnBands 的分区/栏带，比 DOM rect 那套更准，
+           * 而且它把 DOM 与文本项**一起**搬，天然同序）。
            */
           reportSelectionModel(layer, page, viewport, rawItems, regions);
           return true;
@@ -1814,6 +1832,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     // ⚠️ 键用 **0 起页号**（`page` 是 1 起的渲染页号）—— 与模型内部、内核的一致，
     // 漏掉这个换算会让后面所有 `get()` 全部落空（踩过，见 deps 里的注释）。
     const pageIndex = page - 1;
+    selectionDebugLog('模型登记', { page, chars: model ? model.chars.length : null });
     selectionKernelRef.current?.invalidate(pageIndex);
     if (!model) {
       selectionModelsRef.current.delete(pageIndex);

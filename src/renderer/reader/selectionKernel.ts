@@ -46,6 +46,7 @@ import type {
   TextPosition,
 } from './selectionTypes';
 import { getSelectionRanges, getTextFromSelectionRanges } from './zoteroSelection';
+import { selectionDebugLog, selectionDebugState } from './selectionTypes';
 
 /**
  * DOM 端点 → 字符位置。由接线方提供（它手里有每页的 `SelectionModel`）。
@@ -65,7 +66,11 @@ export interface KernelDeps {
   resolveDomPosition: DomPositionResolver;
   /** 页面元素 → 客户端坐标换算：返回该页左上角的 client 坐标（拿不到就 null） */
   pageOriginOf: (pageEl: HTMLElement) => { left: number; top: number } | null;
-  /** 诊断日志开关（默认关；排查划词问题时打开） */
+  /**
+   * 诊断日志开关。**运行时可开**，不用重新构建：
+   * 在窗口控制台里执行 `__litshelfSelDebug(true)` 之后，每次划词都会打 `[zsel] …`，
+   * 并把最近 200 条存在 `__litshelfSelLog` 里（用户按不了 F12 时靠它取证）。
+   */
   debug?: boolean;
 }
 
@@ -82,10 +87,32 @@ interface DomIndex {
 
 export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
   const log = (...args: unknown[]): void => {
-    if (deps.debug) console.debug('[zsel]', ...args);
+    if (deps.debug || selectionDebugState.enabled) selectionDebugLog(...args);
   };
+  /**
+   * 运行时状态面板：`window.__litshelfSelState()` 返回内核此刻的真实状态。
+   *
+   * 为什么要有：用户按不了 F12，而"我这边探针全绿、他那边全废"已经发生过一次 ——
+   * 没有现场数据就只能猜。它回答三个最关键的问题：
+   *   ① 这一页的字符模型建出来没有（`models` 里有没有这一页、多少字）；
+   *   ② 上一次选区两个端点解析到了哪（`lastEndpoints`）；
+   *   ③ 夹取到底跑了没有、结果是什么（`lastApply`）。
+   */
+  const state: {
+    models: Map<number, number>;
+    lastEndpoints: unknown;
+    lastApply: unknown;
+  } = { models: new Map(), lastEndpoints: null, lastApply: null };
 
   let owns = false;
+  /**
+   * 上一次我们写入选区的时间与"写完之后的原生文字"。
+   *
+   * 判据必须跟**原生文字**比，不能跟模型文字比：浏览器 `selection.toString()` 的空白
+   * （换行、行末空格）与模型拼出来的文字不可能逐字相同，跟模型比就永远不相等 →
+   * 每次补夹都再写一遍（真实窗口实测：1 秒内连写 9 次，选区结果对但白耗 CPU 且自激）。
+   */
+  const lastWrite = { at: 0, native: '' };
   const domIndexCache = new Map<number, DomIndex>();
 
   const pageElOf = (model: PageCharModel | null): HTMLElement | null => {
@@ -119,14 +146,62 @@ export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
     }
     const ranges = getSelectionRanges(list, pair.anchor, head);
     if (!ranges?.length || ranges[0].collapsed) return null;
-    return { ranges, head };
+    /**
+     * **收尾夹**：把每一段的端点收进"锚点栏流的连续区间"。
+     *
+     * 为什么还要夹一次：`clampToAnchorFlow` 只是把**焦点位置**挪到区间边界，后面算 range 时
+     * 还会经过 pdf.js 语义、flow 过滤、跨页拆分等几步，实测会多走 1~2 个字符
+     * （10 个多栏页里有 3 页端点是 `[1172]` 而区间上界是 `1170`）—— 差一两个字就正好**越进隔壁栏**。
+     * 这里按同一判据再收一次，保证"夹完一定在锚点流内"是**模型级不变量**，不依赖上游每一步都对。
+     */
+    const runOf = (anchorOffset: number): { lo: number; hi: number } | null => {
+      const chars = anchorEntry.model.chars;
+      if (!chars.length) return null;
+      const start = Math.max(0, Math.min(chars.length - 1, anchorOffset >= chars.length ? chars.length - 1 : anchorOffset));
+      const flow = chars[start]?.flowClass;
+      if (flow === undefined || flow === null) return null;
+      let lo = start;
+      while (lo > 0 && chars[lo - 1].flowClass === flow) lo -= 1;
+      let hi = start;
+      while (hi < chars.length - 1 && chars[hi + 1].flowClass === flow) hi += 1;
+      return { lo, hi };
+    };
+    const run = runOf(pair.anchor.offset);
+    const trimmed = run
+      ? ranges.map((r) => {
+          if (!r || r.collapsed || r.position.pageIndex !== pair.anchorPage) return r;
+          const lo = run.lo;
+          const hi = run.hi + 1; // 端点可以等于"最后一个字之后"
+          const a = Math.max(lo, Math.min(hi, r.anchorOffset));
+          const h = Math.max(lo, Math.min(hi, r.headOffset));
+          if (a === r.anchorOffset && h === r.headOffset) return r;
+          return { ...r, anchorOffset: a, headOffset: h, collapsed: a === h };
+        })
+      : ranges;
+    if (!trimmed.length || trimmed.every((r) => r.collapsed)) return null;
+    return { ranges: trimmed, head };
   };
 
   /** 一次原生选区 → 纯计算结果（不写 DOM） */
+  const resolveEndpoints = (
+    input: SelSnapshotInput,
+  ): EndpointPair | null => {
+    const pair = resolveEndpointsFor(input, log, deps.resolveDomPosition);
+    state.lastEndpoints = pair
+      ? {
+          anchor: { page: pair.anchorPage, offset: pair.anchor.offset },
+          head: { page: pair.headPage, offset: pair.head.offset },
+          anchorIn: pair.anchorPage + 1,
+          headIn: pair.headPage + 1,
+        }
+      : { failed: true };
+    return pair;
+  };
+
   const computeSnapshot = (
     input: SelSnapshotInput,
   ): { snapshot: SelSnapshot | null; ranges: ResolvedRangeLike[] | null; pair: EndpointPair | null } => {
-    const pair = resolveEndpoints(input, log, deps.resolveDomPosition);
+    const pair = resolveEndpoints(input);
     if (!pair) return { snapshot: null, ranges: null, pair: null };
     const computed = computeRanges(pair);
     if (!computed) return { snapshot: null, ranges: null, pair };
@@ -172,13 +247,36 @@ export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
     const sel = typeof window !== 'undefined' ? window.getSelection() : null;
     if (!sel) return null;
     const { snapshot, ranges, pair } = computeSnapshot(input);
-    if (!snapshot || !ranges || !pair) return null;
+    if (!snapshot || !ranges || !pair) {
+      state.lastApply = { skipped: !snapshot ? 'no-snapshot' : !ranges ? 'no-ranges' : 'no-pair' };
+      return null;
+    }
 
     // 端点已经被收窄过吗？没收窄（模型文字 == 原生选区文字）→ 一个字节都不写 DOM。
     // 这条是"手感"的底线：用户拖出来的正常选区绝不能被我们动过。
     if (normalizeForCompare(sel.toString()) === normalizeForCompare(snapshot.text)) {
       log('选区本来就合法，不写 DOM', { chars: snapshot.text.length });
+      state.lastApply = { skipped: 'already-valid', chars: snapshot.text.length };
       owns = true;
+      lastWrite.at = 0;
+      lastWrite.native = '';
+      return null;
+    }
+    /**
+     * **刚写过就别再写**（幂等）。
+     *
+     * 为什么要这条：浏览器 `selection.toString()` 的空白（换行、行末空格）与我们用模型拼出来的
+     * 文字**不可能逐字相同**，所以上面那条"已经合法"的判据在"刚夹过"之后**永远不成立** ——
+     * mouseup 后的每一拍补夹、每一条 `selectionchange` 都会再写一次
+     * （真实窗口实测：1 秒内连写 9 次）。选区结果是对的，但白耗 CPU，而且每次写又会触发新的
+     * `selectionchange`，形成无意义的循环。
+     */
+    if (
+      lastWrite.at &&
+      Date.now() - lastWrite.at < 400 &&
+      normalizeForCompare(sel.toString()) === normalizeForCompare(lastWrite.native)
+    ) {
+      state.lastApply = { skipped: 'just-wrote', chars: snapshot.text.length };
       return null;
     }
 
@@ -186,11 +284,13 @@ export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
     const textLayer = entry?.pageEl.querySelector<HTMLElement>('.rd-pdf-text') ?? null;
     if (!entry || !textLayer) {
       log('拿不到锚点页的文本层，放弃夹取');
+      state.lastApply = { skipped: 'no-layer' };
       return null;
     }
     const index = domIndexFor(entry.model, textLayer);
     if (index.domTotal !== index.total) {
       log('DOM 字符数与模型不一致，放弃夹取', { dom: index.domTotal, model: index.total });
+      state.lastApply = { skipped: 'dom-mismatch', dom: index.domTotal, model: index.total };
       return null;
     }
     const anchorRange = ranges.find((r) => r.anchor) ?? ranges[0];
@@ -199,18 +299,33 @@ export function createSelectionKernel(deps: KernelDeps): SelectionKernel {
     const b = domPositionOf(index, Math.max(headRange.anchorOffset, headRange.headOffset));
     if (!a || !b) {
       log('夹取后的端点建不出 DOM 位置，放弃', { a, b });
+      state.lastApply = { skipped: 'no-dom-position' };
       return null;
     }
     try {
       sel.setBaseAndExtent(a.node, a.offset, b.node, b.offset);
     } catch (err) {
       log('setBaseAndExtent 失败', err);
+      state.lastApply = { skipped: 'set-failed' };
       return null;
     }
     owns = true;
+    lastWrite.at = Date.now();
+    lastWrite.native = sel.toString();
+    state.lastApply = { wrote: true, modelChars: snapshot.text.length, head: snapshot.text.slice(0, 40) };
     log('夹取：原生 → 模型', { native: sel.toString().length, model: snapshot.text.length, head: snapshot.text.slice(0, 40) });
     return snapshot;
   };
+
+  // 运行时状态面板（见上面 state 的注释）：
+  if (typeof window !== 'undefined') {
+    (window as unknown as { __litshelfSelState?: () => unknown }).__litshelfSelState = () => ({
+      pages: [...state.models.entries()].map(([page, chars]) => ({ page: page + 1, chars })),
+      lastEndpoints: state.lastEndpoints,
+      lastApply: state.lastApply,
+      owns,
+    });
+  }
 
   return {
     apply,
@@ -295,7 +410,7 @@ interface EndpointPair {
  * `range.startContainer` 永远是文档顺序里靠前的那一端，而**锚点**是按下的那一端，
  * 反向拖选时两者相反 —— "锚点在哪个栏"依赖这一点，搞错就会夹错栏。
  */
-function resolveEndpoints(
+function resolveEndpointsFor(
   input: SelSnapshotInput,
   log: (...a: unknown[]) => void,
   resolveDomPosition: DomPositionResolver,

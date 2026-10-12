@@ -40,6 +40,7 @@ import type {
 // rectsDist 就是 Zotero 原样移植的那一份，冻结在 selectionTypes.ts 里（本文件不复刻实现）
 import { rectsDist } from './selectionTypes';
 import { TextLayerBoundaryMap } from './zoteroSelection';
+import { selectionDebugLog } from './selectionTypes';
 
 /** pdf.js 文本项里我们用到的字段（结构兼容，不 import pdfjs 类型，模块保持纯净） */
 interface PdfTextItemLike {
@@ -110,6 +111,8 @@ interface ItemGeometry {
 interface SpanPair {
   item: PdfTextItemLike;
   text: string;
+  /** 这个文本项对应的文本层 span（阅读顺序置换要对它一起排序/搬动） */
+  span: HTMLElement;
 }
 
 /** 一个文本项在 chars 里的落点与盒子（DOM 顺序） */
@@ -336,45 +339,194 @@ function itemSortKey(item: PdfTextItemLike, geo: PageGeometry, index: number): S
   return { index, y: (geo.y1 - f) * geo.scale, x: (e - geo.x0) * geo.scale };
 }
 
-/** 文字的多重集合（排序后拼接）：校验"span 与文本项来自同一份文本项" */
-const multisetKey = (texts: readonly string[]): string => [...texts].sort().join('\u0000');
-
 /**
- * 把"DOM 顺序的 span"与"同序的文本项"配对 —— **同号即同项**，所以这个函数几乎是恒等的。
+ * 把"DOM 顺序的文字 span"与"文本项"配对。
  *
- * 为什么可以这么简单（以及为什么以前不是）：
- *   · pdf.js `TextLayer#processItems` 对**每个 `str !== undefined` 的项**都 `#appendText()`，
- *     所以"第 i 个 span ↔ 第 i 个 `str` 已定义的项"是一一对应，连空串项也一样（空串 span 没文字）。
- *     按"非空 str"配对会永远差几个（实测每页差 2 个），整页模型建不起来 —— 这个坑踩过一个版本。
- *   · 模型现在自己从 `textLayer` 里**按 DOM 顺序**取 span（`collectTextSpans`），
- *     与 items 的顺序天然一致，不需要"按文字分组还原置换"那套东西（也就没有配错的风险）。
+ * ## 为什么不按顺序配对（血泪，有真实窗口实测）
  *
- * 仍然保留两条硬校验：数量不等、或文字对不上 → 返回 null（宁可不建，也不能让字符与 DOM 错位，
- * 因为错位的后果是**静默夹错栏**）。
+ * 我按 Zotero 的思路假设"第 i 个 span ↔ 第 i 个 str 已定义的项"，并要求个数相等。真机上两件事都不成立：
+ *
+ *   · **个数不等**：pdf.js 渲染时会跳过一部分项（页 2：span 1780 个 vs `str` 已定义 1849 个）；
+ *   · **顺序不同**：pdf.js v5 的 `TextLayer` 在渲染前会按位置给文本项排序（`#sortItems`），
+ *     所以**渲染出来的 DOM 顺序 ≠ `getTextContent()` 返回的顺序**（页 2 实测：DOM 第 20 个是正文
+ *     第一个字「段」，而同样文字的项出现在第 1840 项附近）。
+ *
+ * 这两个假设让**每一页**的模型都建不出来 → 内核拿不到模型 → 跨栏夹取一次都没运行过
+ * （用户："一项都不符合"）。而 tsc、单测、我自己造的探针全都发现不了，因为探针里我用了同一套假设。
+ *
+ * ## 现在的做法
+ *
+ * 模型真正需要的不是"顺序"，而是**每个 span 对应哪个文本项的盒子**。所以：
+ *   ① 先按文字做一趟**顺序匹配**（两边顺序一致时最精确，也最快）；
+ *   ② 顺序匹配失败就退回**几何匹配**：拿 span 的 `getBoundingClientRect()` 中心，
+ *      在还没用掉的文本项里找"算出来的盒子离它最近"的那个（只接受距离合理、且文字一致的候选）。
+ *
+ * 几何匹配只在真正需要时才跑（顺序一致的页面一次都不会走到那里）。文字一致是硬条件：
+ * 宁可这一页不建模型（夹取退回浏览器原生行为），也不能把字配错 —— 配错的后果是**静默夹错栏**。
  */
 function pairSpansWithItems(
   items: readonly unknown[],
   spans: readonly HTMLElement[],
-  _geo: PageGeometry,
+  geo: PageGeometry,
 ): SpanPair[] | null {
-  const defined: PdfTextItemLike[] = [];
+  if (!spans?.length) return null;
+  const candidates: PdfTextItemLike[] = [];
   for (const raw of items ?? []) {
     const it = asTextItem(raw);
-    if (it && it.str !== undefined) defined.push(it);
+    if (it && it.str !== undefined) candidates.push(it);
   }
-  if (!spans?.length) return null;
-  if (defined.length !== spans.length) return null;
+  if (!candidates.length) return null;
 
-  const pairs: SpanPair[] = [];
-  for (let i = 0; i < spans.length; i += 1) {
-    const text = spans[i]?.textContent ?? '';
-    const item = defined[i];
-    if (!item) return null;
-    if ((item.str ?? '') !== text) return null; // 同号不同文 → 不是同一份渲染，放弃
-    if (!text) continue; // 空串项：贡献 0 个字符
-    pairs.push({ item, text });
+  const texts: string[] = [];
+  for (const s of spans) {
+    const text = s?.textContent ?? '';
+    if (!text) return null; // 传到这里的必须是文字 span
+    texts.push(text);
   }
-  return pairs.length ? pairs : null;
+
+  const ordered = pairInOrder(candidates, texts, spans);
+  if (ordered && ordered.length === spans.length) return ordered;
+
+  const byGeometry = pairByGeometry(candidates, texts, spans, geo);
+  if (byGeometry) {
+    selectionDebugLog('配对退回几何匹配（DOM 顺序与文本项顺序不一致）', {
+      spans: spans.length,
+      items: candidates.length,
+    });
+    return byGeometry;
+  }
+  selectionDebugLog('配对失败：顺序匹配与几何匹配都没成', { spans: spans.length, items: candidates.length });
+  return null;
+}
+
+/** 顺序匹配：两边顺序一致时最精确。允许跳过"渲染没建 span 的项"，但不允许回头。 */
+function pairInOrder(
+  candidates: readonly PdfTextItemLike[],
+  texts: readonly string[],
+  spans: readonly HTMLElement[],
+): SpanPair[] | null {
+  const out: SpanPair[] = [];
+  let cursor = 0;
+  for (let i = 0; i < texts.length; i += 1) {
+    let found = -1;
+    for (let j = cursor; j < candidates.length; j += 1) {
+      if ((candidates[j].str ?? '') === texts[i]) {
+        found = j;
+        break;
+      }
+    }
+    if (found < 0) return null;
+    out.push({ item: candidates[found], text: texts[i], span: spans[i] });
+    cursor = found + 1;
+  }
+  return out.length ? out : null;
+}
+
+/** 文本项在页面上算出来的中心点（拿不到返回 null） */
+function itemCenter(item: PdfTextItemLike, geo: PageGeometry, textLength: number): { x: number; y: number } | null {
+  const ig = itemGeometry(item, geo, textLength, false);
+  if (!ig) return null;
+  const cx = ig.rotation === 0 ? ig.x + ig.length / 2 : ig.x + ig.size / 2;
+  const cy = ig.rotation === 0 ? ig.baselineY - ig.size / 2 : ig.baselineY - ig.length / 2;
+  return { x: cx, y: cy };
+}
+
+/**
+ * 几何匹配：span 的中心 ↔ 文本项算出来的中心。只接受**文字一致**且距离在阈值内的候选，
+ * 并且是全局贪心（每次挑当前距离最小的一对），避免局部错配把后面全带偏。
+ */
+function pairByGeometry(
+  candidates: readonly PdfTextItemLike[],
+  texts: readonly string[],
+  spans: readonly HTMLElement[],
+  geo: PageGeometry,
+): SpanPair[] | null {
+  if (!geo.pageWidth || !geo.pageHeight) return null;
+  const centers: ({ x: number; y: number } | null)[] = [];
+  for (let k = 0; k < candidates.length; k += 1) {
+    centers.push(itemCenter(candidates[k], geo, (candidates[k].str ?? '').length));
+  }
+
+  const spanCenters: ({ x: number; y: number } | null)[] = [];
+  for (const s of spans) {
+    try {
+      const r = s.getBoundingClientRect();
+      spanCenters.push({ x: r.left, y: r.top + r.height / 2 });
+    } catch {
+      spanCenters.push(null);
+    }
+  }
+  // span 的中心是**客户端**坐标，文本项中心是页面坐标：用页面元素原点换算一次
+  let origin: { x: number; y: number } | null = null;
+  try {
+    const pageEl = spans[0]?.closest('.rd-pdf-page') as HTMLElement | null;
+    const pr = pageEl?.getBoundingClientRect();
+    origin = pr ? { x: pr.left, y: pr.top } : null;
+  } catch {
+    origin = null;
+  }
+  if (!origin) return null;
+  for (let i = 0; i < spanCenters.length; i += 1) {
+    const c = spanCenters[i];
+    if (c) spanCenters[i] = { x: c.x - origin.x, y: c.y - origin.y };
+  }
+
+  const used = new Set<number>();
+  const result: (SpanPair | null)[] = new Array(spans.length).fill(null);
+  const pairs: { si: number; ci: number; d: number }[] = [];
+  for (let si = 0; si < spans.length; si += 1) {
+    const sc = spanCenters[si];
+    if (!sc) return null;
+    for (let ci = 0; ci < candidates.length; ci += 1) {
+      if ((candidates[ci].str ?? '') !== texts[si]) continue;
+      const ic = centers[ci];
+      if (!ic) continue;
+      pairs.push({ si, ci, d: Math.hypot(ic.x - sc.x, ic.y - sc.y) });
+    }
+  }
+  /**
+   * 全局贪心：每次取当前**距离最小**的一对。
+   *
+   * ⚠️ **不要设距离上限**（我加过 48px，结果真机上最近的一对是 53px，整页配不上）。
+   * 安全性来自"**文字必须完全一致**"这条硬条件：距离只用来在**多个同文字**的候选里挑最近的那个，
+   * 挑错了也只是两个相同的字互换盒子（选区文字永远正确）。所以这里只关心"有没有同文字的项"，
+   * 不关心它们离得多远（缩放、CSS 手势 transform 都会让绝对值不可靠）。
+   */
+  pairs.sort((a, b) => a.d - b.d);
+  for (const p of pairs) {
+    if (result[p.si] || used.has(p.ci)) continue;
+    result[p.si] = { item: candidates[p.ci], text: texts[p.si], span: spans[p.si] };
+    used.add(p.ci);
+  }
+  for (let i = 0; i < result.length; i += 1) {
+    if (!result[i]) {
+      // 把这一对的具体数字打出来（坐标差多少、同文字的项有几个）——排查几何匹配失败的唯一线索
+      const sc = spanCenters[i];
+      let best = Number.POSITIVE_INFINITY;
+      let bestIdx = -1;
+      if (sc) {
+        for (let ci = 0; ci < candidates.length; ci += 1) {
+          if ((candidates[ci].str ?? '') !== texts[i]) continue;
+          const ic = centers[ci];
+          if (!ic) continue;
+          const d = Math.hypot(ic.x - sc.x, ic.y - sc.y);
+          if (d < best) {
+            best = d;
+            bestIdx = ci;
+          }
+        }
+      }
+      selectionDebugLog('几何匹配失败在某个 span 上', {
+        text: texts[i].slice(0, 12),
+        spanCenter: sc ? { x: Math.round(sc.x), y: Math.round(sc.y) } : null,
+        sameTextItems: candidates.filter((c) => (c.str ?? '') === texts[i]).length,
+        nearest: bestIdx >= 0 ? { d: Math.round(best), str: (candidates[bestIdx].str ?? '').slice(0, 12) } : null,
+        pageSize: { w: Math.round(geo.pageWidth), h: Math.round(geo.pageHeight) },
+      });
+      return null; // 有一个 span 配不上 → 整页不建（宁可不夹，也不夹错）
+    }
+  }
+  return result as SpanPair[];
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +792,112 @@ export function __debugModelStages(
 }
 
 // ---------------------------------------------------------------------------
+// 阅读顺序（DOM 重排 + 模型顺序的**唯一**来源）
+// ---------------------------------------------------------------------------
+
+/** 排序用的一行盒子（x / top / bottom 都是页面坐标系 CSS 像素） */
+interface OrderNode {
+  domIndex: number;
+  x: number;
+  top: number;
+  bottom: number;
+  size: number;
+}
+
+/** 落在哪个分区（y 比例）；分区间缝隙取最近的 */
+function orderRegionIndex(regions: readonly ModelRegion[], yRatio: number): number {
+  let best = 0;
+  let bestD = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < regions.length; i += 1) {
+    const r = regions[i];
+    const d = yRatio < r.top ? r.top - yRatio : yRatio >= r.bottom ? yRatio - r.bottom : 0;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** 落在该分区哪条栏（x 比例）；落在栏缝里取最近的一条 */
+function orderBandIndex(bands: readonly { start: number; end: number }[], xRatio: number): number {
+  let best = 0;
+  let bestD = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < bands.length; i += 1) {
+    const b = bands[i];
+    const d = xRatio < b.start ? b.start - xRatio : xRatio > b.end ? xRatio - b.end : 0;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+
+
+/**
+ * 按阅读顺序排列**已配对**的文本项，返回置换 order[k] = "第 k 个位置放原来第几个"。
+ *
+ * 排序键（与 columnBands.ts 的分区 / 栏带同一套口径）：
+ *   分区（上→下）→ 区内【多栏区：栏，左→右；通栏区：不切栏】→ 视觉行（上→下）→ 行内 x（左→右）
+ *
+ * 视觉行按**竖直重叠**归并（不是行号）：上标数字、混排西文 run 的 y 会略有不同，
+ * 只要两个盒子竖直重叠超过较矮者的 50% 就算同一行 —— 这样一行里的字在顺序上一定连续。
+ *
+ * 为什么输入是"配对结果"而不是 items + spans：pdf.js 渲染时会跳过一部分文本项
+ * （真实窗口实测：span 1780 个 vs str 已定义的项 1849 个），两者**个数不等**，
+ * 所以必须先按文字配对、再排序。返回 null = 几何缺失算不出来，调用方保持原顺序。
+ */
+function readingOrderOfPairs(
+  pairs: readonly SpanPair[],
+  geo: PageGeometry,
+  regions: readonly ModelRegion[],
+): number[] | null {
+  if (pairs.length < 2) return null;
+  const normRegions = normalizeRegions(regions, geo);
+  const nodes: OrderNode[] = [];
+  for (let i = 0; i < pairs.length; i += 1) {
+    const ig = itemGeometry(pairs[i].item, geo, pairs[i].text.length, false);
+    if (!ig) return null;
+    nodes.push({ domIndex: i, x: ig.x, top: ig.baselineY - ig.size, bottom: ig.baselineY, size: ig.size });
+  }
+
+  const withKey = nodes.map((n) => {
+    const yRatio = (n.top + n.bottom) / 2 / geo.pageHeight;
+    const ri = orderRegionIndex(normRegions, yRatio);
+    const region = normRegions[ri];
+    const bi = region.bands.length > 1 ? orderBandIndex(region.bands, n.x / geo.pageWidth) : 0;
+    return { ...n, ri, bi };
+  });
+
+  const out: number[] = [];
+  const regionIds = [...new Set(withKey.map((n) => n.ri))].sort((a, b) => a - b);
+  for (const ri of regionIds) {
+    const inRegion = withKey.filter((n) => n.ri === ri);
+    const bandIds = [...new Set(inRegion.map((n) => n.bi))].sort((a, b) => a - b);
+    for (const bi of bandIds) {
+      const inBand = inRegion.filter((n) => n.bi === bi);
+      const lines: (OrderNode & { ri: number; bi: number })[][] = [];
+      for (const n of [...inBand].sort((a, b) => a.top - b.top || a.x - b.x)) {
+        const line = lines.find((l) => {
+          const ref = l[0];
+          const overlap = Math.min(ref.bottom, n.bottom) - Math.max(ref.top, n.top);
+          return overlap > 0.5 * Math.min(ref.size, n.size);
+        });
+        if (line) line.push(n);
+        else lines.push([n]);
+      }
+      for (const line of lines) {
+        out.push(...[...line].sort((a, b) => a.x - b.x).map((n) => n.domIndex));
+      }
+    }
+  }
+  if (out.length !== nodes.length) return null;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // 模型构建（纯几何，不碰 DOM 布局）
 // ---------------------------------------------------------------------------
 
@@ -657,7 +915,29 @@ export function charModelFromItems(
 ): PageCharModel | null {
   const geo = resolvePageGeometry(viewport, viewBox);
   if (!geo) return null;
-  const pairs = pairSpansWithItems(items, spans, geo);
+
+  const unordered = pairSpansWithItems(items, spans, geo);
+  if (!unordered || !unordered.length) return null;
+
+  const order = readingOrderOfPairs(unordered, geo, regions);
+  let pairs = unordered;
+  if (order && !order.every((v, i) => v === i)) {
+    const orderedPairs = order.map((i) => unordered[i]);
+    const orderedSpans = orderedPairs.map((p) => p.span);
+    const host = orderedSpans[0]?.parentElement;
+    if (host && orderedSpans.every((s) => s.parentElement === host)) {
+      try {
+        const frag = host.ownerDocument.createDocumentFragment();
+        for (const s of orderedSpans) frag.appendChild(s);
+        host.appendChild(frag);
+      } catch {
+        /* 拿不到 DOM（单测环境）→ 只重排数组，模型顺序仍与传入的 spans 对齐 */
+      }
+    }
+    pairs = orderedPairs;
+    selectionDebugLog('按阅读顺序重排文本层', { pairs: pairs.length });
+  }
+
   if (!pairs || !pairs.length) return null;
 
   const chars: ZoteroChar[] = [];
@@ -787,17 +1067,76 @@ function collectTextSpans(textLayer: HTMLElement): HTMLElement[] {
  */
 export function buildSelectionModel(input: SelectionModelInput): PageCharModel | null {
   if (!input) return null;
-  const spans = input.spans?.length ? [...input.spans] : collectTextSpans(input.textLayer);
-  if (!spans.length) return null;
+  let domSpans = input.spans?.length ? [...input.spans] : collectTextSpans(input.textLayer);
+  if (!domSpans.length) {
+    selectionDebugLog('建模型失败：文本层里一个 span 都没有', { page: input.pageIndex + 1 });
+    return null;
+  }
+  /**
+   * **把文字 span 提到文本层容器下（拍平）** —— 必须在**采 span 之前**做。
+   *
+   * pdf.js 在带标记内容的页面上把文字 span 挂在 `.markedContent` wrapper 里，而 wrapper 是
+   * `display: contents`（视觉透明）。不拍平的话：
+   *   ① `.markedContent` 下的文字 span **选不出来**（`span:not(.markedContent)` 只匹配 wrapper 自身，
+   *      所以采到的 span 数会比"str 已定义的文本项"少 → 整页模型 null）；
+   *   ② 浏览器给的端点会落在 **wrapper 元素**上（现场实测：`anchor = SPAN.markedContent`），
+   *      而不是具体的文字节点。
+   * 拍平只是把 span 从 wrapper 提到容器下，绝对定位不受影响，**不动外观只改选择语义**。
+   */
+  try {
+    const host = input.textLayer;
+    const nested = input.textLayer.querySelectorAll<HTMLElement>('.markedContent span:not(.markedContent)');
+    if (nested.length) {
+      const frag = host.ownerDocument.createDocumentFragment();
+      for (const s of [...nested]) frag.appendChild(s);
+      host.appendChild(frag);
+      domSpans = input.spans?.length ? [...nested, ...domSpans.filter((s) => s.parentElement === host)] : collectTextSpans(input.textLayer);
+      // 拍平后重新按 DOM 顺序采一次（顺序必须与浏览器看到的一致）
+      domSpans = [...host.querySelectorAll<HTMLElement>('span:not(.markedContent)')];
+    }
+  } catch {
+    /* 拿不到 DOM（单测环境）→ 保持原样 */
+  }
+
+  /**
+   * 文本项（`str !== undefined`）。**注意：个数不要求与 span 相等** ——
+   * 真实窗口实测 pdf.js 渲染时会跳过一部分项（页 2：span 1780 vs 项 1849），
+   * 以前在这里卡"数量不等就 null"，导致**每一页**模型都建不出来、夹取从未运行。
+   * 配对交给 `pairSpansWithItems` 按文字顺序贪心对齐（有文字证据，不依赖个数）。
+   */
+  const definedItems: PdfTextItemLike[] = [];
+  for (const raw of input.items ?? []) {
+    const it = asTextItem(raw);
+    if (it && it.str !== undefined) definedItems.push(it);
+  }
+
+  /**
+   * ## 顺序：**唯一权威在这里**
+   *
+   * pdf.js 按内容流顺序建 span，中文期刊的内容流常常"左右栏交替"，不等于阅读顺序；
+   * 而跨栏硬禁止用的是"锚点流 + **序号连续**"这个判据，顺序错了收窄就会切在版面上不相邻的位置。
+   *
+   * 所以这里算一次阅读顺序置换，交给 `charModelFromItems` **同时**用于：
+   *   ① 重排 DOM span；② 重排文本项；③ 按新顺序打行/段/空格标记。
+   * 三者必须用**同一个置换**（标记是"相邻两项"的函数，顺序换了就得重打）。
+   *
+   * ⚠️ 历史教训（两个都真实发生过，别再犯）：
+   *   · 只在 `PdfViewer` 里重排 DOM、不重排文本项 → 模型建不起来（13 页里 12 页 null）；
+   *   · `reorderTextLayer` 与模型内部各排一次、两套算法不一致 → DOM 顺序 ≠ 模型顺序，
+   *     夹取按模型算出的端点落到**页眉**上（真实窗口实测：栏内纵向拖，选区从「第４期…」开始）。
+   */
   const model = charModelFromItems(
-    input.items,
-    spans,
+    definedItems,
+    domSpans,
     input.viewport,
     input.viewBox,
     input.regions,
     input.pageIndex,
   );
-  if (!model) return null;
+  if (!model) {
+    selectionDebugLog('建模型失败：charModelFromItems 返回 null（几何 / 文字配对）', { page: input.pageIndex + 1 });
+    return null;
+  }
   if (input.pageEl && input.textLayer) {
     let win: Window | null = null;
     try {
@@ -809,7 +1148,8 @@ export function buildSelectionModel(input: SelectionModelInput): PageCharModel |
       win,
       pageEl: input.pageEl,
       textLayer: input.textLayer,
-      spans,
+      // 建模型时用的 span（已经按阅读顺序排过）—— 对齐表要用它算"第 i 个字符 ↔ 第 i 个文字节点"
+      spans: domSpans,
       boundaryTried: false,
     });
   }
@@ -892,6 +1232,21 @@ export class SelectionModel {
   resolveDomPosition(node: Node, offset: number, affinity: 'start' | 'end'): TextPosition | null {
     const chars = this._model.chars;
     if (!node || !chars.length) return null;
+    /**
+     * **先拦"端点在文本层容器（或它的祖先）上"**（浏览器最常见的畸形端点）：
+     * 指针落在字间空隙 / 行末空白时，Chromium 给的是"容器 + 子节点序号"，不是 span 里的文字位置。
+     * 这类端点必须按**语义**解析：起点 → 容器第一个字；终点 → 容器最后一个字。
+     * 走对齐表会按"容器里第 N 个文字节点"折算，得到一个和指针位置无关的偏移
+     * （真实窗口实测：栏 1 里纵向拖，起点被解析到**页首**，于是选中整段页眉 —— 用户报的"莫名从页首开始选"）。
+     */
+    const el = node.nodeType === 1 ? (node as Element) : node.parentElement;
+    const refs = domRefsByModel.get(this._model);
+    const layerEl = refs?.textLayer ?? null;
+    const containerLike = !!el && (el === layerEl || (!!layerEl && el.contains(layerEl)));
+    if (containerLike) {
+      selectionDebugLog('端点落在文本层容器上 → 按语义取首/末字', { page: this._model.pageIndex + 1, affinity, chars: chars.length });
+      return { pageIndex: this._model.pageIndex, offset: affinity === 'end' ? chars.length : 0 };
+    }
     const map = this.ensureBoundaryMap();
     if (map) {
       try {
@@ -986,7 +1341,8 @@ export class SelectionModel {
     const chars = this._model.chars;
     const pageRect = refs.pageEl.getBoundingClientRect();
     const isText = node.nodeType === 3; // Node.TEXT_NODE
-    const el = isText ? node.parentElement : node.nodeType === 1 ? (node as Element) : null; // Node.ELEMENT_NODE
+    const isElement = node.nodeType === 1; // Node.ELEMENT_NODE
+    const el = isText ? node.parentElement : isElement ? (node as Element) : null;
     const elRect = el ? el.getBoundingClientRect() : null;
 
     let px = NaN;
