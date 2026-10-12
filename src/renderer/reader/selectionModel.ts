@@ -1,0 +1,1012 @@
+/**
+ * 字符模型构建器（Zotero 式划词内核的第 ② 块）：把一页的文字变成"一个字符一个盒子"的模型。
+ *
+ * 为什么要这一层：
+ *   原生选区只能给出"两个 DOM 端点"，而浏览器是**按 DOM 顺序**拉区间的 —— 多栏论文里选区就会越到
+ *   相邻栏、拖一下行间距就变成整页。Zotero 的做法是：先把一页的文字变成字符数组（每字带
+ *   `rect / inlineRect / rotation / 行段标记`），再把 DOM 端点映射成字符序号，最后**在字符数组上**
+ *   算区间、画矩形。本文件负责前半段（模型 + 栏流），`zoteroSelection.ts` 负责后半段。
+ *
+ * 三条必须记住的口径（都是真实缺陷逼出来的，别再改回去）：
+ *
+ *   ① **坐标系**：`items[i].transform` 是 PDF 用户空间（y 向上），而且原点**不一定是 (0,0)**
+ *      —— 真实 CNKI 论文的 `page.view` 左下角约 (28.35, 14.17)（CropBox 偏移）。所以 CSS 像素是
+ *      `x = (e - viewBox[0]) * scale`、`yTop = (viewBox[3] - f - h) * scale`。
+ *      **少了"减 viewBox 原点"这一步，整套模型会整体偏移约 54px** —— 这正是老 bug
+ *      "选区右端固定在 613"的根因（docs/HANDOFF-column-selection-fix.md §2）。
+ *
+ *   ② **模型按 DOM 顺序建**：产品挂完文本层后会按视觉阅读顺序重排 span
+ *      （`PdfViewer.tsx::reorderTextLayer`，多栏页必需，否则原生拖选会横穿整页），
+ *      于是 `items` 的顺序与 DOM 里 span 的顺序**不一致**（历史上实测过 1438 vs 1392 的错位）。
+ *      所以：逐个 span（DOM 顺序）建字符，文字取自 `span.textContent`，
+ *      几何取自与它配对的那个文本项。顺序一致时按标配对；被物理重排过时用"文字多重集合 +
+ *      组内几何排序"把置换还原回来（见 `pairSpansWithItems`）。**数量不等就整体返回 null** ——
+ *      宁可不建模型（退回老行为），也不能让"模型第 i 个字符 ↔ DOM 第 i 个字符"错位。
+ *
+ *   ③ **单栏页绝不能被切成多条流**：整页只有一条栏带时，所有字符给同一个 flowClass，
+ *      否则纵向拖过行间距会被 `anchorRunRange` 误夹（手感用例"行间距拖 31 字 / 拖到空白 308 字"）。
+ *
+ * 纯几何部分（`charModelFromItems`）不依赖任何 DOM 布局，可以在 node 里直接单测；
+ * 只有 DOM↔字符对齐表（`TextLayerBoundaryMap`）是懒建的，需要浏览器。
+ */
+
+import type {
+  ModelRegion,
+  PageCharModel,
+  TextLayerBoundaryMapLike,
+  TextPosition,
+  ZoteroChar,
+} from './selectionTypes';
+// rectsDist 就是 Zotero 原样移植的那一份，冻结在 selectionTypes.ts 里（本文件不复刻实现）
+import { rectsDist } from './selectionTypes';
+import { TextLayerBoundaryMap } from './zoteroSelection';
+
+/** pdf.js 文本项里我们用到的字段（结构兼容，不 import pdfjs 类型，模块保持纯净） */
+interface PdfTextItemLike {
+  str?: string;
+  /** [a, b, c, d, e, f]：a/b 是文本方向的 cos/sin，e/f 是基线原点（PDF 用户空间，y 向上） */
+  transform?: ArrayLike<number> | null;
+  /** 文本方向的长度（横排）或字号（竖排） */
+  width?: number;
+  /** 字号（横排）或文本方向的长度（竖排） */
+  height?: number;
+  /** pdf.js 标记：这一项是它那一行的行尾 */
+  hasEOL?: boolean;
+  fontName?: string;
+}
+
+export interface SelectionModelInput {
+  /** 页面序号（0 起） */
+  pageIndex: number;
+  /** 页面元素 .rd-pdf-page：模型 rect 全部相对它左上角（CSS 像素） */
+  pageEl: HTMLElement;
+  /** 文本层容器 .rd-pdf-text（懒建 DOM↔字符对齐表用） */
+  textLayer: HTMLElement;
+  /** 与 TextLayerBuilder 完全同参拿到的文本项（page.getTextContent({includeMarkedContent:true, disableNormalization:true}).items） */
+  items: readonly unknown[];
+  /**
+   * 文本层里**按 DOM 顺序**排列的非空 span（文字取自它，几何与 items 按顺序一一配对）。
+   * 必须按 DOM 顺序传：产品重排过文本层，这个顺序才是选区偏移量的顺序。
+   */
+  spans: readonly HTMLElement[];
+  /** 该页的 viewport（pdf.js）：用 scale / width / height */
+  viewport: { scale: number; width: number; height: number; transform: number[] };
+  /** page.view = [x0, y0, x1, y1]（PDF 用户空间，CropBox 可能不是 0 原点） */
+  viewBox: readonly number[];
+  /** columnBands.ts 算好的分区（比例 0~1）；单栏页也要给（一条整幅栏带）。给了绝对像素也认，见 normalizeRegions */
+  regions: readonly ModelRegion[];
+}
+
+/** 一页的几何常量（坐标换算用） */
+interface PageGeometry {
+  scale: number;
+  /** viewBox 原点：所有坐标都要减掉它（历史真因见文件头 ①） */
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+  /** 页面 CSS 像素尺寸（= viewport.width / height） */
+  pageWidth: number;
+  pageHeight: number;
+}
+
+/** 一个文本项换算到 CSS 像素后的几何 */
+interface ItemGeometry {
+  /** 文本起点 x（CSS 像素，页面元素左上为原点） */
+  x: number;
+  /** 基线 y（CSS 像素，y 向下） */
+  baselineY: number;
+  /** 文本方向长度（CSS 像素，已乘 scale） */
+  length: number;
+  /** 字号（CSS 像素，已乘 scale） */
+  size: number;
+  /** 0 / 90 / 180 / 270 */
+  rotation: number;
+}
+
+/** 一个 span 与它配对到的文本项（DOM 顺序） */
+interface SpanPair {
+  item: PdfTextItemLike;
+  text: string;
+}
+
+/** 一个文本项在 chars 里的落点与盒子（DOM 顺序） */
+interface PairInfo {
+  item: PdfTextItemLike;
+  geo: ItemGeometry;
+  /** 本项占用的字符区间 [lo, hi]（含端点） */
+  lo: number;
+  hi: number;
+  /** 首 / 末个**可见**字符（跳过软连字符这类 ignorable） */
+  first: number;
+  last: number;
+  /** 本项的并集盒子 [x1, y1, x2, y2] */
+  box: [number, number, number, number];
+  /** 首字符的栏流 id（分组按视觉行时当键用） */
+  flow: string | undefined;
+}
+
+/** 一条视觉行（同一行上所有字符共用一个 inlineRect） */
+interface LineBucket {
+  vertical: boolean;
+  /** 跨轴中心：横排 = y 中心；竖排 = x 中心 */
+  cross: number;
+  flow: string | undefined;
+  box: [number, number, number, number];
+}
+
+type Box = [number, number, number, number];
+
+// ---------------------------------------------------------------------------
+// 小工具
+// ---------------------------------------------------------------------------
+
+const num = (v: unknown, fallback: number): number =>
+  typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+
+const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
+
+/** 软连字符：不参与正文（Zotero 的 `ignorable`） */
+const isIgnorable = (c: string): boolean => c === '\u00AD';
+
+/** 字符宽度权重：CJK（含全角标点）算 1，其余算 0.5 —— 中英混排按权重切区间才不会错位 */
+const cjkAdvance = (c: string): number => ((c.codePointAt(0) ?? 0) > 0x2e80 ? 1 : 0.5);
+
+const isVerticalRotation = (rotation: number): boolean => rotation === 90 || rotation === 270;
+
+/** 把弧度角就近取整成 0 / 90 / 180 / 270 */
+function normalizeRotation(rad: number): number {
+  if (!Number.isFinite(rad)) return 0;
+  const deg = (rad * 180) / Math.PI;
+  const snapped = Math.round(deg / 90) * 90;
+  return ((snapped % 360) + 360) % 360;
+}
+
+function asTextItem(raw: unknown): PdfTextItemLike | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const it = raw as PdfTextItemLike;
+  return typeof it.str === 'string' ? it : null;
+}
+
+function unionBox(target: Box, extra: readonly [number, number, number, number]): void {
+  if (extra[0] < target[0]) target[0] = extra[0];
+  if (extra[1] < target[1]) target[1] = extra[1];
+  if (extra[2] > target[2]) target[2] = extra[2];
+  if (extra[3] > target[3]) target[3] = extra[3];
+}
+
+/** 文本方向（阅读推进方向）上的区间：横排取 x，竖排取 y */
+const advStart = (box: readonly [number, number, number, number], rotation: number): number =>
+  isVerticalRotation(rotation) ? box[1] : box[0];
+const advEnd = (box: readonly [number, number, number, number], rotation: number): number =>
+  isVerticalRotation(rotation) ? box[3] : box[2];
+/** 跨轴（行与行之间）区间：横排取 y，竖排取 x */
+const crossStart = (box: readonly [number, number, number, number], rotation: number): number =>
+  isVerticalRotation(rotation) ? box[0] : box[1];
+const crossEnd = (box: readonly [number, number, number, number], rotation: number): number =>
+  isVerticalRotation(rotation) ? box[2] : box[3];
+
+// ---------------------------------------------------------------------------
+// 几何：文本项 → CSS 像素
+// ---------------------------------------------------------------------------
+
+function resolvePageGeometry(
+  viewport: SelectionModelInput['viewport'],
+  viewBox: readonly number[],
+): PageGeometry | null {
+  const scale = num(viewport?.scale, 0);
+  if (!(scale > 0)) return null;
+  const x0 = num(viewBox?.[0], 0);
+  const y0 = num(viewBox?.[1], 0);
+  const x1 = num(viewBox?.[2], NaN);
+  const y1 = num(viewBox?.[3], NaN);
+  if (!Number.isFinite(x1) || !Number.isFinite(y1) || !(x1 > x0) || !(y1 > y0)) return null;
+  const pageWidth = num(viewport?.width, 0) > 0 ? num(viewport.width, 0) : (x1 - x0) * scale;
+  const pageHeight = num(viewport?.height, 0) > 0 ? num(viewport.height, 0) : (y1 - y0) * scale;
+  if (!(pageWidth > 0) || !(pageHeight > 0)) return null;
+  return { scale, x0, y0, x1, y1, pageWidth, pageHeight };
+}
+
+/**
+ * 文本项 → CSS 像素几何。**必须减 viewBox 原点、y 必须翻转**（文件头 ①）。
+ * 拿不到 transform 就返回 null：宁可整页不建模型（调用方退回老行为），也不要错位。
+ */
+function itemGeometry(item: PdfTextItemLike, geo: PageGeometry, textLength: number): ItemGeometry | null {
+  const tf = item.transform;
+  if (!tf || tf.length < 6) return null;
+  const a = num(tf[0], NaN);
+  const b = num(tf[1], NaN);
+  const e = num(tf[4], NaN);
+  const f = num(tf[5], NaN);
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(e) || !Number.isFinite(f)) return null;
+
+  const sizePdf = Math.abs(num(item.height, 0)) || Math.abs(num(tf[3], 0)) || Math.abs(a) || 0;
+  const size = sizePdf * geo.scale;
+  if (!(size > 0)) return null;
+
+  let length = Math.abs(num(item.width, 0)) * geo.scale;
+  if (!(length > 0)) {
+    // pdf.js 对某些项（纯标记 / 零宽 run）给的 width 是 0。这里给一个粗估长度，
+    // 保证**字符数、字符顺序**与 DOM 仍然一一对应（宁可盒子粗一点，也不能少字）。
+    length = size * Math.max(1, textLength) * 0.5;
+  }
+
+  return {
+    x: (e - geo.x0) * geo.scale,
+    // 基线 y：PDF 用户空间 y 向上，页面顶边是 viewBox[3]，减完原点再乘 scale
+    baselineY: (geo.y1 - f) * geo.scale,
+    length,
+    size,
+    rotation: normalizeRotation(Math.atan2(b, a)),
+  };
+}
+
+/** 单个字符的盒子：沿文本方向按权重切区间，厚度 = 字号 */
+function charBox(geo: ItemGeometry, d0: number, d1: number): Box {
+  const { x, baselineY: y, size, rotation } = geo;
+  if (rotation === 90) return [x, y - d1, x + size, y - d0]; // 文本向上
+  if (rotation === 270) return [x - size, y + d0, x, y + d1]; // 文本向下
+  if (rotation === 180) return [x - d1, y - size, x - d0, y]; // 文本向左
+  return [x + d0, y - size, x + d1, y]; // 横排：文本向右，盒子在基线上方
+}
+
+/**
+ * 把一个文本项的文字切成"每字一个盒子"。
+ * pdf.js 的中文项常常一个字一项，但英文/数字是一整串，所以必须按字符宽度权重均分 `width`：
+ * CJK 权重 1、非 CJK 0.5，这样中英混排（"第1章"）也不会错位。
+ * 软连字符是零宽的：权重给 0，免得把后面的字整体挤偏。
+ */
+function charBoxesOf(geo: ItemGeometry, text: string): Box[] {
+  const weights: number[] = [];
+  let total = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const w = isIgnorable(text[i]) ? 0 : cjkAdvance(text[i]);
+    weights.push(w);
+    total += w;
+  }
+  if (!(total > 0)) {
+    for (let i = 0; i < weights.length; i += 1) weights[i] = 1;
+    total = Math.max(1, weights.length);
+  }
+  const out: Box[] = [];
+  let acc = 0;
+  for (let i = 0; i < weights.length; i += 1) {
+    const s = acc / total;
+    acc += weights[i];
+    const t = acc / total;
+    out.push(charBox(geo, geo.length * s, geo.length * t));
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 配对：DOM 顺序的 span ↔ 非空 str 的文本项
+// ---------------------------------------------------------------------------
+
+/** 排序键（只比相对先后，不比绝对距离：缩放手势的 CSS 拉伸是整体一致的，不破坏顺序） */
+interface SortKey {
+  index: number;
+  y: number;
+  x: number;
+}
+
+const byTopLeft = (p: SortKey, q: SortKey): number => p.y - q.y || p.x - q.x;
+
+/** span 的视觉位置（**只用来排序**；字符几何仍然取自配对到的文本项，不用 rect 量几何） */
+function spanSortKey(el: HTMLElement, index: number): SortKey | null {
+  try {
+    const r = el.getBoundingClientRect();
+    if (!r) return null;
+    if (!r.width && !r.height && !r.top && !r.left) return null; // 还没布局 / 已脱离文档
+    return { index, y: r.top, x: r.left };
+  } catch {
+    return null;
+  }
+}
+
+/** 文本项在页面坐标下的位置（**只用来排序**） */
+function itemSortKey(item: PdfTextItemLike, geo: PageGeometry, index: number): SortKey | null {
+  const tf = item.transform;
+  if (!tf || tf.length < 6) return null;
+  const e = num(tf[4], NaN);
+  const f = num(tf[5], NaN);
+  if (!Number.isFinite(e) || !Number.isFinite(f)) return null;
+  return { index, y: (geo.y1 - f) * geo.scale, x: (e - geo.x0) * geo.scale };
+}
+
+/** 文字的多重集合（排序后拼接）：校验"span 与文本项来自同一份文本项" */
+const multisetKey = (texts: readonly string[]): string => [...texts].sort().join('\u0000');
+
+/**
+ * 把"DOM 顺序的非空 span"与"`str !== ''` 的文本项"配对（pdf.js 对每个非空 `str` 项恰好挂一个 span）。
+ * **数量不等就返回 null** —— 这是"模型第 i 个字符 ↔ DOM 第 i 个字符"的前提。
+ * 空 str 的项必须跳过：pdf.js 的 `#appendText` 只在 `hasText`（`str !== ''`）时把 span 挂进 DOM。
+ *
+ * 两条路径：
+ *   ① **顺序一致（绝大多数页面）**：直接按下标配对，与契约一致。
+ *   ② **文本层被 `reorderTextLayer` 物理重排过**（多栏/有 markedContent wrapper 的页面会真的
+ *      搬 DOM 节点：`frag.appendChild(spans[i])`）：这时按下标配对会把"栏 2 的几何"安到
+ *      "栏 1 的文字"上 —— 字符 rect 与 flowClass 全错，跨栏夹取会夹到隔壁栏去。
+ *      重排只是**置换**，所以先要求文字的多重集合完全一致（硬证据），再按文字分组、
+ *      组内用同一套几何键（上→下、左→右）排序后一一对应，把置换还原回来。
+ *      拿不到 span 的视觉位置（未布局 / node 环境）就整体返回 null：宁可不建，也不能错位。
+ */
+function pairSpansWithItems(
+  items: readonly unknown[],
+  spans: readonly HTMLElement[],
+  geo: PageGeometry,
+): SpanPair[] | null {
+  const visible: PdfTextItemLike[] = [];
+  for (const raw of items ?? []) {
+    const it = asTextItem(raw);
+    if (it && it.str !== '') visible.push(it);
+  }
+  if (!spans?.length) return null;
+  if (visible.length !== spans.length) return null;
+
+  const texts: string[] = [];
+  for (let i = 0; i < spans.length; i += 1) {
+    const text = spans[i]?.textContent ?? '';
+    if (!text) return null; // 传进来的必须是"非空 span"
+    texts.push(text);
+  }
+
+  let identity = true;
+  for (let i = 0; i < visible.length; i += 1) {
+    if (visible[i].str !== texts[i]) {
+      identity = false;
+      break;
+    }
+  }
+  if (identity) return texts.map((text, i) => ({ item: visible[i], text }));
+
+  if (multisetKey(texts) !== multisetKey(visible.map((it) => it.str ?? ''))) return null;
+
+  const spanGroups = new Map<string, number[]>();
+  for (let i = 0; i < texts.length; i += 1) {
+    const g = spanGroups.get(texts[i]);
+    if (g) g.push(i);
+    else spanGroups.set(texts[i], [i]);
+  }
+  const itemGroups = new Map<string, number[]>();
+  for (let i = 0; i < visible.length; i += 1) {
+    const t = visible[i].str ?? '';
+    const g = itemGroups.get(t);
+    if (g) g.push(i);
+    else itemGroups.set(t, [i]);
+  }
+
+  const out: (SpanPair | null)[] = new Array<SpanPair | null>(spans.length).fill(null);
+  for (const [text, spanIdx] of spanGroups) {
+    const itemIdx = itemGroups.get(text);
+    if (!itemIdx || itemIdx.length !== spanIdx.length) return null;
+    const spanKeys: SortKey[] = [];
+    for (const i of spanIdx) {
+      const k = spanSortKey(spans[i], i);
+      if (!k) return null;
+      spanKeys.push(k);
+    }
+    const itemKeys: SortKey[] = [];
+    for (const i of itemIdx) {
+      const k = itemSortKey(visible[i], geo, i);
+      if (!k) return null;
+      itemKeys.push(k);
+    }
+    spanKeys.sort(byTopLeft);
+    itemKeys.sort(byTopLeft);
+    /**
+     * 组内一一对应。**不要在这里加"排序键必须唯一"之类的自检**（我加过，又删了）：
+     *
+     * 同一组 = 文字完全相同。当两个同样的字在 span 侧与 item 侧的**先后不一致**时
+     * （例如同一个字在栏 1 与栏 2 各出现一次，因为跨栏共线，y 相同、x 不同），
+     * 任意一种配对在几何上都**说得通**：p 配 q 就给 p 用 q 的盒子，q 配 p 就给 q 用 p 的盒子，
+     * 而 p、q 的文字本来就一样，所以选区文字永远正确，只是"哪个盒子属于哪个字符"两种解释都自洽。
+     * 这跟"配对本身错了"是两回事 —— 真正的错配是**文字**配错（张冠李戴），那个由上面的
+     * 多重集合校验挡掉；号码层面还有接线方 `domTotal === total` 的对照兜底。
+     * 若在这里因为"键不够唯一"就返回 null，等于把本来能用的多栏页夹取**关掉**，
+     * 那才是真正的回归。
+     */
+    for (let k = 0; k < spanKeys.length; k += 1) {
+      out[spanKeys[k].index] = { item: visible[itemKeys[k].index], text };
+    }
+  }
+  for (const p of out) if (!p) return null;
+  return out as SpanPair[];
+}
+
+// ---------------------------------------------------------------------------
+// 分区（栏带）→ 比例坐标
+// ---------------------------------------------------------------------------
+
+/**
+ * 把分区归一成**比例坐标（0~1）**。契约要求传比例，但为了不让接线方踩"比例 / 绝对像素"的坑，
+ * 这里做一次自适应：整组数值都不超过 1（含一点容差）就按比例用，否则按绝对像素除以页宽/页高。
+ * 没有分区时给一条整幅栏带 —— 单栏语义，任何情况下都不会夹取。
+ */
+function normalizeRegions(
+  regions: readonly ModelRegion[] | null | undefined,
+  geo: PageGeometry,
+): ModelRegion[] {
+  // 注意：`Array.isArray(x)` 对 `readonly T[]` 会把类型窄化成 `any[]`（TS 的已知行为），
+  // 所以这里必须显式标注 src 的类型，否则后面 map 回调参数全变隐式 any（noImplicitAny 直接报错）。
+  const src: readonly ModelRegion[] = Array.isArray(regions) ? regions : [];
+  if (!src.length) return [{ top: 0, bottom: 1, full: true, bands: [{ start: 0, end: 1 }] }];
+
+  let ratioLike = true;
+  for (const r of src) {
+    const rt = num(r.top, 0);
+    const rb = num(r.bottom, 1);
+    if (rt > 1.0001 || rb > 1.0001 || rt < -0.0001 || rb < -0.0001) {
+      ratioLike = false;
+      break;
+    }
+    for (const bd of r.bands ?? []) {
+      const bs = num(bd?.start, 0);
+      const be = num(bd?.end, 1);
+      if (bs > 1.0001 || be > 1.0001 || bs < -0.0001 || be < -0.0001) {
+        ratioLike = false;
+        break;
+      }
+    }
+    if (!ratioLike) break;
+  }
+  const kx = ratioLike ? 1 : 1 / geo.pageWidth;
+  const ky = ratioLike ? 1 : 1 / geo.pageHeight;
+
+  return src.map((r) => {
+    const t = clamp(num(r.top, 0) * ky, 0, 1);
+    const b = clamp(num(r.bottom, 1) * ky, 0, 1);
+    const rawBands: { start: number; end: number }[] = r.bands?.length ? [...r.bands] : [{ start: 0, end: 1 }];
+    const bands = rawBands
+      .map((bd) => ({
+        start: clamp(num(bd?.start, 0) * kx, 0, 1),
+        end: clamp(num(bd?.end, 1) * kx, 0, 1),
+      }))
+      .filter((bd) => bd.end > bd.start);
+    return {
+      top: Math.min(t, b),
+      bottom: Math.max(t, b),
+      full: !!r.full,
+      bands: bands.length ? bands : [{ start: 0, end: 1 }],
+    };
+  });
+}
+
+/** y 比例落在哪个分区；落在分区之间的缝隙时取最近的一个 */
+function regionIndexAtYRatio(regions: readonly ModelRegion[], y: number): number {
+  for (let i = 0; i < regions.length; i += 1) {
+    if (y >= regions[i].top && y < regions[i].bottom) return i;
+  }
+  let best = 0;
+  let bestD = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < regions.length; i += 1) {
+    const d = y < regions[i].top ? regions[i].top - y : y - regions[i].bottom;
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** x 比例落在第几条栏带；落在栏缝里返回 -1 */
+function bandIndexAtXRatio(bands: readonly { start: number; end: number }[], x: number): number {
+  for (let i = 0; i < bands.length; i += 1) {
+    if (x >= bands[i].start && x <= bands[i].end) return i;
+  }
+  return -1;
+}
+
+/** 落在栏缝里的字符：用 rectsDist 找最近的栏带（栏带矩形用该分区的 y 范围补齐） */
+function nearestBandIndex(
+  region: ModelRegion,
+  rect: readonly [number, number, number, number],
+  geo: PageGeometry,
+): number {
+  let best = 0;
+  let bestD = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < region.bands.length; i += 1) {
+    const b = region.bands[i];
+    const bandRect: Box = [
+      b.start * geo.pageWidth,
+      region.top * geo.pageHeight,
+      b.end * geo.pageWidth,
+      region.bottom * geo.pageHeight,
+    ];
+    const d = rectsDist(bandRect, rect);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/**
+ * 给每个字符打"栏流"（flowClass）：
+ *   字符中心 → y 比例找分区 → x 比例找栏带；落在栏缝里按 rectsDist 归最近的栏。
+ * **整页只要没有任何多栏分区，就整页统一成一个流（`0:0`）** —— 单栏页绝不能被切成多条流，
+ * 否则纵向拖过行间距会被夹取误夹（文件头 ③）。
+ */
+function assignFlowClasses(chars: ZoteroChar[], regions: readonly ModelRegion[], geo: PageGeometry): void {
+  const hasMultiColumn = regions.some((r) => r.bands.length >= 2);
+  if (!hasMultiColumn) {
+    for (const ch of chars) ch.flowClass = '0:0';
+    return;
+  }
+  for (const ch of chars) {
+    const cx = (ch.rect[0] + ch.rect[2]) / 2;
+    const cy = (ch.rect[1] + ch.rect[3]) / 2;
+    const ri = regionIndexAtYRatio(regions, cy / geo.pageHeight);
+    const region = regions[ri];
+    let bi = bandIndexAtXRatio(region.bands, cx / geo.pageWidth);
+    if (bi < 0) bi = nearestBandIndex(region, ch.rect, geo);
+    ch.flowClass = `${ri}:${bi}`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 视觉行分组 → inlineRect
+// ---------------------------------------------------------------------------
+
+/**
+ * 按视觉行分组，并把"整行矩形"回填到每个字符的 `inlineRect`（Zotero 的语义：同一行的字符共用行矩形，
+ * `getRectsFromChars` 据此按行合并选区矩形）。
+ *
+ * 分组键里带上 flowClass：双栏页左右两栏同一 y 上的两行必须分成两条行矩形，
+ * 否则行矩形会横跨栏缝，画出来的选区就是一个横贯整页的蓝条。
+ */
+function buildLines(chars: ZoteroChar[], infos: readonly PairInfo[]): LineBucket[] {
+  const buckets: LineBucket[] = [];
+  const lineOf: LineBucket[] = [];
+  for (const info of infos) {
+    const vertical = isVerticalRotation(info.geo.rotation);
+    const cross = vertical ? (info.box[0] + info.box[2]) / 2 : (info.box[1] + info.box[3]) / 2;
+    const tol = Math.max(1, info.geo.size * 0.5);
+    let best: LineBucket | null = null;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (const L of buckets) {
+      if (L.vertical !== vertical || L.flow !== info.flow) continue;
+      const d = Math.abs(L.cross - cross);
+      if (d <= tol && d < bestD) {
+        bestD = d;
+        best = L;
+      }
+    }
+    if (!best) {
+      best = { vertical, cross, flow: info.flow, box: [...info.box] as Box };
+      buckets.push(best);
+    } else {
+      unionBox(best.box, info.box);
+    }
+    lineOf.push(best);
+  }
+  for (let i = 0; i < infos.length; i += 1) {
+    const box = lineOf[i].box;
+    const info = infos[i];
+    for (let k = info.lo; k <= info.hi; k += 1) {
+      chars[k].inlineRect = [box[0], box[1], box[2], box[3]];
+    }
+  }
+  return lineOf;
+}
+
+// ---------------------------------------------------------------------------
+// 行 / 段 / 空格标记
+// ---------------------------------------------------------------------------
+
+/**
+ * 行段标记（喂给 `getTextFromChars` 与 `getRectsFromChars`）：
+ *   - `lineBreakAfter`：本项末字，且下一项不在同一视觉行 —— y 中心差 > 0.6 行高，或栏流不同；
+ *     另外 pdf.js 的 `hasEOL === true` 也直接算行尾。
+ *   - `paragraphBreakAfter`：相邻两项**跨栏缝**（栏流不同），或同一栏内行间距 > 1.8 倍行高。
+ *   - `spaceAfter`：同一视觉行、两项之间横向间隙 > 0.25 字号。
+ *   - `ignorable`：软连字符（在切字符时打）。
+ */
+function assignBreakFlags(chars: ZoteroChar[], infos: readonly PairInfo[], lines: readonly LineBucket[]): void {
+  for (let i = 0; i < infos.length; i += 1) {
+    const cur = infos[i];
+    const curLine = lines[i];
+    const next = i + 1 < infos.length ? infos[i + 1] : null;
+    const nextLine = next ? lines[i + 1] : null;
+    const curChar = chars[cur.last];
+    const lineHeight = Math.max(cur.geo.size, next ? next.geo.size : 0, 1);
+
+    let lineBreak = next === null; // 页尾：最后一个字后面也算一次换行
+    let paraBreak = false;
+    let space = false;
+
+    if (next && nextLine) {
+      const nextFirst = chars[next.first];
+      const sameFlow = curChar.flowClass !== undefined && curChar.flowClass === nextFirst.flowClass;
+      const crossDelta = Math.abs(nextLine.cross - curLine.cross);
+      if (!sameFlow || crossDelta > 0.6 * lineHeight) {
+        lineBreak = true;
+        if (!sameFlow) {
+          paraBreak = true; // 跨栏缝 = 段末
+        } else {
+          const gap = Math.abs(
+            crossStart(next.box, cur.geo.rotation) - crossEnd(cur.box, cur.geo.rotation),
+          );
+          if (gap > 1.8 * lineHeight) paraBreak = true;
+        }
+      } else {
+        const gap = Math.abs(advStart(next.box, cur.geo.rotation) - advEnd(cur.box, cur.geo.rotation));
+        if (gap > 0.25 * cur.geo.size) space = true;
+      }
+    }
+
+    if (cur.item.hasEOL === true) lineBreak = true;
+    curChar.lineBreakAfter = lineBreak;
+    if (paraBreak) curChar.paragraphBreakAfter = true;
+    if (space) curChar.spaceAfter = true;
+    // 末字若是 ignorable（软连字符），也把行尾标记打在它身上：读文本时跳过它也不会丢掉换行
+    if (lineBreak && cur.hi !== cur.last) chars[cur.hi].lineBreakAfter = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 模型构建（纯几何，不碰 DOM 布局）
+// ---------------------------------------------------------------------------
+
+/**
+ * 从"DOM 顺序的 span + 同序配对的文本项 + 分区"建字符模型。不依赖 DOM 布局，可在 node 里单测。
+ * 任何会导致"字符数 / 字符顺序与 DOM 对不上"的情况一律返回 null（宁可不建也不能错位）。
+ */
+export function charModelFromItems(
+  items: readonly unknown[],
+  spans: readonly HTMLElement[],
+  viewport: SelectionModelInput['viewport'],
+  viewBox: readonly number[],
+  regions: readonly ModelRegion[] = [],
+  pageIndex = 0,
+): PageCharModel | null {
+  const geo = resolvePageGeometry(viewport, viewBox);
+  if (!geo) return null;
+  const pairs = pairSpansWithItems(items, spans, geo);
+  if (!pairs || !pairs.length) return null;
+
+  const chars: ZoteroChar[] = [];
+  const infos: PairInfo[] = [];
+  for (const pair of pairs) {
+    const itemGeo = itemGeometry(pair.item, geo, pair.text.length);
+    if (!itemGeo) return null; // 几何缺失 → 整页不建（否则字符与 DOM 会错位）
+    const boxes = charBoxesOf(itemGeo, pair.text);
+    const lo = chars.length;
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+    for (let i = 0; i < pair.text.length; i += 1) {
+      const box = boxes[i];
+      chars.push({
+        c: pair.text[i],
+        rect: [box[0], box[1], box[2], box[3]],
+        inlineRect: [box[0], box[1], box[2], box[3]], // 先占位，buildLines 里回填成整行矩形
+        rotation: itemGeo.rotation,
+        ignorable: isIgnorable(pair.text[i]),
+      });
+      if (box[0] < minX) minX = box[0];
+      if (box[1] < minY) minY = box[1];
+      if (box[2] > maxX) maxX = box[2];
+      if (box[3] > maxY) maxY = box[3];
+    }
+    const hi = chars.length - 1;
+    let first = lo;
+    let last = hi;
+    for (let k = lo; k <= hi; k += 1) {
+      if (!chars[k].ignorable) {
+        first = k;
+        break;
+      }
+    }
+    for (let k = hi; k >= lo; k -= 1) {
+      if (!chars[k].ignorable) {
+        last = k;
+        break;
+      }
+    }
+    const box: Box = [minX, minY, maxX, maxY];
+    infos.push({ item: pair.item, geo: itemGeo, lo, hi, first, last, box, flow: undefined });
+  }
+  if (!chars.length) return null;
+
+  // ① 栏流（flowClass）：先定流，行分组要按流分开
+  const normRegions = normalizeRegions(regions, geo);
+  assignFlowClasses(chars, normRegions, geo);
+  for (const info of infos) info.flow = chars[info.first]?.flowClass ?? chars[info.lo]?.flowClass;
+
+  // ② 视觉行 → inlineRect
+  const lines = buildLines(chars, infos);
+
+  // ③ 行 / 段 / 空格标记
+  assignBreakFlags(chars, infos, lines);
+
+  return {
+    pageIndex: Number.isFinite(pageIndex) ? pageIndex : 0,
+    viewBox: [geo.x0, geo.y0, geo.x1, geo.y1],
+    chars,
+    scale: geo.scale,
+    pageWidth: geo.pageWidth,
+    pageHeight: geo.pageHeight,
+    boundaryMap: null, // 懒建：第一次 resolveDomPosition 时再建
+    regions: normRegions,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// DOM ↔ 字符 对齐（懒建）+ SelectionModel
+// ---------------------------------------------------------------------------
+
+/** 建模型时留下的 DOM 引用（WeakMap：模型对象被回收就一起回收，也不会污染 PageCharModel 的字段） */
+interface DomRefs {
+  win: Window | null;
+  pageEl: HTMLElement;
+  textLayer: HTMLElement;
+  /** 建模型时按 DOM 顺序传入的 span（懒建对齐表用） */
+  spans: readonly HTMLElement[];
+  /** 对齐表试建过没有：失败就不必每次都抛一遍异常 */
+  boundaryTried: boolean;
+}
+
+const domRefsByModel = new WeakMap<PageCharModel, DomRefs>();
+
+/** 文本层里 document order 的非空 span */
+function collectTextSpans(textLayer: HTMLElement): HTMLElement[] {
+  const out: HTMLElement[] = [];
+  try {
+    for (const el of Array.from(textLayer.querySelectorAll('span'))) {
+      if ((el.textContent ?? '') !== '') out.push(el as HTMLElement);
+    }
+  } catch {
+    /* 拿不到就当空：退回建模型时记下的 spans */
+  }
+  return out;
+}
+
+/**
+ * 建字符模型。除了模型本体，还会把 DOM 引用记进 WeakMap 供 `SelectionModel` 懒建对齐表。
+ */
+export function buildSelectionModel(input: SelectionModelInput): PageCharModel | null {
+  if (!input) return null;
+  const local = input.spans ? [...input.spans] : [];
+  const model = charModelFromItems(
+    input.items,
+    local,
+    input.viewport,
+    input.viewBox,
+    input.regions,
+    input.pageIndex,
+  );
+  if (!model) return null;
+  if (input.pageEl && input.textLayer) {
+    let win: Window | null = null;
+    try {
+      win = input.pageEl.ownerDocument?.defaultView ?? null;
+    } catch {
+      win = null;
+    }
+    domRefsByModel.set(model, {
+      win,
+      pageEl: input.pageEl,
+      textLayer: input.textLayer,
+      spans: local,
+      boundaryTried: false,
+    });
+  }
+  return model;
+}
+
+/** 点 (x, y) 最近的字符序号（先按 rectsDist，再按中心距，最后按序号，保证确定性） */
+function nearestCharIndex(chars: readonly ZoteroChar[], x: number, y: number): number {
+  let best = -1;
+  let bestD = Number.POSITIVE_INFINITY;
+  let bestC = Number.POSITIVE_INFINITY;
+  const point: Box = [x, y, x, y];
+  for (let i = 0; i < chars.length; i += 1) {
+    const r = chars[i].rect;
+    const d = rectsDist(point, r);
+    const dx = (r[0] + r[2]) / 2 - x;
+    const dy = (r[1] + r[3]) / 2 - y;
+    const c = dx * dx + dy * dy;
+    if (d < bestD - 1e-9 || (Math.abs(d - bestD) <= 1e-9 && c < bestC)) {
+      bestD = d;
+      bestC = c;
+      best = i;
+    }
+  }
+  return best;
+}
+
+/** 中心落在某个矩形内的字符序号（按模型顺序） */
+function charIndicesInsideRect(chars: readonly ZoteroChar[], rect: Box, pad = 1.5): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < chars.length; i += 1) {
+    const r = chars[i].rect;
+    const cx = (r[0] + r[2]) / 2;
+    const cy = (r[1] + r[3]) / 2;
+    if (cx >= rect[0] - pad && cx <= rect[2] + pad && cy >= rect[1] - pad && cy <= rect[3] + pad) {
+      out.push(i);
+    }
+  }
+  return out;
+}
+
+/** 塌陷 Range 的插入点矩形（最准的"光标位置"）；拿不到返回 null */
+function caretRectOf(node: Node, offset: number): DOMRect | null {
+  try {
+    const doc = node.ownerDocument;
+    if (!doc || typeof doc.createRange !== 'function') return null;
+    const range = doc.createRange();
+    range.setStart(node, offset);
+    range.collapse(true);
+    return range.getBoundingClientRect();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 一页字符模型的操作入口：DOM 端点 ↔ 字符序号、点 → 字符、栏流、栏流夹取区间。
+ *
+ * 说明：`model` 可以是任意来源的 `PageCharModel`（哪怕是从缓存里反序列化出来的）。
+ * 只有当它是 `buildSelectionModel` 产出的那个对象时，才拿得到 DOM 引用去懒建 Zotero 的
+ * `TextLayerBoundaryMap`；拿不到就退回几何口径（node 的 rect → 最近字符 + affinity）。
+ */
+export class SelectionModel {
+  private readonly _model: PageCharModel;
+
+  constructor(model: PageCharModel) {
+    this._model = model;
+  }
+
+  get model(): PageCharModel {
+    return this._model;
+  }
+
+  /**
+   * DOM 端点 → 字符序号。
+   * 先走 Zotero 的 `TextLayerBoundaryMap`（懒建、缓存回 `model.boundaryMap`）；
+   * 建不出来 / 映射不出来 → 几何兜底：用端点的 rect（优先塌陷 Range 的插入点）取最近字符，
+   * `affinity` 决定取这个字之前（'start'）还是之后（'end'）。
+   */
+  resolveDomPosition(node: Node, offset: number, affinity: 'start' | 'end'): TextPosition | null {
+    const chars = this._model.chars;
+    if (!node || !chars.length) return null;
+    const map = this.ensureBoundaryMap();
+    if (map) {
+      try {
+        const mapped = map.getReaderOffset(node, offset, affinity);
+        if (typeof mapped === 'number' && Number.isFinite(mapped)) {
+          return { pageIndex: this._model.pageIndex, offset: clamp(Math.round(mapped), 0, chars.length) };
+        }
+      } catch {
+        /* 映射表内部出错 → 几何兜底 */
+      }
+    }
+    return this.geometricPosition(node, offset, affinity);
+  }
+
+  /** 页面内 CSS 像素坐标 → 最近的字符序号（按下点解析锚点用） */
+  positionAtPoint(x: number, y: number): TextPosition | null {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const chars = this._model.chars;
+    if (!chars.length) return null;
+    const idx = nearestCharIndex(chars, x, y);
+    if (idx < 0) return null;
+    return { pageIndex: this._model.pageIndex, offset: idx };
+  }
+
+  /** 锚点字符所在"栏流"的 id（flowClass）；拿不到返回 null */
+  flowClassAt(offset: number): string | null {
+    const chars = this._model.chars;
+    if (!chars.length) return null;
+    const i = clamp(Math.round(Number.isFinite(offset) ? offset : 0), 0, chars.length);
+    if (i < chars.length && chars[i].flowClass) return chars[i].flowClass ?? null;
+    if (i > 0 && chars[i - 1].flowClass) return chars[i - 1].flowClass ?? null;
+    return null;
+  }
+
+  /**
+   * 把 chars 收窄成"锚点栏流"内的连续字符（跨栏硬禁止的**唯一判据**）：返回该栏流的**极大连续区间**
+   * `[lo, hi]`（含端点）—— 包含锚点、区间内每个字符的 flowClass 都等于锚点的、且再往外一个字就不是了。
+   * 调用方把原生选区的头端夹进这个区间即可（单栏页会返回整段，等于不夹）。
+   *
+   * 纯函数式：只读 `chars[i].flowClass`，不碰 DOM 状态，可以在 node 里直接单测。
+   * `headOffset` 只在锚点这一端拿不到 flowClass 时兜底（取头端的栏流）。
+   */
+  anchorRunRange(anchorOffset: number, headOffset: number): { lo: number; hi: number } {
+    const chars = this._model.chars;
+    const n = chars.length;
+    if (!n) return { lo: 0, hi: 0 };
+    const anchor = clamp(Math.round(Number.isFinite(anchorOffset) ? anchorOffset : 0), 0, n - 1);
+    const head = clamp(Math.round(Number.isFinite(headOffset) ? headOffset : 0), 0, n - 1);
+    const flow = chars[anchor].flowClass ?? chars[head].flowClass;
+    if (flow === undefined) return { lo: 0, hi: n - 1 }; // 没有栏流信息 → 不夹（整段）
+    let lo = anchor;
+    let hi = anchor;
+    while (lo > 0 && chars[lo - 1].flowClass === flow) lo -= 1;
+    while (hi < n - 1 && chars[hi + 1].flowClass === flow) hi += 1;
+    return { lo, hi };
+  }
+
+  /** 懒建 Zotero 的 DOM↔字符对齐表；建不出来就一直返回 null（由几何兜底接管） */
+  private ensureBoundaryMap(): TextLayerBoundaryMapLike | null {
+    const model = this._model;
+    if (model.boundaryMap) return model.boundaryMap;
+    const refs = domRefsByModel.get(model);
+    if (!refs || refs.boundaryTried || !model.chars.length) return null;
+    const win = refs.win;
+    if (!win) return null;
+    refs.boundaryTried = true;
+    const candidates: HTMLElement[][] = [collectTextSpans(refs.textLayer), [...refs.spans]];
+    for (const spans of candidates) {
+      if (!spans.length || spans.length !== refs.spans.length) continue;
+      try {
+        const map: TextLayerBoundaryMapLike = new TextLayerBoundaryMap(win, refs.textLayer, spans, model.chars);
+        if (map) {
+          model.boundaryMap = map;
+          return map;
+        }
+      } catch {
+        /* 建不出来 → 几何兜底 */
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 几何兜底：DOM 端点 → 字符序号。
+   * 端点位置优先取"塌陷 Range 的插入点"（最接近光标的真实位置），拿不到才退回 node 自身的 rect 中心。
+   * 若端点是文本节点，则用 `offset / 文本长度` 在"落在这个 node 矩形里的那些字符"上按比例取 ——
+   * 这比单纯"最近字符"更贴 caret；元素节点（offset 是子节点序号）没有这个信息，就用最近字符 + affinity。
+   */
+  private geometricPosition(node: Node, offset: number, affinity: 'start' | 'end'): TextPosition | null {
+    const refs = domRefsByModel.get(this._model);
+    if (!refs) return null;
+    const chars = this._model.chars;
+    const pageRect = refs.pageEl.getBoundingClientRect();
+    const isText = node.nodeType === 3; // Node.TEXT_NODE
+    const el = isText ? node.parentElement : node.nodeType === 1 ? (node as Element) : null; // Node.ELEMENT_NODE
+    const elRect = el ? el.getBoundingClientRect() : null;
+
+    let px = NaN;
+    let py = NaN;
+    const caret = caretRectOf(node, offset);
+    if (
+      caret &&
+      Number.isFinite(caret.left) &&
+      (caret.width > 0 || caret.height > 0 || caret.left !== 0 || caret.top !== 0)
+    ) {
+      px = caret.left - pageRect.left;
+      py = caret.top - pageRect.top + (caret.height || 0) / 2;
+    } else if (elRect && (elRect.width > 0 || elRect.height > 0)) {
+      px = elRect.left - pageRect.left + elRect.width / 2;
+      py = elRect.top - pageRect.top + elRect.height / 2;
+    } else {
+      return null;
+    }
+    if (!Number.isFinite(px) || !Number.isFinite(py)) return null;
+
+    const text = isText ? (node as Text).data : null;
+    if (text && elRect && elRect.width > 0 && elRect.height > 0) {
+      const run: Box = [
+        elRect.left - pageRect.left,
+        elRect.top - pageRect.top,
+        elRect.right - pageRect.left,
+        elRect.bottom - pageRect.top,
+      ];
+      const inside = charIndicesInsideRect(chars, run);
+      if (inside.length) {
+        const k = Math.round((clamp(offset, 0, text.length) / Math.max(1, text.length)) * inside.length);
+        if (k >= inside.length) return { pageIndex: this._model.pageIndex, offset: inside[inside.length - 1] + 1 };
+        return { pageIndex: this._model.pageIndex, offset: inside[k] };
+      }
+    }
+
+    const near = nearestCharIndex(chars, px, py);
+    if (near < 0) return null;
+    // affinity：起点取这个字**之前**的位置，终点取**之后**的位置（与 Zotero 一致）
+    return { pageIndex: this._model.pageIndex, offset: affinity === 'end' ? near + 1 : near };
+  }
+}

@@ -1,5 +1,62 @@
 # 交接文档：划词"禁止跨栏"的残留泄漏怎么修
 
+> ⚠️ **2026-10 更新：本文档 §2/§3/§4 描述的"自研夹取"路线已经被整体替换。**
+> 现在划词走的是 **Zotero reader 的字符模型路线**（照抄 `zotero/reader` 的真实实现），
+> 见下面 §-1。§2 及之后的内容**只作为历史取证记录**保留（那些数字仍然有价值：它们是"为什么不能
+> 用几何判据夹栏"的证据），但**不要再按 §3 的处方改代码**。
+
+---
+
+## -1. 现行架构（Zotero 式划词）——先读这一节
+
+用户的结论是："选取问题一直解决不了，直接照抄 Zotero 的代码"。所以这一版把 §2/§3 那套
+"拖动中改锚点 + 按 DOM span 的 rect 判栏归属 + 松手后锁 0.7~2.5 秒看护"整段删掉了。
+
+### 文件分工（新增 5 个文件，都在 `src/renderer/reader/`）
+
+| 文件 | 对应 Zotero 的 | 干什么 |
+|---|---|---|
+| `zoteroSelection.ts` | `src/pdf/selection.js` | 字符模型上的 range 计算（rectsDist / getClosestOffset / getRangeByPosition / getRangeByRects / getSelectionRanges / getModifiedSelectionRanges / getWordSelectionRanges …） |
+| `selectionFlow.ts` | `src/pdf/selection-flow.mjs` + `native-text-selection-map.mjs` | 归一化单位对齐（`alignTextUnits` / `buildReaderUnitMap` / `getNormalizedUnits`）、DOM↔字符 的 `TextLayerBoundaryMap`、栏流隔离 `isolateCharsToAnchorFlow` |
+| `selectionModel.ts` | `pdf-document-data.mjs` 给的 `chars`（Zotero 在 worker 里抽）+ `page.js` | 把 pdf.js 的文本项 + 栏带变成**字符模型**（`ZoteroChar[]`，每个字符带 rect / inlineRect / lineBreakAfter / flowClass） |
+| `selectionKernel.ts` | `src/pdf/native-text-selection.js` | 划词内核：读原生选区的两个端点 → 映射进模型 → **跨栏硬禁止**（收窄到锚点栏流）→ 只写一次 `setBaseAndExtent` |
+| `selectionTypes.ts` | — | 上面四块之间的**冻结接口**（纯类型 + rectsDist / quickIntersectRect / getCenterRect） |
+
+接线在 `PdfViewer.tsx`：`PdfPage` 在"文本层挂好 + 重排完"之后建模型并 `onSelectionModel` 上报；
+父级拿着内核在 `mouseup` / `selectionchange`（非拖动中）时收一次选区，矩形与文字**都从模型算**。
+
+### 这一版的三条硬规矩（改代码请遵守）
+
+1. **拖动交给浏览器，我们只在选区成型后收窄端点。** 历史上"拖动中逐帧改写选区"的实现
+   与浏览器打架，快拖时会出现 1~3 字碎选区（commit 8cce94a）。
+2. **跨栏判据是离散的**：看"这个字符属于哪条栏流（`flowClass`）"，**不是**看
+   "x 有没有越过栏带上界"。因为两端对齐的中文会把行末单字推进栏缝（实测 `「连」` 在
+   `[595~613]` 而栏缝是 `555~595`），几何判据必然在栏缝里来回跳。
+3. **单栏页整页同一条栏流。** 单栏页被切成多条流，纵向拖过行间距就会被误夹
+   （历史上"行间距拖 31 字 → 2 字"就是这么来的）。
+
+### 与 Zotero 的唯一差异
+
+Zotero 的 `isolateCharsToAnchorFlow()` 在两端 `flowClass` 不同时返回 `null`（语义：这是一次
+跨流选择，保留用户完整的扫动）。多栏 PDF 里那个 `null` 正好就是用户抱怨的"选区越过栏缝"，
+所以本产品改成：两端不同流时**收窄到锚点那一栏**（`selectionFlow.ts` 里有注释说明）。
+
+### 验收（与旧版不同，注意）
+
+- `node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit` → 必须 exit 0；
+- `node scripts/build.mjs` → 必须成功（产物在 `dist/`）；
+- 手感/跨栏的**真实验收请在真机上跑**（用户明确要求由他来验证）。
+- `tools/col-scan.mjs`（旧门槛）里的"栏带模型"是脚本自己用 DOM span 的 y 覆盖率独立算的，
+  与本版内核的"字符 flowClass"不是同一套判据，跑出来的数字**需要重新校准**，
+  不要把它当成本版的通过标准（它的历史价值见 §2 的取证）。
+
+---
+
+> ⚠️ 以下 §0~§7 是**旧路线**的记录（自研夹取）。保留原因：§2 的真因（CropBox 原点、栏缝里的
+> 行末字、口径坑）至今仍然是有效证据，§5 的环境坑（Electron 单实例、dist 是共用产物、
+> 别用 PowerShell 改源码）也仍然适用。
+
+
 > 写给下一个接手的人/模型。**先读这一页，再动代码**。本文件记录：现状、真因（带数字）、处方（改哪个函数/什么判据）、
 > 验收门槛（必须全绿才能发布）、以及所有踩过的坑。仓库：`D:\dsh\litshelf`。
 

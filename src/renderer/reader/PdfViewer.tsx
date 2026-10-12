@@ -28,6 +28,16 @@ import {
   type BandRange,
 } from './columnBands';
 import { orderTextSpans } from './textOrder';
+import { buildSelectionModel, SelectionModel } from './selectionModel';
+import { createSelectionKernel, type KernelDeps } from './selectionKernel';
+import type {
+  DomSelectionEndpoint,
+  PageCharModel,
+  Rect,
+  SelSnapshot,
+  SelSnapshotInput,
+  SelectionKernel,
+} from './selectionTypes';
 
 /**
  * 页宽/页高**比例**坐标下的版式分区（0~1），供夹取与重排共用。
@@ -69,47 +79,28 @@ function regionIndexAtY(regions: readonly RegionRatio[], y: number): number {
   return best;
 }
 
-/**
- * 离某个 y 比例最近的、**真正多栏**的分区（夹取兜底用）。
- *
- * 为什么需要：锚点落在"通栏/单栏"分区时，老代码直接 `return false` 放弃夹取 ——
- * 而"放弃"意味着浏览器按 DOM 顺序拉出来的选区原样留在页面上（实测 p2 末栏：
- * 945 字 / rect 1421 / 越界 rect 520）。改用**相邻多栏区**的栏带夹，至少不会跨栏。
- * 整页都没有多栏分区时返回 null，调用方照旧不夹（那种页面横跨整幅是版式事实）。
- */
-function nearestMultiColumnRegion(regions: readonly RegionRatio[], y: number): RegionRatio | null {
-  let best: RegionRatio | null = null;
-  let bestD = Number.POSITIVE_INFINITY;
-  for (const r of regions) {
-    if (r.bands.length < 2) continue;
-    const d = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0;
-    if (d < bestD) {
-      bestD = d;
-      best = r;
-    }
-  }
-  return best;
-}
 
 /** 这一页是否值得按分区里的栏重排（只有"整页模型确实多栏"时才为 true） */
 function hasMultiColumnRegion(regions: readonly RegionRatio[] | undefined): boolean {
   return !!regions?.some((r) => r.orderByBands && r.bands.length >= 2);
 }
 
+
 /**
- * 取元素里第一个**文字节点**（含后代）。
+ * 某个节点所在的页面元素（`.rd-pdf-page`）。
  *
- * R6 的关键修复：夹取要用"按下点那个 span 的文字节点"和"候选 span 的文字节点"建 Range，
- * 而 pdf.js 在带标记内容（`includeMarkedContent: true`）的页面上会把文字放进**嵌套元素**里 ——
- * 只扫 `childNodes` 里的直接子节点会拿到 `null`，于是 604 个候选**一个都建不出 Range**，
- * 夹取永远"无端点"（实测苏敬勤 p2 末栏：`Range建不出=604`；用户侧表现就是"选不中/一选就断"）。
+ * 划词内核用它把 DOM 端点反查成页号：`data-page-index` 是 **1 起**的（模型是 0 起），
+ * 这样内核不需要任何"页号 → 元素"的注册表，翻页、重建文本层、多页同时渲染都不会错位。
  */
-function firstTextNodeOf(el: Element | null): Text | null {
-  if (!el) return null;
-  const direct = [...el.childNodes].find((n) => n.nodeType === Node.TEXT_NODE) as Text | undefined;
-  if (direct) return direct;
-  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
-  return (walker.nextNode() as Text | null) ?? null;
+function pageElementOf(node: Node | null): HTMLElement | null {
+  if (!node) return null;
+  const el = node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
+  return (el?.closest?.('.rd-pdf-page') as HTMLElement | null) ?? null;
+}
+
+/** 按模型页号（0 起）取页面元素 */
+function pageElByIndex(pageIndex: number): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`.rd-pdf-page[data-page-index="${pageIndex + 1}"]`);
 }
 
 /**
@@ -127,24 +118,14 @@ function firstTextNodeOf(el: Element | null): Text | null {
  */
 const MAX_CANVAS_PX = 1600;
 
+
 /**
- * 是否仍启用手写的选择纠正（容器边界改锚 + 跨页夹取 + 松手后 0.7 秒看护）。
+ * 划词内核的诊断日志（`[zsel] …`）。
  *
- * 实测结论（同一套 45 条划词验收，只切这个开关）：
- *   · 只靠官方 `.endOfContent` + selectionchange 修正 → **3 项红**：反向（右→左）拖进行间距
- *     覆盖 1536px 暴涨、反向 11 字 vs 正向 2 字不一致、Shift+点击终点偏一行（20px）；
- *   · 两套叠加 → 全绿（正向行间距还更准：从 31 字降到 15 字）。
- * 所以**两套都要**：上游那套负责"指针在文字外时别把选区按 DOM 顺序甩出去"，
- * 我们这套负责"边界落到容器时改锚到最近一行 + 只在变短时替换 + 松手后锁 0.7 秒"。
+ * 默认**关**：这套内核在正常选区上一个字节都不写 DOM，日志只在你排查"选区不对"时打开
+ * （`console.debug` 在 DevTools 里默认折叠，但要先有 console 才看得到）。
  */
-/**
- * "选区不许跨栏"：**已开启**。
- * 栏带由 pdf.js 的文本项算出（`columnBands.ts`），已在 8 篇 CNKI 论文 111 页上验证：
- * 7 页多栏全对、104 页单栏无误切；DOM 投影版（会被竖排页眉桥接）已废弃。
- * 单栏页面 `bands.length < 2` 时直接跳过，不做任何夹取。
- */
-const ENABLE_COLUMN_LOCK = true;
-const USE_OUR_SELECTION_FIX = true;
+const SELECTION_DEBUG = false;
 
 /**
  * 官方 web 版 viewer（`pdf_viewer.mjs`）**假定全局存在 `pdfjsLib`**：它模块一开头就
@@ -314,6 +295,11 @@ interface PdfPageProps {
   onStuck?: (page: number) => void;
   /** 这一页的栏带（按页宽比例）算好了，上报给父级做"划词禁止跨栏" */
   onBands?: (page: number, regions: RegionRatio[]) => void;
+  /**
+   * 这一页的**划词字符模型**建好了，交给父级的划词内核（见 selectionKernel.ts）。
+   * 传 null 表示这一页暂时没有可用模型（文本层没了 / 取不到文本项）→ 内核放弃纠正。
+   */
+  onSelectionModel?: (page: number, model: PageCharModel | null) => void;
   /** 拖选结束后由父级读取选区；这里只上报"页面元素" */
   onPageElement: (page: number, el: HTMLElement | null) => void;
   /** 文内跳转（PDF 里的引用/目录链接）用：跳到指定页 */
@@ -343,6 +329,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     onPageElement,
     goToPage,
     onBands,
+    onSelectionModel,
   } = props;
 
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -408,8 +395,8 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
    * 会让整个 canvas + 文本层被拆掉重建；拖动过程中文本层节点被替换，原生选区的锚点随之失效，
    * 表现就是"选区莫名其妙乱选/整段选中"和"文本层间歇性一个 span 都没有"。
    */
-  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands });
-  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands };
+  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel });
+  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel };
 
   /**
    * 位图实际渲染用的 scale：缩放先防抖 160ms，停手后再重绘**一次**。
@@ -910,6 +897,65 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     /** 当前这页的文本层元素（由 TextLayerBuilder 创建，我们给它加了 rd-pdf-text 类名） */
     const textLayerEl = (): HTMLElement | null => textRef.current?.querySelector<HTMLElement>('.rd-pdf-text') ?? null;
 
+    /**
+     * 建这一页的**划词字符模型**并上报给父级的划词内核（见 selectionKernel.ts / selectionModel.ts）。
+     *
+     * 为什么要有这一层：产品的划词以前靠 DOM span 的 rect 猜"这个字属于哪一栏"，端点、span 序号、
+     * 按下点三套坐标互相追着跑，越修越乱。Zotero 的做法是把一页文字变成**字符模型**，
+     * 原生选区只提供两个端点，真正的选区在模型上算。模型必须建在"文本层挂好 + 重排完"之后，
+     * 这样模型里的字符顺序与 DOM 里 span 的顺序一致，字符区间才能写回 DOM。
+     *
+     * 失败（取不到文本项 / span 与文本项逐字对不上）就上报 null：内核会放弃纠正，
+     * 让浏览器的原生选区原样留着 —— 宁可不夹，也不乱夹。
+     *
+     * 这个函数建在 `paintTextLayer` **内部**，因为它必须拿到"这一次渲染实际用的"文本项、
+     * viewport 与分区（分开取第二遍一旦参数不同就会出现 span 与文本项错位的老 bug）。
+     */
+    const reportSelectionModel = (
+      layer: HTMLElement,
+      page: pdfjsLib.PDFPageProxy,
+      viewport: ReturnType<typeof page.getViewport>,
+      items: readonly unknown[],
+      regionList: readonly RegionRatio[],
+    ): void => {
+      const report = cbRef.current.onSelectionModel;
+      if (!report) return;
+      let model: PageCharModel | null = null;
+      try {
+        /**
+         * 三个细节都踩过（model-builder 的自检 T2 复现过第一个）：
+         *   ① 排除 `.markedContent` wrapper：它也是 `span`、`textContent` 也非空，但里面包着真正的文字 span。
+         *      只有在 reorderTextLayer 把 span 提到容器下（拍平）之后才没有 wrapper；没拍平时把 wrapper
+         *      当文字 span 传进去，数量就对不上 → 整页模型 null（安全，但夹取会静默关闭）。
+         *   ② 判空用 `length > 0` 而**不是** `trim().length > 0`：pdf.js 的 `hasText = str !== ''`，
+         *      纯空格项会挂 span，用 trim 又会让两边数量对不上。模型那边也是按 `str !== ''` 配对的。
+         *   ③ 顺序必须是**此刻 DOM 的顺序**（模型要按它和文字一一对应地写回选区端点）。
+         */
+        const spans = [...layer.querySelectorAll<HTMLElement>('span:not(.markedContent)')].filter(
+          (s) => (s.textContent ?? '').length > 0,
+        );
+        model = buildSelectionModel({
+          pageIndex: pageNumber - 1,
+          pageEl: rootRef.current ?? layer,
+          textLayer: layer,
+          spans,
+          items,
+          viewport: {
+            scale: viewport.scale,
+            width: viewport.width,
+            height: viewport.height,
+            transform: viewport.transform as unknown as number[],
+          },
+          viewBox: page.view,
+          regions: regionList.map((r) => ({ top: r.top, bottom: r.bottom, full: r.full, bands: r.bands })),
+        });
+      } catch (err) {
+        if (!cancelled) console.warn(`[reader] 第 ${pageNumber} 页划词字符模型建失败`, err);
+        model = null;
+      }
+      report(pageNumber, model);
+    };
+
     /** 丢掉当前文本层（取消 + 从宿主里摘掉），下一次 paintTextLayer 会重建 */
     const dropTextLayer = (): void => {
       try {
@@ -944,8 +990,14 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
       let regions: RegionRatio[] = [];
       /** 每个 span（按文本项序）对应的文本项横向范围，页宽比例；拿不到就留空，夹取退回 DOM 判据 */
       let itemXs: ({ x0: number; x1: number } | null)[] = [];
+      /**
+       * 这一轮拿到的原始文本项：**建划词字符模型要用同一份**（同一份文本项、同一个顺序，
+       * 模型与 DOM 才能逐字对齐；分开取两次一旦参数不同就会出现"1438 vs 1392"那种错位）。
+       */
+      let rawItems: unknown[] = [];
       try {
         const content = await page.getTextContent(TEXT_LAYER_PARAMS);
+        rawItems = content.items;
         const items = itemsInViewSpace(content.items.filter((it) => 'str' in it), page.view);
         const unscaledW = viewport.width / viewport.scale;
         const unscaledH = viewport.height / viewport.scale;
@@ -1004,6 +1056,13 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         if (layer?.querySelector('span')) {
           tagTextSpans(layer, itemXs);
           reorderTextLayer(layer, regions);
+          /**
+           * 挂完 + **重排完之后**才建划词字符模型（顺序不能反）：
+           * 模型必须反映"此刻 DOM 里 span 的实际顺序"，否则字符区间写回 DOM 会错位。
+           * 模型只在 span 文本与文本项逐字对得上时才建得出来，对不上就上报 null（内核会放弃纠正，
+           * 让浏览器原生选区原样留着 —— 宁可不夹，也不乱夹）。
+           */
+          reportSelectionModel(layer, page, viewport, rawItems, regions);
           return true;
         }
         dropTextLayer();
@@ -1372,10 +1431,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   const [, forceRedraw] = useState(0);
 
   const reloadRef = useRef(false);
-  /** 各页上报版式分区：只写 ref，回调身份必须稳定（否则会带着页面 effect 一起重订阅） */
-  const handleBands = useCallback((page: number, regions: RegionRatio[]) => {
-    regionsByPageRef.current.set(page, regions);
-  }, []);
 
   const onStuck = useCallback((page: number) => {
     const n = stuckRef.current.get(page) ?? 0;
@@ -1576,27 +1631,13 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
 
   // -------- 选区（划词） --------
   const lastSelectionRef = useRef<PdfSelectionPayload | null>(null);
-  /**
-   * 每页的"栏带"（按**页宽比例** 0–1 存，抗缩放与手势 transform）：由各页 PdfPage 用 pdf.js 的
-   * 文本项算好（见 columnBands.ts）后上报，划词夹取据此**硬性禁止跨栏**。
-   */
-  const regionsByPageRef = useRef(new Map<number, RegionRatio[]>());
-  /**
-   * 最后一次非空选区的文字（只增不清）。
-   *
-   * 试过用它给右键菜单兜底（"按 1 标注后 DOM 选区还在/刚被右键清掉"那种不同步场景），
-   * 结果把**真正的无选区场景**也带偏了：明明没选区，菜单却给出标注项（UX 回归实测
-   * "无选区时 4 项齐全且没有标注项（7 项）"变红）。所以这里只留作诊断/日志用途，
-   * **不参与菜单判定**。不同步那条老问题记在 docs/known-issues.md 里。
-   */
-  const lastTextRef = useRef('');
   // 事件回调里要读最新的批注与选择回调，但不希望它们进依赖数组导致频繁重订阅
   const annotationsRef = useRef(props.annotations);
   annotationsRef.current = props.annotations;
   const onSelectAnnotationRef = useRef(props.onSelectAnnotation);
   onSelectAnnotationRef.current = props.onSelectAnnotation;
 
-  const collectSelection = useCallback(() => {
+  const collectSelection = useCallback((snap?: SelSnapshot | null, rangeArg?: Range | null) => {
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
       if (lastSelectionRef.current) {
@@ -1605,17 +1646,40 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       }
       return;
     }
-    const text = sel.toString().replace(/\s+/g, ' ').trim();
-    if (text.length < 1) return;
-    const range = sel.getRangeAt(0);
-    const startEl = range.startContainer.parentElement?.closest<HTMLElement>('.rd-pdf-page');
-    const endEl = range.endContainer.parentElement?.closest<HTMLElement>('.rd-pdf-page');
-    if (!startEl || startEl !== endEl) return; // 跨页选择暂不支持建批注
-    const pageEl = startEl;
+    // 内核写过 DOM 时（`apply` 收窄了端点）它返回的 range 已经失效，必须重新读一次原生选区
+    const range = rangeArg ?? sel.getRangeAt(0);
+    const pageEl = pageElementOf(range.startContainer) ?? pageElementOf(range.endContainer);
+    if (!pageEl) return;
     const page = Number(pageEl.dataset.pageIndex ?? '0');
     if (!page) return;
     const pageRect = pageEl.getBoundingClientRect();
     if (pageRect.width <= 0 || pageRect.height <= 0) return;
+
+    /**
+     * 选区矩形：**优先用划词内核从字符模型算出来的**（Zotero 的做法）。
+     *
+     * 为什么不直接用 `range.getClientRects()`：pdf.js 会把一个整层大小的 `.endOfContent`
+     * 插到选区锚点旁边，它一旦进了 range，`getClientRects()` 就会多报一条横贯整页的矩形
+     * （实测：27 字的选区报成 1536px 高）—— 批注会画出一整页高亮、工具条也会定位到错的地方。
+     * 模型算出来的 rects 天生只有"真正的文字行"。
+     */
+    const snapPage =
+      snap && (snap.pageIndex === page - 1 || snap.rectsByPage.some((p) => p.pageIndex === page - 1)) ? snap : null;
+    const modelRects = snapPage?.rectsByPage.find((p) => p.pageIndex === page - 1)?.rects ?? null;
+    const rects = modelRects && modelRects.length
+      ? clampRects(normalizeRects(modelRects, pageRect))
+      : clampRects(relRects(Array.from(range.getClientRects()), pageRect));
+
+    /**
+     * 文字：**优先用模型算出来的**。
+     *
+     * 模型会在段落之间补空格、把行内断开的 run 接起来（`getTextFromChars`），比
+     * `selection.toString()` 更接近"用户以为选到的那段话"；而且它是我们真正用来
+     * 判断端点归属的那一份文本，两者必须一致，否则批注重定位会漂。
+     */
+    const rawText = snapPage?.text?.trim() ? snapPage.text : sel.toString();
+    const text = rawText.replace(/\s+/g, ' ').trim();
+    if (text.length < 1) return;
 
     const map = mapsRef.current.get(page);
     let anchor: { prefix: string; suffix: string; occurrence: number };
@@ -1630,1232 +1694,446 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       anchor = buildAnchorFallback(text, '');
     }
 
-    const rects = clampRects(relRects(Array.from(range.getClientRects()), pageRect));
-    const first = range.getClientRects()[0];
+    /**
+     * 工具条定位用的第一行矩形：模型算出来的（相对页面元素）→ 转客户端；
+     * 没有模型就退回 DOM 的 `getClientRects()[0]`。
+     */
+    const firstLine = modelRects && modelRects.length
+      ? {
+          left: pageRect.left + modelRects[0].left,
+          top: pageRect.top + modelRects[0].top,
+          right: pageRect.left + modelRects[0].right,
+          bottom: pageRect.top + modelRects[0].bottom,
+        }
+      : null;
+    const firstDom = range.getClientRects()[0];
+    const rect = firstLine ?? (firstDom
+      ? { left: firstDom.left, top: firstDom.top, right: firstDom.right, bottom: firstDom.bottom }
+      : { left: pageRect.left, top: pageRect.top, right: pageRect.right, bottom: pageRect.top });
     const payload: PdfSelectionPayload = {
       text,
-      rect: first
-        ? { left: first.left, top: first.top, right: first.right, bottom: first.bottom }
-        : { left: pageRect.left, top: pageRect.top, right: pageRect.right, bottom: pageRect.top },
+      rect,
       pageEl,
       page,
       rects,
       anchor,
     };
     lastSelectionRef.current = payload;
-    lastTextRef.current = payload.text;
     onSelectionRef.current(payload);
     // 依赖保持空：`collectSelection` 的身份必须稳定，否则鼠标 effect 会反复重订阅，
     // 把"手动划词"等 effect 局部状态整批重置（真实后果：拖选后选区变空、工具条不弹）。
   }, []);
   const onSelectionRef = useRef(onSelection);
   onSelectionRef.current = onSelection;
-    useEffect(() => {
+  /** 一个 DOM 位置的"文档序"（比较两个端点谁在前；`range.startContainer` 只是文档序，不等于锚点） */
+  const docOrderCompare = (a: { node: Node; offset: number }, b: { node: Node; offset: number }): number => {
+    try {
+      const probe = document.createRange();
+      probe.setStart(a.node, a.offset);
+      probe.collapse(true);
+      const closer = probe.comparePoint(b.node, b.offset);
+      return closer >= 0 ? -1 : 1;
+    } catch {
+      return 0;
+    }
+  };
+
+  /** 选中区域里排最前的那个 DOM 端点（用来判 `anchorIsStart`） */
+  const firstNodePosition = (list: readonly DomSelectionEndpoint[]): { node: Node; offset: number } | null => {
+    let best: { node: Node; offset: number } | null = null;
+    for (const ep of list) {
+      for (const p of [ep.start, ep.end]) {
+        if (!best || docOrderCompare(p, best) < 0) best = p;
+      }
+    }
+    return best;
+  };
+
+  /** 文本层里第一个/最后一个文字节点位置（跨页选择时把端点钉在页首/页尾） */
+  const edgeTextPosition = (layer: HTMLElement | null, edge: 'first' | 'last'): { node: Node; offset: number } | null => {
+    if (!layer) return null;
+    const walker = document.createTreeWalker(layer, NodeFilter.SHOW_TEXT);
+    let last: Text | null = null;
+    let node: Node | null = walker.nextNode();
+    while (node) {
+      const t = node as Text;
+      if ((t.nodeValue ?? '').length > 0) {
+        if (edge === 'first') return { node: t, offset: 0 };
+        last = t;
+      }
+      node = walker.nextNode();
+    }
+    return last ? { node: last, offset: (last.nodeValue ?? '').length } : null;
+  };
+
+  /**
+   * 各页上报的划词字符模型（0 起页号，包一层 `SelectionModel` 好带方法）。
+   * 页模型被替换/丢弃时由 PdfPage 再报一次覆盖它。
+   */
+  const selectionModelsRef = useRef(new Map<number, SelectionModel>());
+
+  /**
+   * 划词内核（Zotero 式：原生选区只提供两个端点，真正的选区在**字符模型**上算）。
+   *
+   * 这一版把之前那套"自研夹取"整段删掉了：拖动中改锚点、夹跨页、按 DOM span 的 rect 判栏归属、
+   * 松手后锁 0.7~2.5 秒 + MutationObserver 看护 + 7 拍补夹…… 那套东西的每一行都对应一个实测 bug，
+   * 而 bug 的总数并没有减少（见 docs/HANDOFF-column-selection-fix.md）。Zotero 的做法是：
+   * 浏览器负责拖动，我们把端点映射进字符模型，再按"锚点所在栏流"这个**离散**判据收窄焦点，
+   * 最后只写一次 `setBaseAndExtent`。细节见 selectionKernel.ts 顶部的长注释。
+   */
+  const selectionKernelRef = useRef<SelectionKernel | null>(null);
+  if (!selectionKernelRef.current) {
+    const deps: KernelDeps = {
+      getPage: (i) => selectionModelsRef.current.get(i)?.model ?? null,
       /**
-       * 点在了哪条批注上（几何命中）。
-       * 批注的文字标记层设成 pointer-events:none（好处：已经高亮过的文字照样能用鼠标划过选中），
-       * 代价是点击不再由 DOM 事件派发，所以这里按 0-1 相对矩形自己算一遍。
+       * DOM 端点 → （页号, 字符序号）。
+       *
+       * 页号从 DOM 反查（`.rd-pdf-page[data-page-index]` 是 1 起的，模型是 0 起）——
+       * 这样不依赖任何"页号 → 元素"注册表，翻页 / 重建文本层都不会错位。
        */
-      const hitTestAnnotation = (pageEl: HTMLElement, clientX: number, clientY: number): Annotation | null => {
-        const page = Number(pageEl.dataset.pageIndex ?? '0');
-        if (!page) return null;
-        const rect = pageEl.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return null;
-        const x = (clientX - rect.left) / rect.width;
-        const y = (clientY - rect.top) / rect.height;
-        const list = annotationsRef.current.filter((a) => a.page === page && a.type !== 'bookmark');
-        for (let i = list.length - 1; i >= 0; i -= 1) {
-          const a = list[i];
-          if (a.rects.some((r) => x >= r.x - 0.004 && x <= r.x + r.w + 0.004 && y >= r.y - 0.004 && y <= r.y + r.h + 0.004)) {
-            return a;
-          }
+      resolveDomPosition: (node, offset, affinity) => {
+        const pageEl = pageElementOf(node);
+        const pageNo = Number(pageEl?.dataset.pageIndex ?? '0');
+        if (!pageNo) return null;
+        const model = selectionModelsRef.current.get(pageNo);
+        if (!model) return null;
+        return model.resolveDomPosition(node, offset, affinity);
+      },
+      pageOriginOf: (pageEl) => {
+        const r = pageEl.getBoundingClientRect();
+        return { left: r.left, top: r.top };
+      },
+      debug: SELECTION_DEBUG,
+    };
+    selectionKernelRef.current = createSelectionKernel(deps);
+  }
+
+  /** 各页上报的划词模型：**先包成 SelectionModel** 再存（内核只认模型本身，方法在包装层上） */
+  const handleSelectionModel = useCallback((page: number, model: PageCharModel | null) => {
+    selectionKernelRef.current?.invalidate(page);
+    if (!model) {
+      selectionModelsRef.current.delete(page);
+      return;
+    }
+    selectionModelsRef.current.set(page, new SelectionModel(model));
+  }, []);
+
+
+  /**
+   * 把当前原生选区收成内核要的输入（按页分组）。
+   *
+   * 为什么按页分组：跨页拖选是合法操作（Zotero 也支持），但**每一页的模型互不相干**，
+   * 所以内核按页分别算 range。
+   */
+  const selectionInput = useCallback((): { input: SelSnapshotInput; range: Range } | null => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+    const range = sel.getRangeAt(0);
+    const startPage = pageElementOf(range.startContainer);
+    const endPage = pageElementOf(range.endContainer);
+    if (!startPage || !endPage) return null;
+    const pageIndexOf = (el: HTMLElement): number => Number(el.dataset.pageIndex ?? '0');
+    const startIdx = pageIndexOf(startPage);
+    const endIdx = pageIndexOf(endPage);
+    if (!startIdx || !endIdx) return null;
+    const endpoints: DomSelectionEndpoint[] = [];
+    if (startIdx === endIdx) {
+      endpoints.push({
+        pageIndex: startIdx - 1,
+        scale: selectionModelsRef.current.get(startIdx)?.model?.scale ?? 1,
+        start: { node: range.startContainer, offset: range.startOffset },
+        end: { node: range.endContainer, offset: range.endOffset },
+        pageEl: startPage,
+      });
+    } else {
+      // 跨页：起点页取"range 起点 → 该页文本层末尾"，终点页取"该页文本层开头 → range 终点"。
+      const startTail = edgeTextPosition(startPage.querySelector<HTMLElement>('.rd-pdf-text'), 'last');
+      const endHead = edgeTextPosition(endPage.querySelector<HTMLElement>('.rd-pdf-text'), 'first');
+      if (startTail) {
+        endpoints.push({
+          pageIndex: startIdx - 1,
+          scale: selectionModelsRef.current.get(startIdx)?.model?.scale ?? 1,
+          start: { node: range.startContainer, offset: range.startOffset },
+          end: startTail,
+          pageEl: startPage,
+        });
+      }
+      if (endHead) {
+        endpoints.push({
+          pageIndex: endIdx - 1,
+          scale: selectionModelsRef.current.get(endIdx)?.model?.scale ?? 1,
+          start: endHead,
+          end: { node: range.endContainer, offset: range.endOffset },
+          pageEl: endPage,
+        });
+      }
+    }
+    if (!endpoints.length) return null;
+    const first = firstNodePosition(endpoints);
+    const anchorDoc = first
+      ? docOrderCompare({ node: sel.anchorNode ?? range.startContainer, offset: sel.anchorOffset }, first) === 0
+      : true;
+    return { input: { anchorIsStart: anchorDoc, endpoints }, range };
+  }, []);
+
+  /**
+   * 读一次原生选区 → 交给内核算。
+   *
+   * `read()` 只算不写；`apply()` 只在"端点确实越栏/越流"时才写一次 DOM。
+   * 两者都用同一份输入，所以结果一定是同一个选区，不会出现"读完又变"的抖动。
+   */
+  const readKernelSelection = useCallback((): { snap: SelSnapshot | null; range: Range | null } => {
+    const kernel = selectionKernelRef.current;
+    if (!kernel) return { snap: null, range: null };
+    const read = selectionInput();
+    if (!read) {
+      kernel.clear();
+      return { snap: null, range: null };
+    }
+    const snap = kernel.read(read.input);
+    if (!snap) return { snap: null, range: read.range };
+    const applied = kernel.apply(read.input);
+    if (applied) return { snap: applied, range: null };
+    // `apply` 返回 null = 端点本来就合法（或映射不出来）→ 用只读那一份
+    return { snap, range: read.range };
+  }, [selectionInput]);
+
+  useEffect(() => {
+    /** 合并短时间内的多次触发：`selectionchange` 在拖动中会刷屏，收一次就够 */
+    let collectTimer = 0;
+    /** 指针是否按下 —— 拖动中只做"纠正"，不做"上报"（工具条不该在拖动过程中就冒出来） */
+    let pressed = false;
+    /** 指针最后位置与按下点（`selectionchange` 里没有事件参数，只能自己记） */
+    const pointerRef = { x: 0, y: 0 };
+    const downRef = { x: 0, y: 0 };
+
+    /**
+     * 点在了哪条批注上（几何命中）。
+     * 批注的文字标记层设成 pointer-events:none（好处：已经高亮过的文字照样能用鼠标划过选中），
+     * 代价是点击不再由 DOM 事件派发，所以这里按 0-1 相对矩形自己算一遍。
+     */
+    const hitTestAnnotation = (pageEl: HTMLElement, clientX: number, clientY: number): Annotation | null => {
+      const page = Number(pageEl.dataset.pageIndex ?? '0');
+      if (!page) return null;
+      const rect = pageEl.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      const x = (clientX - rect.left) / rect.width;
+      const y = (clientY - rect.top) / rect.height;
+      const list = annotationsRef.current.filter((a) => a.page === page && a.type !== 'bookmark');
+      for (let i = list.length - 1; i >= 0; i -= 1) {
+        const a = list[i];
+        if (a.rects.some((r) => x >= r.x - 0.004 && x <= r.x + r.w + 0.004 && y >= r.y - 0.004 && y <= r.y + r.h + 0.004)) {
+          return a;
         }
-        return null;
-      };
+      }
+      return null;
+    };
 
-      const pageOf = (node: Node | null): HTMLElement | null => {
-        const el = !node ? null : node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
-        return (el?.closest?.('.rd-pdf-page') as HTMLElement | null) ?? null;
-      };
-
-      /** 指针最后位置：selectionchange 里没有事件参数，只能自己记 */
-      const pointerRef = { x: 0, y: 0 };
-      /** **按下点**（mousedown 时的指针位置）：只给"空选区兜底"当锚点用，别处不要读 */
-      const downRef = { x: 0, y: 0 };
-
-      /** 边界是否落在"文本层容器"上（而不是某个 span 里） */
-      const containerBoundary = (node: Node | null): HTMLElement | null =>
-        node && node.nodeType === Node.ELEMENT_NODE && (node as HTMLElement).classList?.contains('rd-pdf-text')
-          ? (node as HTMLElement)
-          : null;
-
-      /** 离指针最近的 span：**竖直优先**（Word 是"停在指针所在那一行"），再比横向 */
-      const nearestSpan = (spans: HTMLElement[], x: number, y: number): HTMLElement | null => {
-        let best: HTMLElement | null = null;
-        let bestScore = Number.POSITIVE_INFINITY;
-        for (const s of spans) {
-          const r = s.getBoundingClientRect();
-          if (r.width <= 0 && r.height <= 0) continue;
-          const dy = Math.max(0, r.top - y, y - r.bottom);
-          const dx = Math.max(0, r.left - x, x - r.right);
-          const score = dy * 3 + dx;
-          if (score < bestScore) {
-            bestScore = score;
-            best = s;
-          }
-        }
-        return best;
-      };
-
-      /**
-       * 核心兜底：**边界落在文本层容器上时，把它改锚到离指针最近的 span**。
-       *
-       * 为什么必须有这一手（实测取证）：
-       * 指针停在哪一行文字都不压的空隙（行间距）或页面空白处时，Chromium 原生会把焦点解析成
-       * 文本层容器 `DIV.rd-pdf-text`（offset 0）。容器在 DOM 顺序里排在**所有 span 之前**，
-       * 于是 range 被规范化成「容器开头 → 按下点所在 span」——选区从**页首**一路连到按下行：
-       * 行间距拖一下 298 字 / 覆盖 1494px，拖到页脚空白 1366 字（几乎整页），就是用户说的"莫名多选"。
-       * 跨页安全网拦不住它（起止都在同一页）。
-       *
-       * 处理原则：只替换**落在容器上**的那一端，另一端（真实按下点）原样保留；
-       * 结果只在**变短**时才采用，绝不把选区改长。
-       */
-      const fixContainerBoundary = (): boolean => {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed || sel.rangeCount === 0) return false;
-        const range = sel.getRangeAt(0);
-        const startC = containerBoundary(range.startContainer);
-        const endC = containerBoundary(range.endContainer);
-        if (!startC && !endC) return false;
-        const layer = startC ?? endC;
-        if (!layer) return false;
-        const spans = [...layer.querySelectorAll<HTMLElement>('span')].filter((s) => (s.textContent ?? '').trim().length > 0);
-        if (!spans.length) return false;
-        const near = nearestSpan(spans, pointerRef.x, pointerRef.y);
-        const node = near?.firstChild ?? null;
-        if (!near || !node) return false;
-        const rect = near.getBoundingClientRect();
-        const atEnd = pointerRef.x > rect.left + rect.width / 2;
-        const offset = atEnd ? (node.textContent ?? '').length : 0;
-        const keepNode = startC ? range.endContainer : range.startContainer;
-        const keepOffset = startC ? range.endOffset : range.startOffset;
-        const build = (aNode: Node, aOff: number, bNode: Node, bOff: number): Range | null => {
-          const r = document.createRange();
-          try {
-            r.setStart(aNode, aOff);
-            r.setEnd(bNode, bOff);
-            return r;
-          } catch {
-            return null;
-          }
-        };
-        /**
-         * 两个顺序都要试：DOM 顺序与参数顺序相反时，Chromium **不抛异常**，
-         * 而是返回一个**塌陷**的 Range（踩过的坑：`build(a,b) ?? build(b,a)` 永远不会走第二条）。
-         */
-        const fixed =
-          [build(node, offset, keepNode, keepOffset), build(keepNode, keepOffset, node, offset)].find(
-            (r): r is Range => !!r && !r.collapsed,
-          ) ?? null;
-        if (!fixed) return false;
-        /**
-         * **容器边界一律替换，不看长度**。
-         *
-         * 这是"只夹短"规则的一个例外，也是实测踩出来的：`range.startContainer` 是
-         * `DIV.textLayer` 时，`getClientRects()` 会把**容器与 .endOfContent 的整页框**一起报出来
-         * （27 字的选区报成 1536px 高、2 条文字带），工具栏定位与批注矩形都会被污染。
-         * 而"起点/终点落在容器上"本身就代表"整页开头/结尾"，从来不是用户想要的选区 ——
-         * 所以这里直接换成最近的 span；只有替换后为空才放弃。
-         * 长度判断仍然保留在跨页夹取（clampCrossPage）那条路径上。
-         */
-        sel.removeAllRanges();
-        sel.addRange(fixed);
-        console.debug(`[reader] 容器边界修整：${range.toString().length} → ${fixed.toString().length} 字`);
-        return true;
-      };
-
-      /**
-       * 兜底：**浏览器压根没拉动选区**时，自己把"按下点 → 松手点"这一段拉出来。
-       *
-       * 为什么必须有：会出现"整段拖动一条 selectionchange 都没有"的情况 —— 按下点明明在文字上、
-       * 命中与样式都正常，松手却是**空选区**（用户侧的表现就是"划不中词"，`col-scan` 里则是
-       * "0 字"整片变红）。实测苏敬勤 p2/p4/p9/p11：同一个取样点连续三次拖动都是 0 字，
-       * 而拖动期间三处守卫（`relockTimer` / `MutationObserver` / `applyLocked`）都在 `pressed`
-       * 时返回 —— 没有我们的代码在改写选区，是浏览器自己没开始拉。
-       *
-       * 只在这一种情况下动手，而且只朝"用户本来想要的那个选区"走：
-       *   · 已经有非空选区 → 立刻放手（绝不覆盖浏览器选出来的东西）；
-       *   · 按下/松手位移 < 6px（单击、双击选词、Shift+点击）→ 放手；
-       *   · 两端都必须落在**同一页**文本层 span 的文字上，否则放手（拖到图/页边空白这些场景
-       *     浏览器自己会选，轮不到我们）；
-       *   · 构造出来的区间必须**非空**，否则放手。
-       * 之后的流程完全照旧（容器边界修整 → 跨栏夹取 → 看护），所以"不许跨栏"的保证不变：
-       * 补出来的选区照样要过 `clampToAnchorColumn()`。
-       */
-      const rescueEmptyDrag = (): boolean => {
-        const sel = window.getSelection();
-        if (sel && !sel.isCollapsed && sel.toString().trim()) return false;
-        const dx = pointerRef.x - downRef.x;
-        const dy = pointerRef.y - downRef.y;
-        if (dx * dx + dy * dy < 36) return false;
-        const caretAt = (
-          document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null }
-        ).caretRangeFromPoint;
-        if (typeof caretAt !== 'function') return false;
-        const at = (x: number, y: number): { node: Node; off: number; span: HTMLElement } | null => {
-          let r: Range | null = null;
-          try {
-            r = caretAt.call(document, x, y);
-          } catch {
-            return null;
-          }
-          if (!r) return null;
-          const node = r.startContainer;
-          const el = node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
-          const span = (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
-          if (!span || !(span.textContent ?? '').trim()) return null;
-          return { node, off: r.startOffset, span };
-        };
-        const a = at(downRef.x, downRef.y);
-        const b = at(pointerRef.x, pointerRef.y);
-        if (!a || !b) return false;
-        if (a.span.closest('.rd-pdf-page') !== b.span.closest('.rd-pdf-page')) return false;
-        /**
-         * 两个顺序都要试：DOM 顺序与参数顺序相反时 Chromium **不抛异常**，
-         * 而是返回一个**塌陷**的 Range（同一个坑在 fixContainerBoundary 里也踩过）。
-         */
-        const mk = (n1: Node, o1: number, n2: Node, o2: number): Range | null => {
-          const r = document.createRange();
-          try {
-            r.setStart(n1, o1);
-            r.setEnd(n2, o2);
-          } catch {
-            return null;
-          }
-          return r.collapsed ? null : r;
-        };
-        const fixed = mk(a.node, a.off, b.node, b.off) ?? mk(b.node, b.off, a.node, a.off);
-        if (!fixed || !fixed.toString().trim()) return false;
-        sel?.removeAllRanges();
-        sel?.addRange(fixed);
-        console.debug(`[reader] 浏览器没拉出选区，已按"按下点 → 松手点"补一个：${fixed.toString().length} 字`);
-        return true;
-      };
-
-      /**
-       * 划词的全部逻辑就是这一句：**让浏览器自己选**。
-       *
-       * 曾经这里有一整套自研实现（拖动中每帧自己构造选区、按行取点、夹在起始页内），
-       * 起因是"从正文拖到页面空白会一路吃到后面几页"。那套代码把浏览器的原生行为
-       * （行间距里就近吸附、双向扩展、双击选词、Shift 扩选）全都盖掉了，手感反而不像 Word，
-       * 所以现在只保留唯一的干预：**跨页时夹回按下时所在那一页**。
-       *
-       * 为什么只夹跨页就够：Chromium 的选区扩展是按 DOM 顺序走的，本页文字层选完就跨到下一页，
-       * 跨页才是"全选"的来源；页内的任何位置（包括行间距）都交给它，那正是最接近 Word 的行为。
-       * 夹取**只在变短时**替换，绝不把选区改长。
-       */
-      const clampCrossPage = (): void => {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed || sel.rangeCount === 0) return;
-        const range = sel.getRangeAt(0);
-        const startPage = pageOf(range.startContainer);
-        const endPage = pageOf(range.endContainer);
-        if (!startPage || !endPage || startPage === endPage) return;
-        const spans = [...startPage.querySelectorAll<HTMLElement>('.rd-pdf-text span')].filter(
-          (s) => (s.textContent ?? '').length > 0,
-        );
-        const last = spans[spans.length - 1];
-        const node = last?.firstChild;
-        if (!node) return;
-        const next = document.createRange();
+    /**
+     * 浏览器**压根没拉出选区**时的兜底（整段拖动一条 `selectionchange` 都没有）。
+     *
+     * 这条路径与"跨栏纠正"无关（它只是把用户本来想要的选区补出来），所以保留：
+     * 实测会有"按下点明明在文字上、松手却是空选区"的情况，而命中与样式都正常。
+     * 只在这种情况动手，而且只朝"按下点 → 松手点"这一条走：
+     *   · 已经有非空选区 → 立刻放手；
+     *   · 按下/松手位移 < 6px（单击、双击选词、Shift+点击）→ 放手；
+     *   · 两端必须落在同一页的文本层文字上，否则放手；
+     *   · 构造出来的区间必须非空，否则放手。
+     */
+    const rescueEmptyDrag = (): boolean => {
+      const sel = window.getSelection();
+      if (sel && !sel.isCollapsed && sel.toString().trim()) return false;
+      const dx = pointerRef.x - downRef.x;
+      const dy = pointerRef.y - downRef.y;
+      if (dx * dx + dy * dy < 36) return false;
+      const caretAt = (
+        document as Document & { caretRangeFromPoint?: (x: number, y: number) => Range | null }
+      ).caretRangeFromPoint;
+      if (typeof caretAt !== 'function') return false;
+      const at = (x: number, y: number): { node: Node; off: number; span: HTMLElement } | null => {
+        let r: Range | null = null;
         try {
-          next.setStart(range.startContainer, range.startOffset);
-          next.setEnd(node, (node.textContent ?? '').length);
+          r = caretAt.call(document, x, y);
         } catch {
-          return;
+          return null;
         }
-        if (next.toString().length >= range.toString().length) return;
-        sel.removeAllRanges();
-        sel.addRange(next);
-        console.debug(
-          `[reader] 跨页夹取：${startPage.dataset.pageIndex}→${endPage.dataset.pageIndex} 页，${range.toString().length} → ${next.toString().length} 字`,
-        );
+        if (!r) return null;
+        const node = r.startContainer;
+        const el = node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
+        const span = (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
+        if (!span || !(span.textContent ?? '').trim()) return null;
+        return { node, off: r.startOffset, span };
       };
-
-        /**
-         * 划词**硬性禁止跨栏**（用户明确要求：不想要跨栏选择）。
-         *
-         * 为什么需要：文本层按阅读顺序排 DOM 后，浏览器按 DOM 顺序扩展选区 —— 横向拖过栏缝会把
-         * "左栏剩余 + 整段中栏 + 右栏开头"连成一条横穿三栏的高亮带，而这三段在纸面上并不相邻。
-         *
-         * 栏带来自 **pdf.js 的文本项**（`columnBandsFromItems`，见 columnBands.ts）：DOM 里 span 的
-         * x 投影会被左侧竖排页眉"桥接"（上一版就栽在这），而文本项自带字体方向与几何，
-         * 能稳定切出 1/2/3 栏（已在 8 篇 CNKI 论文 111 页上验过：7 页多栏全对、104 页单栏无误切）。
-         * 栏带按**页宽比例**存，抗缩放与手势 transform。
-         */
-        /**
-         * @param force 强制重算：DOM 被 pdf.js 动过之后，当前选区可能已经被"整体重新解释"，
-         *              锚点/焦点也不再可信 —— 这时用上一次夹取记下来的**栏号、方向、按下点文字节点**
-         *              重算一遍，并且跳过"同栏就不动"的早退（这正是它平时要早退的那种情况）。
-         */
-        const clampToAnchorColumn = (force = false): boolean => {
-          /**
-           * **先收拾 pdf.js 的 `.endOfContent`，再量几何。**
-           *
-           * 它在"选中状态"下会被插到选区锚点旁边，并被设成**整个文本层那么大**；它一旦进了 range，
-           * `getClientRects()` 里就多出一条横贯整页的矩形 → `rectsInAnchorBand()` 把**每一个候选**都判失败
-           * （实测苏敬勤 p2 末栏：mouseup 后 7 拍补夹全部报"没有任何候选过整段在本栏内"→ 不夹 →
-           * 869 字 / rect 越界 463；改前那条 1 字的兜底也是同一个原因）。
-           * 所以夹取之前先把它挪回末尾并清掉行内宽高（用现成的 parkEndOfContent，pdf.js 自己的 reset() 口径）。
-           */
-          parkEndOfContent();
-          /** [diag] 排查用：夹取在任何一步"没执行"时都要留下原因（以前是静默 return false） */
-          const bail = (why: string): false => {
-            console.debug(
-              `[diag] 夹取未执行：${why}｜anchorNode=${(window.getSelection()?.anchorNode as Node | null)?.nodeName ?? 'null'}` +
-                `｜focusNode=${(window.getSelection()?.focusNode as Node | null)?.nodeName ?? 'null'}｜force=${force}`,
-            );
-            return false;
-          };
-          /**
-           * [diag] 兜底：该页**没有登记版式分区**（regionsByPageRef 没有它的条目）时，
-           * 现场用文本层 span 的 x 投影估一次栏带（取最宽的空档当栏缝，只在"两侧都有 ≥15% 内容宽"时成立）。
-           * 宁可夹得保守，也不能把"浏览器按 DOM 顺序拉出来的整页选区"原样留下。
-           */
-          const domBandsOfPage = (pageEl: HTMLElement): BandRange[] | null => {
-            const spans = [...pageEl.querySelectorAll<HTMLElement>('.rd-pdf-text span:not(.markedContent)')].filter(
-              (s) => (s.textContent ?? '').trim().length > 0,
-            );
-            if (spans.length < 20) return null;
-            const pr = pageEl.getBoundingClientRect();
-            if (pr.width <= 0) return null;
-            const xs = spans
-              .map((s) => {
-                const r = s.getBoundingClientRect();
-                return { l: (r.left - pr.left) / pr.width, r: (r.right - pr.left) / pr.width };
-              })
-              .filter((x) => x.r > x.l);
-            if (!xs.length) return null;
-            const minX = Math.min(...xs.map((x) => x.l));
-            const maxX = Math.max(...xs.map((x) => x.r));
-            const span = maxX - minX;
-            if (!(span > 0)) return null;
-            const W = 1000;
-            const cover = new Uint8Array(W);
-            for (const x of xs) {
-              const a = Math.max(0, Math.floor(((x.l - minX) / span) * (W - 1)));
-              const b = Math.min(W - 1, Math.ceil(((x.r - minX) / span) * (W - 1)));
-              for (let i = a; i <= b; i += 1) cover[i] = 1;
-            }
-            let bestLen = 0;
-            let bestStart = -1;
-            let run = 0;
-            let runStart = 0;
-            for (let i = 0; i < W; i += 1) {
-              if (!cover[i]) {
-                if (!run) runStart = i;
-                run += 1;
-              } else {
-                if (run > bestLen) {
-                  bestLen = run;
-                  bestStart = runStart;
-                }
-                run = 0;
-              }
-            }
-            if (run > bestLen) {
-              bestLen = run;
-              bestStart = runStart;
-            }
-            if (bestStart < 0 || bestLen < W * 0.012) return null;
-            const toRatio = (i: number): number => minX + (i / (W - 1)) * span;
-            const gStart = toRatio(bestStart);
-            const gEnd = toRatio(bestStart + bestLen);
-            if (gStart - minX < 0.15 * span || maxX - gEnd < 0.15 * span) return null;
-            return [
-              { start: minX, end: gStart },
-              { start: gEnd, end: maxX },
-            ];
-          };
-          const sel = window.getSelection();
-          if (!sel || sel.isCollapsed || sel.rangeCount === 0) return bail('选区为空/塌陷/没有 range');
-          const range = sel.getRangeAt(0);
-          const spanOf = (node: Node | null): HTMLElement | null => {
-            const el = !node ? null : node.nodeType === Node.ELEMENT_NODE ? (node as HTMLElement) : node.parentElement;
-            return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
-          };
-          /**
-           * 锚点栏必须按**按下点**定，不能信 `sel.anchorNode`。
-           *
-           * R6 实测（苏敬勤 p2 末栏，按下 x=820 在栏 2）：浏览器把排队的 mousemove 应用完之后，
-           * 整个 range 是从**页面开头**拉出来的，`sel.anchorNode` 因此落在**栏 1** 的第一个字上 ——
-           * 于是夹取把选区"夹回"了栏 1（量到 `x=[144~563] 1024 字`，用户按的却是栏 2）。
-           * 按下点的坐标 `downRef` 是唯一没被浏览器改写的东西，所以优先用它来命中最内层 span；
-           * 命中不到（按在空白/图上）才退回 `sel.anchorNode`（强制重算时先用记住的那个文字节点）。
-           */
-          const pressSpan = ((): HTMLElement | null => {
-            try {
-              const el = document.elementFromPoint(downRef.x, downRef.y) as HTMLElement | null;
-              return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
-            } catch {
-              return null;
-            }
-          })();
-          /**
-           * 按下点没压在任何字形上时（**行间距/字间空隙**，实测 (820,655) 就是这种），
-           * 按几何找**离按下点最近的非空 span** —— 那才是用户"想选"的那个字所在的行。
-           * 不这么做的话：浏览器会从容器起拉 range，`sel.anchorNode` 落到页首的空白 span 上，
-           * 夹取就把选区夹到了**第 1 栏**（实测 `anchorSpan「      」anchorBand=0` → x=[144~563] 1025 字）。
-           */
-          const nearestSpanTo = (x: number, y: number): HTMLElement | null => {
-            let layer: Element | null = null;
-            try {
-              const hit = document.elementFromPoint(x, y);
-              layer = hit?.closest?.('.rd-pdf-text') ?? hit?.closest?.('.rd-pdf-page')?.querySelector('.rd-pdf-text') ?? null;
-            } catch {
-              layer = null;
-            }
-            if (!layer) {
-              const firstPage = document.querySelector('.rd-pdf-page .rd-pdf-text');
-              layer = firstPage;
-            }
-            if (!layer) return null;
-            let best: HTMLElement | null = null;
-            let bestD = Number.POSITIVE_INFINITY;
-            for (const s of layer.querySelectorAll<HTMLElement>('span:not(.markedContent)')) {
-              if (!(s.textContent ?? '').trim()) continue;
-              const r = s.getBoundingClientRect();
-              if (r.width <= 0 || r.height <= 0) continue;
-              const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0;
-              const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0;
-              const d = dx * dx + dy * dy;
-              if (d < bestD) {
-                bestD = d;
-                best = s;
-              }
-            }
-            return best;
-          };
-          const anchorSpan =
-            (force && anchorNodeRef && document.contains(anchorNodeRef) ? spanOf(anchorNodeRef) : null) ??
-            pressSpan ??
-            nearestSpanTo(downRef.x, downRef.y) ??
-            spanOf(sel.anchorNode);
-          if (!anchorSpan) return bail('按下点定不到 span（anchorNode 落在容器上）'); // 交给 fixContainerBoundary
-          /**
-           * 焦点**可能不在任何 span 上**：横向拖过栏缝时，浏览器的选区扩展会按 DOM 顺序一路吃到
-           * 文本层容器（实测样本文献 A（双栏）p4：`sel.focusNode` 就是 `DIV.rd-pdf-text`）。
-           * 所以焦点定不到 span 时**也算跨栏**，按指针位置决定夹到本栏的哪一端。
-           */
-          const focusSpan = spanOf(sel.focusNode);
-          const page = anchorSpan.closest('.rd-pdf-page') as HTMLElement | null;
-          if (!page) return bail('锚点不在 .rd-pdf-page 内');
-          if (focusSpan && focusSpan.closest('.rd-pdf-page') !== page) return bail('焦点在另一页（交给 clampCrossPage）');
-          // data-page-index 就是**1 基的页码**（= PdfPage 的 pageNumber，handleBands 也是按它存的），
-          // 别再 +1：那会去取下一页的栏带。实测症状就是"夹取日志打了、选区却还横跨两栏"——
-          // 拿错页的栏带会让跨栏的右端恰好落回锚点栏里，于是直接判定"没跨栏"而不夹。
-          const pageNo = Number(page.dataset.pageIndex ?? '0');
-          let regions = regionsByPageRef.current.get(pageNo);
-          if (!regions?.length) {
-            // [diag] 该页没有登记版式分区（实测会让夹取在**这一行**静默放弃 → 整页/跨栏选区原样留下）。
-            // 退回"现场用文本层 span 估一次栏带"，估不出来才真的不夹。
-            const domBands = domBandsOfPage(page);
-            if (!domBands) return bail(`第 ${pageNo} 页没有版式分区，DOM 也估不出栏带`);
-            console.debug(`[diag] 第 ${pageNo} 页没有登记版式分区 → 用现场 DOM 估计的 ${domBands.length} 条栏带夹取`);
-            regions = [{ top: 0, bottom: 1, full: false, bands: domBands, orderByBands: true }];
-          }
-          const pageRect = page.getBoundingClientRect();
-          if (pageRect.width <= 0 || pageRect.height <= 0) return bail('页面 rect 宽/高为 0');
-          const ratioOf = (span: HTMLElement): number => {
-            const r = span.getBoundingClientRect();
-            return (r.left + r.width / 2 - pageRect.left) / pageRect.width; // 0–1：抗缩放与 transform
-          };
-          /**
-           * **按锚点所在的纵向分区取栏带**（不是整页一套）。
-           *
-           * 混排页（上整幅通栏摘要 + 下双栏正文）里，摘要行本身就横跨整幅；整页一套栏带会把它
-           * 判成跨栏 → 夹成碎块（用户截图那一片零散蓝块）。所以：
-           *   · 锚点在**通栏区/单栏区**（该区栏带只有一条）→ **根本不夹**：那一段横跨整幅是版式事实；
-           *   · 锚点在**多栏区** → 用该区自己的栏带夹（正文照旧硬性禁止跨栏）。
-           */
-          const anchorRatioY = ((): number => {
-            const r = anchorSpan.getBoundingClientRect();
-            return (r.top + r.height / 2 - pageRect.top) / pageRect.height;
-          })();
-          let region = regions[regionIndexAtY(regions, anchorRatioY)];
-          if (!region || region.bands.length < 2) {
-            /**
-             * 老行为是这里直接 `return false`（放弃夹取）。**放弃 = 浏览器按 DOM 顺序拉出来的
-             * 整页选区原样留下**（实测 p2 末栏 945 字 / 越界 rect 520）。改成退到"最近的多栏分区"
-             * 的栏带；整页确实没有多栏分区时才真的不夹。`[diag]` 是排查用日志。
-             */
-            const near = nearestMultiColumnRegion(regions, anchorRatioY);
-            if (!near) {
-              console.debug(
-                `[diag] 夹取放弃：第 ${pageNo} 页锚点分区=${region ? (region.full ? '通栏' : '单栏') : '缺失'}，且整页没有多栏分区可退`,
-              );
-              return false;
-            }
-            console.debug(
-              `[diag] 第 ${pageNo} 页锚点分区=${region ? (region.full ? '通栏' : '单栏') : '缺失'} → 退到最近多栏分区 y ${near.top.toFixed(3)}~${near.bottom.toFixed(3)}（${near.bands.length} 栏）夹取`,
-            );
-            region = near;
-          }
-          const bands = region.bands;
-          const bandFor = (span: HTMLElement): number => {
-            const x = ratioOf(span);
-            const i = bandIndexOf(bands, x);
-            return i >= 0 ? i : nearestBandIndexOf(bands, x);
-          };
-          const anchorBand = force && lockedBand >= 0 ? lockedBand : bandFor(anchorSpan);
-          if (anchorBand < 0) return false;
-          console.debug(
-            `[diag] 锚点解析：press=(${Math.round(downRef.x)},${Math.round(downRef.y)}) pressSpan=${pressSpan ? `有「${(pressSpan.textContent ?? '').slice(0, 4)}」` : '无'}｜anchorSpan「${(anchorSpan.textContent ?? '').slice(0, 6)}」｜anchorBand=${anchorBand}｜栏带(px)=${bands.map((b) => `${Math.round(b.start * pageRect.width)}~${Math.round(b.end * pageRect.width)}`).join(',')}｜选区=${range.toString().length}字`,
-          );
-          const focusBand = focusSpan ? bandFor(focusSpan) : -1;
-          /**
-           * 同栏的正常选区不动它（**强制重算时例外**：DOM 变动后它"看起来同栏"正是被重新解释的结果）；
-           * 焦点定不到 span（容器）时按"跨栏"处理。
-           *
-           * ⚠ 但不能只看"两端 span 同栏"：实测苏敬勤 p2 末栏，浏览器把排队的 mousemove 在 mouseup
-           * **之后**才应用完，此时两端 span 都在锚点栏里，range 却被 DOM 顺序解释成**横跨整页**
-           * （869 字 / rect 越界 463）。所以补一个**几何事实**判据：选区里只要有一条 rect 的中心
-           * 落在锚点栏之外，就仍然要夹 —— "同栏就不动"只适用于 rect 也真在本栏内的选区。
-           */
-          if (!force && focusSpan && focusBand === anchorBand) {
-            const b0 = bands[anchorBand];
-            const crosses = [...sel.getRangeAt(0).getClientRects()].some((r) => {
-              const c = (r.left + r.right) / 2 - pageRect.left;
-              return c < b0.start * pageRect.width - 15 || c > b0.end * pageRect.width + 15;
-            });
-            if (!crosses) return false;
-            console.debug(
-              `[diag] 第 ${pageNo} 页两端 span 同栏（栏 ${anchorBand}）但选区 rect 越到栏外 → 仍然夹取`,
-            );
-          }
-          const spans = [...page.querySelectorAll<HTMLElement>('.rd-pdf-text span:not(.markedContent)')].filter(
-            (s) => (s.textContent ?? '').trim().length > 0,
-          );
-          /**
-           * 端点必须落在本栏的**安全区**里 —— 两端用**相邻栏缝**卡死。
-           *
-           * 栏缝本身来自 **pdf.js 文本项**的 x 覆盖（`columnBandsFromItems`/`columnRegionsFromItems`），
-           * 所以"哪个字属于哪一栏"实际是按文本项判的；DOM span 只用来定位端点、不再决定归属。
-           *
-           * 为什么必须这样（用户截图那批泄漏的真因）：两端对齐的中文正文里，**行末单个汉字会被字距
-           * 推进栏缝**（实测 p3：栏缝 555~595，却有 span `[595~613]「连」` 中心落在栏 1 一侧）。
-           * 按"span 中心在本栏"挑端点就会把它当本栏内容，夹出来的选区右端一律停在 613 ✗。
-           * 现在要求端点的**右端 ≤ 下一栏起点 +2px**（左端同理 ≥ 上一栏终点 -2px）。
-           */
-          const band = bands[anchorBand];
-          const prevBand = bands[anchorBand - 1];
-          const nextBand = bands[anchorBand + 1];
-          const tolPx = 2;
-          const safeLo = (prevBand ? prevBand.end : band.start) * pageRect.width - tolPx;
-          const safeHi = (nextBand ? nextBand.start : band.end) * pageRect.width + tolPx;
-          const safeEndpoint = (s: HTMLElement): boolean => {
-            const r = s.getBoundingClientRect();
-            const l = r.left - pageRect.left;
-            const rr = r.right - pageRect.left;
-            return rr <= safeHi && l >= safeLo;
-          };
-          /**
-           * 端点归属**只认文本项几何**（span 上打的 data-x0/x1，见 tagTextSpans）：文本项整段落在本栏
-           * （容差 2px）才是候选。两端对齐时行末的汉字可能被推进栏缝，它的文本项会越过本栏右界，
-           * 于是不是候选 —— 这正是 613 泄漏的真因（DOM 中心/rect 判会把它算进本栏）。
-           * 打标失败的页（没有 x0/x1）才退回上面的 DOM 判据。
-           */
-          const endpointInBand = (s: HTMLElement): boolean => {
-            if (s.dataset.x0 !== undefined && s.dataset.x1 !== undefined) {
-              const tol = 2 / pageRect.width;
-              return Number(s.dataset.x0) >= band.start - tol && Number(s.dataset.x1) <= band.end + tol;
-            }
-            return bandIndexOf(bands, ratioOf(s)) === anchorBand && safeEndpoint(s);
-          };
-          let inAnchor = spans.filter(endpointInBand);
-          if (!inAnchor.length) {
-            /**
-             * 老行为：一个端点都没命中就 `return false` 放弃夹取（同样把跨栏选区留下）。
-             * 打标（data-x0/x1）没生效、或与栏带口径不一致时会走到这里，所以退回**几何判据**：
-             * span 中心落在本栏（含"最近栏"兜底）且两端都在 safeLo/safeHi 之内。
-             * `[diag]` 是排查用日志。
-             */
-            inAnchor = spans.filter((s) => bandIndexOf(bands, ratioOf(s)) === anchorBand && safeEndpoint(s));
-            console.debug(
-              `[diag] 第 ${pageNo} 页端点打标没命中，退回几何判据：命中 ${inAnchor.length} / ${spans.length} 个 span`,
-            );
-          }
-          if (!inAnchor.length) {
-            console.debug(
-              `[diag] 夹取放弃：第 ${pageNo} 页几何判据也没有可用端点（锚点栏=${anchorBand}，栏带=${JSON.stringify(bands)}）`,
-            );
-            return false;
-          }
-          // 往前拖（按下点在前）夹到本栏末尾，往回拖夹到本栏开头；焦点不在 span 上时用指针 x 判方向。
-          // 强制重算时用上次记下的方向（DOM 变动后 compareDocumentPosition 已经不可信）。
-          const anchorRect = anchorSpan.getBoundingClientRect();
-          const forward =
-            force && lockedForward !== null
-              ? lockedForward
-              : focusSpan
-                ? !!(anchorSpan.compareDocumentPosition(focusSpan) & Node.DOCUMENT_POSITION_FOLLOWING)
-                : pointerRef.x >= anchorRect.left + anchorRect.width / 2;
-          const build = (aNode: Node, aOff: number, bNode: Node, bOff: number): Range | null => {
-            const r = document.createRange();
-            try {
-              r.setStart(aNode, aOff);
-              r.setEnd(bNode, bOff);
-              return r;
-            } catch {
-              return null;
-            }
-          };
-          /**
-           * 取"本栏末尾/开头"这一步**不能按 DOM 顺序取**（老写法用 inAnchor[last]）。
-           *
-           * 真实反例（样本文献 A（双栏）p4）：该页文本层带 .markedContent 嵌套，`reorderTextLayer`
-           * 的保守分支不会重排，于是 **DOM 顺序 ≠ 阅读顺序** —— DOM 里最后一个"属于左栏"的 span
-           * 在纸面上靠近页面末尾，[按下点 → 它] 的区间直接把整页包进来（实测 1820 字、x 138~945，
-           * 看着像没夹，其实是"夹歪了"）。
-           *
-           * 所以改成：按**几何**挑（往前拖取本栏最靠下、往回拖取最靠上），并且只在本轮选区**之内**挑，
-           * 保证结果一定不比原来长；逐个候选试，第一个"更短且非空"的采用。
-           */
-          const edgeY = (el: HTMLElement): number => {
-            const r = el.getBoundingClientRect();
-            // 升序排：往前拖要"本栏最靠下"的排最前（取负），往回拖要"最靠上"的排最前
-            return forward ? -r.bottom : r.top;
-          };
-          /**
-           * 候选端点 = **本栏的所有 span**（不限于当前选区之内）。
-           *
-           * 为什么不能只看"当前选区里"的 span：浏览器按 DOM 顺序扩展，跨栏那一拖的选区可能很短
-           * （实测样本文献 A p4：重排后焦点恰好挨着锚点，原生选区只有 5 字），于是候选寥寥、夹出来还是 5 字。
-           * 而"往前拖到本栏末尾"本来就是要**延伸到本栏末尾**的语义 —— 安全性由下面
-           * `rectsInAnchorBand`（每一段都必须整段在本栏内）保证，不靠"不许变长"。
-           */
-          const candidates = inAnchor.slice().sort((p, q) => edgeY(p) - edgeY(q));
-          /**
-           * 候选端点是否"整段在本栏内"。
-           *
-           * ⚠ R6 改法（用户亲口要求"跨过数字/标点/英文不要中断" + 修掉 R5 的副作用）：
-           * **只看候选 span 自己的 rect**，不再拿"锚点→候选"整段 Range 的 rects 去判。
-           * 原因（实测苏敬勤 p2 末栏）：DOM 已按栏重排，而 Range 会跨越中间那些"伸出栏缝"的内容
-           * —— 行末被推进栏缝的单字、西文/数字 run、以及 pdf.js 那个整页大小的 `.endOfContent` ——
-           * 于是**每一个候选**都被判失败 → 夹取一个端点都没有 → R5 只能"永远等下一拍"，
-           * 把"偶发 1 字碎片"变成"稳定留下 869 字跨栏选区"（对用户更糟）。
-           * 只判候选自己那一格：既保证"夹到的端点确实在本栏"，又不会被中间内容连坐；
-           * ghost（`.endOfContent` / `.selecting`）的整页矩形属于**别的元素**，从此不再进入判定。
-           */
-          const rectsInAnchorBand = (cand: HTMLElement): boolean => {
-            const band = bands[anchorBand];
-            if (!band) return false;
-            const pad = pageRect.width * 0.01; // 1% 容差：字距/抗锯齿的零点几像素别误杀
-            const lo = band.start * pageRect.width - pad;
-            const hi = band.end * pageRect.width + pad;
-            let rects: DOMRect[] = [];
-            try {
-              rects = [...cand.getClientRects()].filter((x) => x.width > 0.5 && x.height > 0.5);
-            } catch {
-              return false;
-            }
-            if (!rects.length) return false;
-            return rects.every((x) => {
-              const l = x.left - pageRect.left;
-              const rr = x.right - pageRect.left;
-              return l >= lo && rr <= hi;
-            });
-          };
-          const before = range.toString();
-          let bestRange: Range | null = null;
-          let bestLen = -1;
-          let tried = 0;
-          let passed = 0;
-          /** [diag] 排查用：候选为什么一个都没过（build 失败 / 栏判据失败分开计数） */
-          let failNoNode = 0;
-          let failBuild = 0;
-          let failBand = 0;
-          const failSamples: string[] = [];
-          const buildFromAnchor = (node: Node | null, off: number): Range | null => {
-            if (!node) return null;
-            /**
-             * 按下点那一端**只用 span 自己的文字节点**定位（按指针在 span 里的左右半边决定取头还是取尾）。
-             *
-             * 为什么不用 `sel.anchorNode/anchorOffset`：夹取是在松手后 ~0.4 秒才跑的，
-             * 那时浏览器（和 pdf.js 自己的选区修正）可能已经把锚点解析到了**容器级节点**上；
-             * 容器级的边界点极其脆弱 —— pdf.js 会在选区变化时移动 `.endOfContent`、给文本层
-             * 加/去 `selecting` 类，这些都是容器子节点的增删，会让"同一对边界点"圈住的内容整体改变，
-             * 而浏览器**不会**为这种变化补发 `selectionchange`（看护逻辑因此完全没机会纠正）。
-             * 实测：夹取刚把选区锁成右栏 650 字 x590~997，16ms 后同一对边界点变成横跨整页 x1~1147。
-             * 换成 span 内部的文字节点后，pdf.js 动它自己的节点就影响不到我们的区间了。
-             */
-            /**
-             * ⚠ R6 关键修复：取**后代**里第一个文字节点，而不是只看 `childNodes` 里的直接子节点。
-             *
-             * 实测（苏敬勤 p2 末栏）：`candidates=604 tried=0 passed=0 Range建不出=604` —— 604 个候选
-             * **一个都没能建出 Range**，因为 pdf.js 在带标记内容的页面上会把文字放在嵌套元素里，
-             * `anchorSpan.childNodes` 里没有直接 TEXT_NODE → `tn === null` → 每个候选都 `return null`。
-             * 结果：夹取永远"无端点"（R5 之后表现为"永远等下一拍"），用户侧就是"选不中/一选就断"。
-             */
-            const tn = firstTextNodeOf(anchorSpan);
-            if (!tn) return null;
-            const r = anchorSpan.getBoundingClientRect();
-            const aOff = pointerRef.x >= r.left + r.width / 2 ? (tn.textContent ?? '').length : 0;
-            return (
-              [build(tn, aOff, node, off), build(node, off, tn, aOff)].find(
-                (x): x is Range => !!x && !x.collapsed,
-              ) ?? null
-            );
-          };
-          for (const cand of candidates) {
-            const node = firstTextNodeOf(cand);
-            if (!node) {
-              failNoNode += 1;
-              continue;
-            }
-            const offset = forward ? (node.textContent ?? '').length : 0;
-            const r = buildFromAnchor(node, offset);
-            if (!r) {
-              failBuild += 1;
-              if (failSamples.length < 3) {
-                const cr = cand.getBoundingClientRect();
-                failSamples.push(`build=null cand[${Math.round(cr.left - pageRect.left)}~${Math.round(cr.right - pageRect.left)}]「${(cand.textContent ?? '').slice(0, 6)}」`);
-              }
-              continue;
-            }
-            tried += 1;
-            // **硬条件**：端点在锚点栏里（只看候选自己的 rect，见上面 R6 的说明）
-            if (!rectsInAnchorBand(cand)) {
-              failBand += 1;
-              if (failSamples.length < 3) {
-                const cr = cand.getBoundingClientRect();
-                failSamples.push(
-                  `band=${band.start.toFixed(3)}~${band.end.toFixed(3)} cand=[${Math.round(cr.left - pageRect.left)}~${Math.round(cr.right - pageRect.left)}]「${(cand.textContent ?? '').slice(0, 6)}」`,
-                );
-              }
-              continue;
-            }
-            passed += 1;
-            const len = r.toString().length;
-            // 在"不出栏"的候选里挑**最长**的：往前拖就一路夹到本栏末尾。
-            // 这里**不做"只在变短时替换"**：重排之后 DOM = 阅读顺序，夹到本栏末尾天然是连续区间；
-            // 而"只在变短时"会让"浏览器恰好只选了几个字"的情况下完全夹不动（实测样本文献 A p4 卡在 5 字）。
-            if (len > bestLen) {
-              bestRange = r;
-              bestLen = len;
-            }
-          }
-          /**
-           * (R5) 最长候选只有 1~2 字 → 判定"端点还没就绪"（浏览器选区尚未定型时，本栏内的候选端点
-           * 会残缺不全），**这一拍不夹**，等空窗期的下一拍（mouseup 后 +80…+900ms 共 7 拍）。
-           * 宁可晚一点夹对，也不要把"横跨整页"换成"1 个字" —— 后者正是用户报的"碎成 1~3 字"。
-           */
-          if (bestRange && bestLen <= 2) {
-            console.debug(`[diag] 第 ${pageNo} 页最长候选只有 ${bestLen} 字（端点未就绪）→ 本拍不夹，等下一拍`);
-            return false;
-          }
-          if (!bestRange) {
-            /**
-             * 兜底：一整个候选都过不了"整段在本栏内"时（真实页面上方常有横跨栏缝的公告块/图注，
-             * 反向拖的范围必然穿过它们），退到**锚点自己那个 span 的边界**——
-             * 它一定在本栏内、也一定不会跨栏。宁可只夹出几个字，也绝不让跨栏选区留下。
-             */
-            /**
-             * (R5) 老代码这里退到**锚点 span 自身**（通常 1~3 个字）—— 正是用户报的"碎成 1~3 字"。
-             * 实测这一拍往往只是"端点还没就绪"，所以本拍不夹，交给 mouseup 后 +80…+900ms 的
-             * 空窗期补夹（7 拍）以及 selectionchange 那条路。宁可晚一拍夹对，也不产出碎片。
-             */
-            console.debug(`[diag] 第 ${pageNo} 页没有任何候选过"整段在本栏内"（端点未就绪）→ 本拍不夹，等下一拍`);
-            console.debug(
-              `[diag] 候选诊断：candidates=${candidates.length} tried=${tried} passed=${passed} 无文字节点=${failNoNode} Range建不出=${failBuild} 栏判据失败=${failBand}｜样本：${failSamples.join('；') || '（无）'}`,
-            );
-            return false;
-          }
-          const fixed = bestRange;
-          // 连兜底都过不了就不动手（宁可不夹，也绝不产出跨栏选区）
-          if (!fixed) return false;
-          if (fixed.toString() === before) return false;
-          sel.removeAllRanges();
-          sel.addRange(fixed);
-          // 记下"这次夹到哪一栏、哪个方向、按下点是哪个文字节点"：DOM 被 pdf.js 动过之后，
-          // 这些是唯一还可信的东西（强制重算要用，见 watchLayer）。
-          lockedBand = anchorBand;
-          lockedForward = forward;
-          anchorNodeRef = anchorSpan.firstChild ?? null;
-          console.debug(`[reader] 选区跨栏，已夹回按下时所在那一栏（第 ${pageNo} 页共 ${bands.length} 栏）`);
-          return true;
-        };
-
-      let collectTimer = 0;
-      /** 鼠标是否按着（拖动期间一律不干预、也不弹工具条——老实现只在松手时收集） */
-      let pressed = false;
+      const a = at(downRef.x, downRef.y);
+      const b = at(pointerRef.x, pointerRef.y);
+      if (!a || !b) return false;
+      if (a.span.closest('.rd-pdf-page') !== b.span.closest('.rd-pdf-page')) return false;
       /**
-       * 松手瞬间算出的"正确选区"，在看护窗口内锁住。
-       *
-       * 为什么需要锁：浏览器会把**排队的 mousemove 在 mouseup 之后才应用完**，
-       * 于是松手后选区还会被它改写一次（实测 27 字 → 296 字，又变回"从页首连到按下行"）。
-       * 一次性修不住，得在随后 ~0.7 秒里"它改一次、我锁回一次"。
+       * 两个顺序都要试：DOM 顺序与参数顺序相反时 Chromium **不抛异常**，
+       * 而是返回一个**塌陷**的 Range（这个坑在旧实现里踩过两次）。
        */
-      let lockedRange: Range | null = null;
-      let guardUntil = 0;
-      /** 看护窗口内的主动重锁定时器（见 armLock：有些改写不发 selectionchange） */
-      let relockTimer = 0;
-      /** 本次跨栏夹取记住的"锚点栏 / 方向 / 按下点文字节点"（强制重算用，见 watchLayer） */
-      let lockedBand = -1;
-      let lockedForward: boolean | null = null;
-      let anchorNodeRef: Node | null = null;
-      /**
-       * 当前这次看护是不是"跨栏夹取"的结果。
-       * 只有它才允许走**强制重算**：正常同栏选区的顺序/长度都是浏览器原生给的，
-       * 绝不能因为页面里任何一次 DOM 变动就把它重算成"整栏"（那会把 45 条手感用例全带崩）。
-       */
-      let columnClamped = false;
-      /** 看护窗口内的文本层变动监听（pdf.js 会动 `.endOfContent`、加/去 `selecting`） */
-      let layerObserver: MutationObserver | null = null;
-      /** 强制重算次数上限：防止"回夹 → 又变动 → 再回夹"互相触发成环 */
-      let forcedReclamps = 0;
-      const MAX_FORCED_RECLAMPS = 20;
-      /**
-       * 本次划词的看护上限。跨栏夹取成功后会把看护往后延（见 armLock），但不能无限延
-       * —— 否则用户下一次点击之前一直锁着。2.5 秒足够覆盖浏览器把排队的 mousemove 应用完。
-       */
-      let lockDeadline = 0;
-
-      /** 结束看护：定时器、变动监听、记住的锚点信息一起清掉 */
-      const stopGuard = (): void => {
-        if (relockTimer) {
-          window.clearInterval(relockTimer);
-          relockTimer = 0;
+      const mk = (n1: Node, o1: number, n2: Node, o2: number): Range | null => {
+        const r = document.createRange();
+        try {
+          r.setStart(n1, o1);
+          r.setEnd(n2, o2);
+        } catch {
+          return null;
         }
-        layerObserver?.disconnect();
-        layerObserver = null;
-        lockedRange = null;
-        lockedBand = -1;
-        lockedForward = null;
-        anchorNodeRef = null;
-        columnClamped = false;
+        return r.collapsed ? null : r;
       };
+      const fixed = mk(a.node, a.off, b.node, b.off) ?? mk(b.node, b.off, a.node, a.off);
+      if (!fixed || !fixed.toString().trim()) return false;
+      sel?.removeAllRanges();
+      sel?.addRange(fixed);
+      console.debug(`[reader] 浏览器没拉出选区，已按"按下点 → 松手点"补一个：${fixed.toString().length} 字`);
+      return true;
+    };
 
-      /**
-       * 看护窗口内盯住文本层的子节点变动。
-       *
-       * 为什么非要有它：pdf.js 自己会在选区变化时搬 `.endOfContent`、给文本层加/去 `selecting` 类，
-       * 这些容器子节点的增删会让"同一对边界点"圈住的**内容整体改变**，而 Chromium **不会**补发
-       * `selectionchange`（实测：夹取刚锁成右栏 650 字 x590~997，16ms 后同一段变成横跨整页
-       * x1~1147，整条时间线里一条 selectionchange 都没有）。事件驱动与"套回旧边界点"都救不回来
-       * （`cloneRange()` 只存边界点，会被同样地重新解释），所以一检测到变动就**按几何强制重算**。
-       */
-      const watchLayer = (): void => {
-        if (layerObserver) return;
-        // 盯住"按下点所在的那个文本层"（拿不到就退到滚动容器里的第一个）
-        const ref = anchorNodeRef;
-        const el = !ref ? null : ref.nodeType === Node.ELEMENT_NODE ? (ref as HTMLElement) : ref.parentElement;
-        const host =
-          (el?.closest?.('.rd-pdf-text') as HTMLElement | null) ??
-          scrollRef.current?.querySelector<HTMLElement>('.rd-pdf-text') ??
-          null;
-        if (!host) return;
-        layerObserver = new MutationObserver(() => {
-          // 拖动期间不干预：pdf.js 自己拖动时会搬 `.endOfContent` 触发这里，
-          // 一旦回写旧区间就会把用户正在拖的选区打碎（用户实测的"1~3 字小选区"）
-          if (pressed) return;
-          if (!lockedRange || Date.now() > guardUntil) {
-            stopGuard();
-            return;
-          }
-          if (forcedReclamps >= MAX_FORCED_RECLAMPS) {
-            layerObserver?.disconnect();
-            layerObserver = null;
-            return;
-          }
-          forcedReclamps += 1;
-          // 正常同栏选区：只套旧区间，绝不重算（见 columnClamped 的说明）
-          if (!columnClamped) {
-            applyLocked();
-            parkEndOfContent();
-            return;
-          }
-          // 跨栏夹取的结果：先试"强制重算"（绕过"同栏就不动"的早退）；算不出来才退回套旧区间
-          if (clampToAnchorColumn(true)) {
-            const sel = window.getSelection();
-            if (sel && !sel.isCollapsed && sel.rangeCount) {
-              armLock(sel.getRangeAt(0), Math.max(200, lockDeadline - Date.now()));
-            }
-            parkEndOfContent(); // pdf.js 刚把整页大小的 .endOfContent 插进选区 → 挪回末尾
-            console.debug(
-              `[reader] 文本层被改动过，已按几何重夹回按下那一栏（本次第 ${forcedReclamps} 次）`,
-            );
-            return;
-          }
-          applyLocked();
-          parkEndOfContent();
-        });
-        layerObserver.observe(host, { childList: true, subtree: true });
-      };
-
-      /**
-       * 把 pdf.js 的 `.endOfContent` 挪回文本层末尾。
-       *
-       * 这是**最后一块拼图**：pdf.js 在每次 `selectionchange` 里会
-       * （`pdf_viewer.mjs` 的 `#enableGlobalSelectionListener`）把 `.endOfContent`
-       * `insertBefore` 到**选区锚点旁边**，并把它的宽高设成**整个文本层的宽高** ——
-       * 于是一个"整页大小"的块被塞进了我们的区间里：选区的**文字一个没变**，
-       * `getClientRects()` 却多出一条横贯整页的矩形（实测右栏 650 字 x0.514~0.869
-       * 变成 x0.001~0.999），批注矩形、工具条定位、验收判据全被这条幽灵矩形污染。
-       * 我们自己重新设选区又会触发它再插一次 —— 这也是"夹取日志打了、量到还是跨栏"的真正原因。
-       *
-       * pdf.js 自己的 `reset()`（pointerup/blur 时）就是 `textLayer.append(end)`，
-       * 所以放回末尾=回到它的规范位置，不影响它的"拖到页尾"逻辑（下一次拖动它会自己再插）。
-       */
-      const parkEndOfContent = (): void => {
-        /**
-         * **所有文本层都要清**，而且**没有选区时也要清**。
-         *
-         * 老写法有两道早退（"选区塌陷就返回""只处理与选区相交的那一层"），于是总有一层
-         * 被漏在"铺满整层 + `.selecting`"的状态里；那一层接下来就是一个盖住整页、
-         * `user-select: none` 的块 —— 下一次在这片区域按下拖动**一个字符都选不中**
-         * （实测：按下命中 `.endOfContent` → 全程 0 字、松手停在松手点）。
-         * pdf.js 自己的 `reset()`（pointerup/blur 时）就是 `textLayers.forEach(reset)`、
-         * 不看选区也不看塌陷，这里照它的口径来。
-         */
-        const layers = scrollRef.current?.querySelectorAll<HTMLElement>('.rd-pdf-text');
-        if (!layers?.length) return;
-        for (const layer of layers) {
-          const end = layer.querySelector<HTMLElement>('.endOfContent');
-          if (!end) continue;
-          /**
-           * 必须**照着 pdf.js 自己的 reset() 清掉行内宽高**（`end.style.width/height = ""`）：
-           * pdf.js 在选中期间会把它的宽高设成**整个文本层那么大**；只把它挪到末尾、不清尺寸，
-           * 它就是一个盖住整页的可选中块 —— 下一次按下会落在它身上，拖出来是**塌陷选区**
-           * （实测样本文献 A p4 正向：全新实例、按下(417,665)→松手(895,699)，结果 0 字）。
-           * 清掉后它回到 `inset:100% 0 0` 的零尺寸状态，既不撑大选区也不吃鼠标。
-           */
-          if (end !== layer.lastElementChild) layer.append(end);
-          if (end.style.width || end.style.height) {
-            end.style.width = '';
-            end.style.height = '';
-          }
-          /**
-           * 还要像 pdf.js 的 `reset()` 一样**摘掉 `selecting` 类**：CSS 里
-           * `.rd-pdf-text.selecting .endOfContent { top: 0 }` 会把它从"文字下方零高度的一条"
-           * 变成**盖住整页的可选中层**（实测夹取成功后它的 rect 是 `1,1,1147,1622`，整个文本层大小）。
-           * 留着它，下一次在这个区域按下拖动就**选不中任何文字**（实测样本文献 A p4 正向：
-           * 按住(417,665)一路拖到(895,699)，全程 0 字、松手塌陷在松手点）。
-           * 摘掉类名即回到 pdf.js 的 idle 状态；它下一次拖动会自己再加回来。
-           */
-          layer.classList.remove('selecting');
+    /**
+     * 收尾：读原生选区 → 内核按字符模型算合法选区（越栏就写一次端点）→ 上报给工具条。
+     *
+     * 顺序不能反：必须先让内核把端点收窄，再按收窄后的选区建 anchor/rects，
+     * 否则批注会锚在"越栏那一版"的坐标上。
+     */
+    const settle = (): void => {
+      collectTimer = 0;
+      if (pressed) return;
+      let { snap, range } = readKernelSelection();
+      if (!snap && !range) {
+        // 浏览器完全没拉出选区 → 补一个再按同一条路走一遍
+        if (rescueEmptyDrag()) {
+          const again = readKernelSelection();
+          snap = again.snap;
+          range = again.range;
         }
-      };
+      }
+      if (!snap) {
+        if (lastSelectionRef.current) {
+          lastSelectionRef.current = null;
+          onSelectionRef.current(null);
+        }
+        return;
+      }
+      collectSelection(snap, range);
+    };
+    /** 合并短时间内的多次触发（`selectionchange` 在拖动中会刷屏） */
+    const schedule = (delay = 0): void => {
+      if (collectTimer) window.clearTimeout(collectTimer);
+      collectTimer = window.setTimeout(settle, delay);
+    };
 
+    const onSelectionChange = (): void => {
       /**
-       * 清完再"补两刀"：pdf.js 的 `selectionchange` 回调是**异步**的
-       * （Chromium 把 selectionchange 作为任务排队），我们把选区写回去之后紧接着调
-       * `parkEndOfContent()`，跑在它的回调**之前** —— 它随后又把 `.endOfContent`
-       * 铺满整层、再加上 `.selecting`，而这时候看护窗口往往已经结束，没人再清。
-       * 结果就是那一层留下一个盖住整页、选不中字的块（0 字拖动的直接来源）。
-       * 所以在随后的两个宏任务里各补一次。
+       * 拖动中：**只纠正、不上报**。Zotero 是每个 `selectionchange` 都同步一次选区
+       * （它的高亮是模型渲染的，所以不怕改）；我们用的是原生选区，所以拖动中尽量不写 DOM，
+       * 只在上报时（松手后）做一次收窄 —— 这样不会和浏览器正在进行的拖动打架。
        */
-      const parkSoon = (): void => {
-        parkEndOfContent();
+      if (pressed) return;
+      schedule(20);
+    };
+
+    const onMove = (ev: Event): void => {
+      const me = ev as MouseEvent;
+      if (me.clientX || me.clientY) {
+        pointerRef.x = me.clientX;
+        pointerRef.y = me.clientY;
+      }
+    };
+
+    const onUp = (ev: Event): void => {
+      const me = ev as MouseEvent;
+      const target = ev.target as Node | null;
+      if (!target || !scrollRef.current?.contains(target)) return;
+      if (typeof me.button === 'number' && me.button !== 0) return; // 右键/中键不参与划词收尾
+      onMove(ev);
+      pressed = false;
+      // 没有选中文字时，先看是不是点在已有批注上（点批注打开卡片）
+      const pageEl = (target as HTMLElement).closest?.('.rd-pdf-page') as HTMLElement | null;
+      if (pageEl) {
+        const selBefore = window.getSelection();
+        const hasText = !!selBefore && !selBefore.isCollapsed && selBefore.toString().trim().length > 0;
+        if (!hasText) {
+          const ann = hitTestAnnotation(pageEl, me.clientX ?? 0, me.clientY ?? 0);
+          if (ann) {
+            onSelectAnnotationRef.current(ann, pageEl.getBoundingClientRect());
+            return;
+          }
+        }
+      }
+      settle(); // 松手立刻收一次（工具条在松手时才弹）
+      /**
+       * 浏览器会把**排队的 mousemove 在 mouseup 之后才应用完**（实测能晚到 1 秒之后），
+       * 那一波会把选区再扩回去。所以在 1.2 秒内补几拍，复用同一条 `settle` 路径
+       * （没有越栏选区时每一拍都是空操作：内核的 `read` 算出来与原生一致 → `apply` 一个字节都不写）。
+       */
+      for (const delay of [70, 150, 260, 420, 650, 900, 1200]) {
         window.setTimeout(() => {
-          if (!pressed) parkEndOfContent();
-        }, 0);
-        window.setTimeout(() => {
-          if (!pressed) parkEndOfContent();
-        }, 90);
-      };
+          if (!pressed) schedule(0);
+        }, delay);
+      }
+    };
 
-      /** 锁住一个选区并顺延看护窗口（不超过 lockDeadline） */
-      const armLock = (range: Range, ms: number): void => {
-        lockedRange = range.cloneRange();
-        guardUntil = Math.min(Date.now() + ms, lockDeadline || Date.now() + ms);        /**
-         * 除了"它改一次我锁回一次"（selectionchange 驱动），还要**定时主动重锁**。
-         *
-         * 原因同上（有些改写不发 selectionchange）。定时重锁负责"套回旧区间"，
-         * 变动监听负责"旧区间也失效时按几何重算"，两者互补。
-         */
-        watchLayer();
-        if (relockTimer) return;
-        relockTimer = window.setInterval(() => {
-          /**
-           * **拖动期间绝对不许改写选区**（用户实测：按着鼠标一次性快拖时，会出现"1 个、2 个、3 个字"
-           * 的小选区 —— 就是因为看护窗口没结束用户又开始拖，这个 120ms 的定时器把**上一次锁定的旧区间**
-           * 写回选区，把人正在拖的选区打碎）。看护只服务于"松手之后"。
-           */
-          if (pressed) return;
-          if (Date.now() > guardUntil || !lockedRange) {
-            stopGuard();
-            return;
-          }
-          applyLocked();
-          parkEndOfContent();
-        }, 120);
-      };
-
-      /** 看护窗口内：把选区套回锁定的那个（锁失效则返回 false，交回正常流程） */
+    const onDown = (ev: Event): void => {
+      const me = ev as MouseEvent;
+      const target = ev.target as HTMLElement | null;
       /**
-       * 当前选区在**几何上**是否越出了"它锚点所在的那一栏"。
-       * 判据与 `clampToAnchorColumn()` 里那条一致：只要有 rect 的中心落在锚点栏之外就算越栏。
-       * 用途：`applyLocked()` 在"浏览器刚把整页 range 拉出来"时让位给夹取（否则上一轮的锁会短路本轮夹取）。
+       * 右键：**只阻止焦点转移，不动选区**。
+       *
+       * 官方 TextLayerBuilder 给文本层 div 设了 `tabIndex = 0`（为了键盘可达性），
+       * 于是右键按下会把焦点移到那一层上、浏览器顺手把选区清掉 —— 表现就是
+       * "右键菜单里没有高亮/复制这些依赖选区的项"（UX 回归实测 6 字 → 0 字）。
+       * 在 mousedown 上 preventDefault 能挡住焦点转移，而且不影响 contextmenu 照常弹出。
        */
-      const liveSelectionCrossesColumn = (): boolean => {
-        const sel = window.getSelection();
-        if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
-        const spanOfNode = (n: Node | null): HTMLElement | null => {
-          const el = !n ? null : n.nodeType === Node.ELEMENT_NODE ? (n as HTMLElement) : n.parentElement;
-          return (el?.closest?.('.rd-pdf-text span') as HTMLElement | null) ?? null;
-        };
-        const anchorSpan =
-          spanOfNode(sel.anchorNode) ??
-          (anchorNodeRef && document.contains(anchorNodeRef) ? spanOfNode(anchorNodeRef) : null);
-        const page = anchorSpan?.closest?.('.rd-pdf-page') as HTMLElement | null;
-        if (!anchorSpan || !page) return false;
-        const pageNo = Number(page.dataset.pageIndex ?? '0');
-        const regions = regionsByPageRef.current.get(pageNo);
-        if (!regions?.length) return false;
-        const pr = page.getBoundingClientRect();
-        if (pr.width <= 0 || pr.height <= 0) return false;
-        const ar = anchorSpan.getBoundingClientRect();
-        const yRatio = (ar.top + ar.height / 2 - pr.top) / pr.height;
-        const region = regions[regionIndexAtY(regions, yRatio)];
-        if (!region || region.bands.length < 2) return false;
-        const xRatio = (ar.left + ar.width / 2 - pr.left) / pr.width;
-        const bi = bandIndexOf(region.bands, xRatio);
-        if (bi < 0) return false;
-        const band = region.bands[bi];
-        return [...sel.getRangeAt(0).getClientRects()].some((r) => {
-          const c = (r.left + r.right) / 2 - pr.left;
-          return c < band.start * pr.width - 15 || c > band.end * pr.width + 15;
-        });
-      };
+      if (me.button === 2) {
+        ev.preventDefault();
+        if (window.getSelection()?.toString().trim()) settle();
+        return;
+      }
+      if (me.button !== 0) return; // 中键等一律不参与划词
+      onMove(ev);
+      downRef.x = me.clientX ?? 0;
+      downRef.y = me.clientY ?? 0;
+      pressed = true;
+      selectionKernelRef.current?.clear();
+      lastSelectionRef.current = null;
+      // 点在文字层之外（画布/页边空白）：浏览器会清掉选区，等它清完再收一次，工具条跟着消失
+      if (!target?.closest?.('.rd-pdf-text')) window.setTimeout(() => schedule(0), 0);
+    };
 
-      const applyLocked = (): boolean => {
-        // 拖动中一律不改写选区：任何"套回旧区间"的动作都会和用户正在进行的拖动打架
-        if (pressed) return false;
-        if (!lockedRange) return false;
-        /**
-         * **让位给夹取**：当前选区在几何上已经越栏时，先把机会让给 `clampToAnchorColumn()`。
-         *
-         * 为什么：浏览器把排队的 mousemove 应用完那一刻，选区是"横跨整页"的；若这里先"套回上一轮
-         * 的锁"，夹取就被短路掉了。实测苏敬勤 p2 末栏：4 次快/慢拖里 3 次**全程没有任何夹取日志**，
-         * 最终量到 869 字 / rect 越界 463。
-         */
-        if (liveSelectionCrossesColumn()) {
-          console.debug('[diag] 当前选区几何上已越栏 → applyLocked 让位，交给夹取');
-          return false;
-        }
-        if (!document.contains(lockedRange.startContainer) || !document.contains(lockedRange.endContainer)) {
-          stopGuard(); // 边界节点已脱离文档：锁没意义了，定时器/监听一起收掉
-          return false;
-        }
-        const sel = window.getSelection();
-        if (!sel) return false;
-        const cur = sel.rangeCount ? sel.getRangeAt(0) : null;
-        /**
-         * "已经是它了"必须**连几何一起比**，不能只比文字。
-         *
-         * 实测（样本文献 A p4 反向拖，锚点在右栏）：夹取选出的 650 字在右栏 x590~997，
-         * 浏览器随后改写出的选区**正好也是 650 字**、却横跨整页 x1~1147 —— 只比 `toString()`
-         * 就会判定"已经锁对了"，于是放着跨栏选区不管（日志里夹取打了、量到的还是跨栏）。
-         */
-        const sameAsLocked = (r: Range): boolean => {
-          if (!lockedRange || r.toString() !== lockedRange.toString()) return false;
-          const a = [...r.getClientRects()];
-          const b = [...lockedRange.getClientRects()];
-          if (a.length !== b.length) return false;
-          if (!a.length) return true;
-          return (
-            Math.abs(a[0].left - b[0].left) < 2 &&
-            Math.abs(a[0].top - b[0].top) < 2 &&
-            Math.abs(a[a.length - 1].right - b[b.length - 1].right) < 2
-          );
-        };
-        if (cur && !sel.isCollapsed && sameAsLocked(cur)) return false; // 已经是它了
-        sel.removeAllRanges();
-        sel.addRange(lockedRange);
-        // 又被浏览器改了一次 → 看护再顺延一小段（实测松手后它会分批改写好几次）
-        guardUntil = Math.min(Date.now() + 400, lockDeadline || Date.now() + 400);
-        return true;
-      };
+    const onKeyUp = (ev: Event): void => {
+      const ke = ev as KeyboardEvent;
+      if (ke.shiftKey || ke.key === 'Shift' || ke.key.startsWith('Arrow')) schedule(10);
+    };
 
-      /**
-       * 收尾：先修"边界落在容器上"的畸形选区，再夹跨页，最后收集（顺序不能反，后两步都读当前选区）。
-       * 拖动期间直接返回：让浏览器原生表现（实测拖动中一直是正常的 2→18 字），
-       * 松手后再纠正最后一次跳变。
-       */
-      const settle = (): void => {
-        collectTimer = 0;
-        if (pressed) return;
-        if (lockedRange && Date.now() > guardUntil) stopGuard(); // 看护结束
-        if (applyLocked()) {
-          parkEndOfContent();
-          return;
-        }
-        if (USE_OUR_SELECTION_FIX) {
-          rescueEmptyDrag(); // 浏览器完全没拉出选区时先补一个（见它的注释；有选区时是空操作）
-          fixContainerBoundary();
-          const clamped = ENABLE_COLUMN_LOCK ? clampToAnchorColumn() : false;
-          clampCrossPage();
-          // 跨栏夹取成功后重新锁住并顺延看护：浏览器把排队的 mousemove 应用完时会把选区再扩回去
-          // （实测样本文献 A（双栏）p4：夹取日志打了，0.7 秒后量到的仍是横跨两栏的 1820 字）
-          if (clamped) {
-            const sel = window.getSelection();
-            // 锁到"本次划词的看护上限"为止（不是固定 700ms）：浏览器把排队的 mousemove
-            // 应用完可能比 1 秒还晚（实测样本文献 A p4 反向：1.5 秒时量到的仍是横跨整页的 650 字），
-            // 锁太短就正好漏在窗口外。
-            if (sel && !sel.isCollapsed && sel.rangeCount) {
-              columnClamped = true; // 允许看护期内走强制重算（见 watchLayer）
-              armLock(sel.getRangeAt(0), Math.max(700, lockDeadline - Date.now()));
-            }
-          }
-          // pdf.js 会把整页大小的 `.endOfContent` 插到选区锚点旁边（见 parkEndOfContent），
-          // 每轮收尾都要把它挪回末尾，否则选区的 rect 里永远横着一条整页矩形。
-          // 用 parkSoon：pdf.js 的 selectionchange 回调排在后面，清完还得补两刀（见它的注释）。
-          parkSoon();
-        }
-        collectSelection();
-      };
-      /** 合并短时间内的多次触发：selectionchange 在拖动中会刷屏，收一次就够 */
-      const schedule = (delay = 0): void => {
-        if (collectTimer) window.clearTimeout(collectTimer);
-        collectTimer = window.setTimeout(settle, delay);
-      };
+    /**
+     * 双保险：绝不让 Chromium 在 PDF 文本上启动原生拖拽。
+     * 一旦启动 drag-and-drop，**mouseup 就不再派发**，选区收尾/工具条/批注全跟着失效。
+     * （CSS 里已有 `-webkit-user-drag: none`，这里再兜一层。）
+     */
+    const onDragStart = (ev: Event): void => {
+      if ((ev.target as HTMLElement | null)?.closest?.('.rd-pdf-page')) ev.preventDefault();
+    };
 
-      const onSelectionChange = (): void => {
-        if (pressed) return; // 拖动中不收集：工具条不该在拖动过程中就冒出来（会挡文字、还可能抢走 mousemove）
-        schedule(30);
-      };
-
-      /** 拖动中记录指针位置：修容器边界时要用（"离指针最近的那一行"） */
-      const onMove = (ev: Event): void => {
-        const me = ev as MouseEvent;
-        if (me.clientX || me.clientY) {
-          pointerRef.x = me.clientX;
-          pointerRef.y = me.clientY;
-        }
-      };
-
-      const onUp = (ev: Event): void => {
-        const me = ev as MouseEvent;
-        const target = ev.target as Node | null;
-        if (!target || !scrollRef.current?.contains(target)) return;
-        if (typeof me.button === 'number' && me.button !== 0) return; // 右键/中键不参与划词收尾
-        onMove(ev);
-        pressed = false;
-        // 没有选中文字时，先看是不是点在已有批注上（点批注打开卡片）
-        const pageEl = (target as HTMLElement).closest?.('.rd-pdf-page') as HTMLElement | null;
-        if (pageEl) {
-          const selBefore = window.getSelection();
-          const hasText = !!selBefore && !selBefore.isCollapsed && selBefore.toString().trim().length > 0;
-          if (!hasText) {
-            const ann = hitTestAnnotation(pageEl, me.clientX ?? 0, me.clientY ?? 0);
-            if (ann) {
-              onSelectAnnotationRef.current(ann, pageEl.getBoundingClientRect());
-              return;
-            }
-          }
-        }
-        // 松手：先纠正一次（若启用手写纠正），再把结果锁住看护，并立刻收集（工具条在松手时才弹）
-        stopGuard();
-        forcedReclamps = 0;
-        lockDeadline = Date.now() + 2500; // 本次划词的看护上限（跨栏夹取会用到）
-        let clampedAtUp = false;
-        if (USE_OUR_SELECTION_FIX) {
-          rescueEmptyDrag(); // 浏览器完全没拉出选区时先补一个（见它的注释；有选区时是空操作）
-          fixContainerBoundary();
-          clampedAtUp = ENABLE_COLUMN_LOCK ? clampToAnchorColumn() : false;
-          clampCrossPage();
-        }
-        const selAtUp = window.getSelection();
-        if (selAtUp && !selAtUp.isCollapsed && selAtUp.rangeCount) {
-          // 跨栏夹取成功 → 守到"看护上限"（浏览器还会把排队的 mousemove 分批应用完，
-          // 实测能晚到 1.5 秒之后；只守 0.7/1.5 秒会正好漏掉那一批）
-          if (clampedAtUp) columnClamped = true; // 允许看护期内走强制重算（见 watchLayer）
-          armLock(selAtUp.getRangeAt(0), clampedAtUp ? Math.max(900, lockDeadline - Date.now()) : 700);
-        } else {
-          guardUntil = Date.now() + 700;
-        }
-        collectSelection();
-        schedule(60);
-        /**
-         * **空窗期补夹（有界连打）**：浏览器把排队的 mousemove 应用完的时刻不稳定 ——
-         * 实测（苏敬勤 p2 末栏）：mouseup 时选区塌陷，+150ms / +400ms 两拍**都还是塌陷**
-         * （`[diag] 选区为空/塌陷/没有 range`），而到 +900ms 量的时候已经是横跨整页的 869 字，
-         * 那一波**没有触发夹取**（`settle` 被 `applyLocked` 短路）。
-         * 所以在 1 秒内补若干拍，复用同一条 `schedule() → settle() → 夹取` 路径（不写第二套逻辑）；
-         * 没有"越栏选区"时每一拍都是空操作（夹取内部会早退），不会改写正常选区。
-         */
-        for (const delay of [80, 160, 260, 380, 520, 700, 900]) {
-          window.setTimeout(() => {
-            if (!pressed) schedule(0);
-          }, delay);
-        }
-      };
-
-      const onDown = (ev: Event): void => {
-        const me = ev as MouseEvent;
-        const target = ev.target as HTMLElement | null;
-        /**
-         * 右键：**只阻止焦点转移，不动选区**。
-         *
-         * 官方 TextLayerBuilder 给文本层 div 设了 `tabIndex = 0`（为了键盘可达性），
-         * 于是右键按下会把焦点移到那一层上、浏览器顺手把选区清掉 —— 表现就是
-         * "右键菜单里没有高亮/复制这些依赖选区的项"（UX 回归实测 6 字 → 0 字）。
-         * 在 mousedown 上 preventDefault 能挡住焦点转移，而且不影响 contextmenu 照常弹出。
-         */
-        if (me.button === 2) {
-          ev.preventDefault();
-          // 右键别把"最后一次真实选区"弄丢：还有选区就刷新，已经没了就保留上一次的结果，
-          // 菜单据此仍能给出标注项（见 lastTextRef 的说明）。
-          const sel = window.getSelection();
-          if (sel && !sel.isCollapsed && sel.toString().trim()) collectSelection();
-          return;
-        }
-        if (me.button !== 0) return; // 中键等一律不参与划词
-        onMove(ev);
-        downRef.x = me.clientX ?? 0;
-        downRef.y = me.clientY ?? 0;
-        pressed = true;
-        stopGuard();
-        guardUntil = 0;
-        lockDeadline = 0; // 新的一次按下：之前的看护全部作废
-        // 点在文字层之外（画布/页边空白）：浏览器会清掉选区，等它清完再收一次，工具条跟着消失
-        if (!target?.closest?.('.rd-pdf-text')) window.setTimeout(() => schedule(0), 0);
-      };
-
-      const onKeyUp = (ev: Event): void => {
-        const ke = ev as KeyboardEvent;
-        if (ke.shiftKey || ke.key === 'Shift' || ke.key.startsWith('Arrow')) schedule(10);
-      };
-
-      /**
-       * 双保险：绝不让 Chromium 在 PDF 文本上启动原生拖拽。
-       * 一旦启动 drag-and-drop，**mouseup 就不再派发**，选区收尾/工具条/批注全跟着失效。
-       * （CSS 里已有 `-webkit-user-drag: none`，这里再兜一层。）
-       */
-      const onDragStart = (ev: Event): void => {
-        if ((ev.target as HTMLElement | null)?.closest?.('.rd-pdf-page')) ev.preventDefault();
-      };
-
-      const root: EventTarget = scrollRef.current?.parentElement ?? document;
-      document.addEventListener('selectionchange', onSelectionChange);
-      root.addEventListener('mouseup', onUp, true);
-      root.addEventListener('mousedown', onDown, true);
-      root.addEventListener('mousemove', onMove);
-      root.addEventListener('keyup', onKeyUp);
-      root.addEventListener('dragstart', onDragStart, true);
-      return () => {
-        if (collectTimer) window.clearTimeout(collectTimer);
-        document.removeEventListener('selectionchange', onSelectionChange);
-        root.removeEventListener('mouseup', onUp, true);
-        root.removeEventListener('mousedown', onDown, true);
-        root.removeEventListener('mousemove', onMove);
-        root.removeEventListener('keyup', onKeyUp);
-        root.removeEventListener('dragstart', onDragStart, true);
-      };
-      // 依赖只放 collectSelection（它身份稳定）；不要把 onSelection 放进来——
-      // 父级每次渲染都传新函数，会导致 effect 反复重订阅（历史 bug：拖完选不中字、工具条不弹）。
-    }, [collectSelection]);
+    const root: EventTarget = scrollRef.current?.parentElement ?? document;
+    document.addEventListener('selectionchange', onSelectionChange);
+    root.addEventListener('mouseup', onUp, true);
+    root.addEventListener('mousedown', onDown, true);
+    root.addEventListener('mousemove', onMove);
+    root.addEventListener('keyup', onKeyUp);
+    root.addEventListener('dragstart', onDragStart, true);
+    return () => {
+      if (collectTimer) window.clearTimeout(collectTimer);
+      document.removeEventListener('selectionchange', onSelectionChange);
+      root.removeEventListener('mouseup', onUp, true);
+      root.removeEventListener('mousedown', onDown, true);
+      root.removeEventListener('mousemove', onMove);
+      root.removeEventListener('keyup', onKeyUp);
+      root.removeEventListener('dragstart', onDragStart, true);
+    };
+    // 依赖只放 collectSelection（它身份稳定）；不要把 onSelection 放进来——
+    // 父级每次渲染都传新函数，会导致 effect 反复重订阅（历史 bug：拖完选不中字、工具条不弹）。
+  }, [collectSelection, readKernelSelection]);
 
   // ---------------------------------------------------------------- 右键菜单
 
@@ -2982,7 +2260,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     onFirstPaint={pageNumber === 1 ? onFirstPaint : undefined}
                     onPageElement={onPageElement}
                     goToPage={goToPage}
-                    onBands={handleBands}
+                    onSelectionModel={handleSelectionModel}
                   />
                 ) : (
                   <div className="rd-page-ghost" data-page-index={pageNumber} aria-hidden />
@@ -3019,7 +2297,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     onFirstPaint={pageNumber === 1 ? onFirstPaint : undefined}
                     onPageElement={onPageElement}
                     goToPage={goToPage}
-                    onBands={handleBands}
+                    onSelectionModel={handleSelectionModel}
                   />
                 );
               })}
@@ -3100,4 +2378,44 @@ function clampRects(rects: AnnotationRect[]): AnnotationRect[] {
       h: Math.min(1, Math.max(0, r.h)),
     }))
     .filter((r) => r.w > 0.0005 && r.h > 0.0005);
+}
+
+/**
+ * 划词内核给的矩形（CSS 像素、相对页面元素）→ 批注用的 0~1 比例矩形。
+ *
+ * 合并规则与 `relRects()` 对齐（同一行上左右相接的两段并成一条），这样"模型算的矩形"
+ * 与"DOM rect 算的矩形"在批注里长得一样；区别只在于模型那份**没有** pdf.js 那个
+ * 整层大小 `.endOfContent` 造成的整页框（`relRects` 里那条 0.25 页高的过滤就是为它写的）。
+ */
+function normalizeRects(rects: readonly Rect[], pageRect: DOMRect): AnnotationRect[] {
+  const out: AnnotationRect[] = [];
+  if (pageRect.width <= 0 || pageRect.height <= 0) return out;
+  for (const r of rects) {
+    const w = r.right - r.left;
+    const h = r.bottom - r.top;
+    if (w <= 0.5 || h <= 0.5) continue;
+    if (h > pageRect.height * 0.25 || w > pageRect.width * 1.05) continue;
+    const rect: AnnotationRect = {
+      x: r.left / pageRect.width,
+      y: r.top / pageRect.height,
+      w: w / pageRect.width,
+      h: h / pageRect.height,
+    };
+    if (rect.x > 1.2 || rect.y > 1.2 || rect.x + rect.w < -0.2) continue;
+    const existing = out.find(
+      (e) =>
+        Math.abs(e.y - rect.y) < 0.002 &&
+        Math.abs(e.h - rect.h) < 0.004 &&
+        rect.x - (e.x + e.w) > -0.004 &&
+        rect.x - (e.x + e.w) < 0.012,
+    );
+    if (existing) {
+      const right = Math.max(existing.x + existing.w, rect.x + rect.w);
+      existing.x = Math.min(existing.x, rect.x);
+      existing.w = right - existing.x;
+      continue;
+    }
+    out.push(rect);
+  }
+  return out.slice(0, 64);
 }
