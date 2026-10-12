@@ -246,3 +246,11 @@ node tools/acceptance-columns.mjs                                     # 期望 2
   做法：确认要推的提交 diff 与**提交信息**都干净；必要时把若干提交 `git reset --soft origin/main` 压成一个再提交（本仓库做过一次）。
 - 上传 Release 附件用 `git credential fill` 在内存里取 token，**不打印、不落盘**；替换附件时先删旧再传新，避免同名两个 zip。
 - 打包：`node tools/make-portable.mjs` → `D:\dsh\文献架整合`；自检 `tools/smoke-portable.mjs`（13/13）+ 真实论文探针（8/8，确认只读）。
+
+
+---
+
+## 最新（引擎接管版）
+
+划词已改为**由 selectionEngine 接管**，不再使用浏览器原生选区。
+详见 `docs/划词引擎接管说明.md`。

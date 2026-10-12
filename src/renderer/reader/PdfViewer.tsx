@@ -29,6 +29,7 @@ import {
 } from './columnBands';
 import { orderTextSpans } from './textOrder';
 import { buildSelectionModel, SelectionModel } from './selectionModel';
+import { createSelectionEngine, type EngineSelection, type PageHandle } from './selectionEngine';
 import { createSelectionKernel, type KernelDeps } from './selectionKernel';
 import type {
   DomSelectionEndpoint,
@@ -200,7 +201,19 @@ const TEXT_LAYER_CSS = `
 }
 .rd-pdf-text .markedContent { display: contents; }
 .rd-pdf-text span[role='img'] { user-select: none; cursor: default; }
-.rd-pdf-text ::selection { background: rgba(0, 122, 255, 0.3); }
+/* 划词已由 selectionEngine 接管：文本层**不再产生任何浏览器原生选区**。
+   这是"终止两个选区互相打架"的关键一步 —— 关掉它，引擎的几何判据才说了算。 */
+.rd-pdf-text, .rd-pdf-text * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+.rd-pdf-text ::selection { background: transparent; }
+/* 自绘高亮：一行一条（引擎按行合并后给出矩形）。
+   颜色刻意和批注高亮区分：这里是"正在选的文字"，批注是"已经存下来的"。 */
+.rd-sel-overlay .sel-line {
+  background: rgba(0, 122, 255, 0.32);
+  border-radius: 2px;
+}
 /* 官方 pdf.js viewer 的"拖到空白"机制：文本层末尾放一个 .endOfContent，
    平时贴在文字下方（inset:100% 0 0）、不可选中；一旦这一层进入 selecting 状态就铺满整层。
    它的作用是让"指针落在文字以外的空白处"有明确的可命中目标，浏览器就不会把选区
@@ -312,6 +325,11 @@ interface PdfPageProps {
    * 传 null 表示这一页暂时没有可用模型（文本层没了 / 取不到文本项）→ 内核放弃纠正。
    */
   onSelectionModel?: (page: number, model: PageCharModel | null) => void;
+  /**
+   * 这一页的 DOM 就绪（页面元素 + 文本层），交给父级的**选取引擎**。
+   * 引擎按几何命中，需要的正是这两块；传 null 表示这一页被卸载了。
+   */
+  onLayer?: (page: number, layer: { pageEl: HTMLElement; textLayer: HTMLElement } | null) => void;
   /** 拖选结束后由父级读取选区；这里只上报"页面元素" */
   onPageElement: (page: number, el: HTMLElement | null) => void;
   /** 文内跳转（PDF 里的引用/目录链接）用：跳到指定页 */
@@ -342,6 +360,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     goToPage,
     onBands,
     onSelectionModel,
+    onLayer,
   } = props;
 
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -407,8 +426,8 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
    * 会让整个 canvas + 文本层被拆掉重建；拖动过程中文本层节点被替换，原生选区的锚点随之失效，
    * 表现就是"选区莫名其妙乱选/整段选中"和"文本层间歇性一个 span 都没有"。
    */
-  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel });
-  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel };
+  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer });
+  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer };
 
   /**
    * 位图实际渲染用的 scale：缩放先防抖 160ms，停手后再重绘**一次**。
@@ -965,6 +984,12 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         items: items.length,
       });
       report(pageNumber, model);
+      // 页面 DOM 就绪：把"页面元素 + 文本层"交给父级的选取引擎（引擎只按几何命中，不看 DOM 顺序）
+      if (model) {
+        const pageEl = rootRef.current;
+        const textLayer = textLayerEl();
+        if (pageEl && textLayer) cbRef.current.onLayer?.(pageNumber, { pageEl, textLayer });
+      }
     };
 
     /** 丢掉当前文本层（取消 + 从宿主里摘掉），下一次 paintTextLayer 会重建 */
@@ -1091,6 +1116,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
 
     return () => {
       cancelled = true;
+      cbRef.current.onLayer?.(pageNumber, null);
       window.clearTimeout(watchdog);
       try {
         renderTask?.cancel();
@@ -1645,6 +1671,158 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     currentPageRef.current = currentPage;
   }, [currentPage]);
 
+  // -------- 选区（划词）：**由选取引擎接管，不再使用浏览器原生选区** --------
+  //
+  // 背景（写给下一个人）：这里以前是"浏览器原生选区 + 我们自己纠偏"，前后修了 7~8 轮都翻在
+  // 同一件事上 —— 浏览器的 DOM 顺序 ≠ 版面顺序（中文期刊的内容流常常左右栏交替），
+  // 两个"选区"永远在对不上。现在的做法是把浏览器从"选取"里踢出去（Zotero 的做法）：
+  //   1. 文本层 `user-select: none`，浏览器不再产生任何选区；
+  //   2. 拖动 = 按下点的字（锚点）→ 指针当前的字（焦点），**每帧重新算两端**；
+  //   3. 焦点只允许取"锚点那一栏"里的字 → **跨栏在结构上不可能**；
+  //   4. 高亮自己画（按行合并，一行一条），复制自己写剪贴板。
+  // 引擎本身在 selectionEngine.ts，并已在隔离页（tmp/sel-harness）用真实鼠标 + 截图验收过。
+  const layerByPageRef = useRef(new Map<number, { pageEl: HTMLElement; textLayer: HTMLElement }>());
+  /** 引擎给的最后一次选区（模型坐标 + 客户端矩形） */
+  const engineSelRef = useRef<EngineSelection | null>(null);
+
+  const handleLayer = useCallback((page: number, layer: { pageEl: HTMLElement; textLayer: HTMLElement } | null) => {
+    if (!layer) {
+      layerByPageRef.current.delete(page);
+      return;
+    }
+    layerByPageRef.current.set(page, layer);
+  }, []);
+
+  /** 引擎 → 产品：把引擎给的选区翻成工具条/批注要的形状（页内相对矩形 + 首行 client 矩形） */
+  const reportEngineSelection = useCallback(
+    (sel: EngineSelection | null) => {
+      engineSelRef.current = sel;
+      if (!sel) {
+        if (lastSelectionRef.current) {
+          lastSelectionRef.current = null;
+          onSelectionRef.current(null);
+        }
+        return;
+      }
+      const layer = layerByPageRef.current.get(sel.pageIndex + 1);
+      const pageEl = layer?.pageEl;
+      if (!pageEl) return;
+      const pageRect = pageEl.getBoundingClientRect();
+      if (pageRect.width <= 0 || pageRect.height <= 0) return;
+      const text = sel.text;
+      if (!text) return;
+      const map = mapsRef.current.get(sel.pageIndex + 1);
+      const anchor = map ? buildAnchorFallback(text, map.text) : buildAnchorFallback(text, '');
+      const rect: PdfSelectionPayload['rect'] = sel.rects.length
+        ? { left: sel.rects[0][0], top: sel.rects[0][1], right: sel.rects[0][2], bottom: sel.rects[0][3] }
+        : { left: pageRect.left, top: pageRect.top, right: pageRect.right, bottom: pageRect.top };
+      const payload: PdfSelectionPayload = {
+        text,
+        rect,
+        pageEl,
+        page: sel.pageIndex + 1,
+        rects: clampRects(
+          normalizeRects(
+            sel.rects.map(([x1, y1, x2, y2]) => ({ left: x1 - pageRect.left, top: y1 - pageRect.top, right: x2 - pageRect.left, bottom: y2 - pageRect.top })),
+            pageRect,
+          ),
+        ),
+        anchor,
+      };
+      lastSelectionRef.current = payload;
+      onSelectionRef.current(payload);
+    },
+    [],
+  );
+
+  const engineOverlayRef = useRef<HTMLDivElement | null>(null);
+  const engineRef = useRef<ReturnType<typeof createSelectionEngine> | null>(null);
+  if (!engineRef.current) {
+    engineRef.current = createSelectionEngine({
+      pages: (): PageHandle[] => {
+        const out: PageHandle[] = [];
+        for (const [pageNumber, layer] of layerByPageRef.current) {
+          const model = selectionModelsRef.current.get(pageNumber - 1)?.model;
+          if (!model) continue;
+          out.push({ pageIndex: pageNumber - 1, pageEl: layer.pageEl, textLayer: layer.textLayer, model });
+        }
+        return out;
+      },
+      overlay: () => engineOverlayRef.current,
+      onSelection: (sel) => reportEngineSelection(sel),
+      debug: SELECTION_DEBUG,
+    });
+  }
+
+  /**
+   * 引擎的鼠标接线：按下 → 移动（每帧）→ 松手。
+   *
+   * ⚠️ **挂在 `document` 上（capture），不挂在滚动容器上**：我第一版挂
+   * `scrollRef.current?.parentElement`，结果 effect 执行时容器引用还是空的，
+   * 直接 `return` 了 —— 监听器一个都没挂上，产品里"拖动一个字都选不中"（真机实测）。
+   * 挂在 document 上没有挂载时机问题：引擎本来就靠 `pages()` 里的几何命中，
+   * 不需要知道自己挂在哪个 DOM 上。是否属于阅读器由 target 判定。
+   */
+  useEffect(() => {
+    let dragging = false;
+    const onDown = (ev: MouseEvent): void => {
+      if (ev.button !== 0) return;
+      const target = ev.target as HTMLElement | null;
+      if (!target?.closest?.('.rd-pdf-page')) return; // 只在页面上开始
+      // 点空白也要能清选区：引擎 begin 返回 false 时会自己清
+      dragging = engineRef.current?.begin(ev.clientX, ev.clientY, ev.shiftKey) ?? false;
+      if (!dragging) return;
+      // 原生选区彻底不用了：清掉它，避免它和自绘高亮同时出现
+      window.getSelection()?.removeAllRanges();
+    };
+    const onMove = (ev: MouseEvent): void => {
+      if (!dragging) return;
+      engineRef.current?.move(ev.clientX, ev.clientY);
+    };
+    const onUp = (): void => {
+      if (!dragging) return;
+      dragging = false;
+      engineRef.current?.end();
+    };
+    const onScroll = (): void => {
+      // 滚动/缩放后矩形要重算（高亮层在视口上，坐标是客户端坐标）
+      engineRef.current?.refresh();
+    };
+    document.addEventListener('mousedown', onDown, true);
+    document.addEventListener('mousemove', onMove, true);
+    document.addEventListener('mouseup', onUp, true);
+    document.addEventListener('scroll', onScroll, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown, true);
+      document.removeEventListener('mousemove', onMove, true);
+      document.removeEventListener('mouseup', onUp, true);
+      document.removeEventListener('scroll', onScroll, true);
+    };
+  }, []);
+
+  /** 复制：原生选区已被关掉，Ctrl+C / 右键"复制"都要我们自己写剪贴板 */
+  useEffect(() => {
+    const onCopy = (ev: ClipboardEvent): void => {
+      const sel = engineSelRef.current;
+      if (!sel?.text) return;
+      ev.preventDefault();
+      ev.clipboardData?.setData('text/plain', sel.text);
+    };
+    const onKey = (ev: KeyboardEvent): void => {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'a') {
+        const target = ev.target as HTMLElement | null;
+        if (target?.closest?.('.rd-pdf-page')) ev.preventDefault(); // 不选整个界面
+      }
+      if (ev.key === 'Escape') engineRef.current?.clear();
+    };
+    document.addEventListener('copy', onCopy);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('copy', onCopy);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, []);
+
   // -------- 选区（划词） --------
   const lastSelectionRef = useRef<PdfSelectionPayload | null>(null);
   // 事件回调里要读最新的批注与选择回调，但不希望它们进依赖数组导致频繁重订阅
@@ -2021,6 +2199,16 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
      */
     const settle = (): void => {
       collectTimer = 0;
+      /**
+       * **整条旧路径已停用**：划词现在完全由 selectionEngine 接管（原生选区已关掉，
+       * 这里读到的永远是"空选区"）。如果还让它跑，它会拿"空选区"去把工具条清掉，
+       * 反而把引擎刚上报的选区冲掉 —— 这正是"两个选区打架"的最后一块。
+       *
+       * 保留这段代码（不删）是因为：`readKernelSelection` / `collectSelection` 里还有
+       * 工具条定位、批注坐标、anchor 生成等一堆在用逻辑，删了会牵动太多。
+       * 所以只关"入口"，让引擎成为唯一触发者。
+       */
+      if (true) return;
       if (pressed) return;
       let { snap, range } = readKernelSelection();
       if (!snap && !range) {
@@ -2284,6 +2472,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     onPageElement={onPageElement}
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
+                    onLayer={handleLayer}
                   />
                 ) : (
                   <div className="rd-page-ghost" data-page-index={pageNumber} aria-hidden />
@@ -2321,6 +2510,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     onPageElement={onPageElement}
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
+                    onLayer={handleLayer}
                   />
                 );
               })}
@@ -2342,6 +2532,17 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       {degradedWorker ? (
         <div className="rd-notice">PDF worker 未能加载，已切到主线程渲染（大文件会更慢）。</div>
       ) : null}
+      {/*
+        划词高亮层：**固定在视口上**（引擎按行合并后给的就是客户端坐标的矩形）。
+        它必须盖在页面之上、且不吃指针事件（否则拖动会被自己挡住）。
+        为什么不用浏览器原生高亮：原生高亮的形状由浏览器按 DOM 顺序算，正是过去
+        "碎片化 / 跳过一截再拼接 / 跨栏"的来源；这里的矩形由字符模型按行算，一行一条。
+      */}
+      <div
+        ref={engineOverlayRef}
+        className="rd-sel-overlay"
+        style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 40 }}
+      />
       <span className="rd-sr-only" aria-live="polite">
         第 {currentPage} / {total} 页
       </span>
