@@ -214,6 +214,20 @@ const TEXT_LAYER_CSS = `
   background: rgba(0, 122, 255, 0.32);
   border-radius: 2px;
 }
+/* 高亮的"裁切壳"：铺满阅读区、不吃事件，把高亮限制在阅读区内（防止露到侧栏/工具栏/窗口外）。
+   注意：overflow:hidden 放在壳上（而不是高亮层自己身上），否则矩形会被按自身坐标系裁掉。 */
+.rd-sel-clip {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 40;
+}
+.rd-sel-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
 /* 官方 pdf.js viewer 的"拖到空白"机制：文本层末尾放一个 .endOfContent，
    平时贴在文字下方（inset:100% 0 0）、不可选中；一旦这一层进入 selecting 状态就铺满整层。
    它的作用是让"指针落在文字以外的空白处"有明确的可命中目标，浏览器就不会把选区
@@ -1784,19 +1798,48 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       dragging = false;
       engineRef.current?.end();
     };
-    const onScroll = (): void => {
-      // 滚动/缩放后矩形要重算（高亮层在视口上，坐标是客户端坐标）
+    /**
+     * 触发"重算高亮"的四个来源。
+     *
+     * ⚠️ 只挂 `scroll` 是不够的 —— 用户实测：**缩放之后高亮不跟着动**。
+     * 缩放时既没有 scroll 事件，页面元素的尺寸又变了，于是高亮停留在旧尺寸的坐标上。
+     * 所以这里四条一起挂（互为冗余，宁可多算几次也不能漏）：
+     *   1. `scroll`（capture，能收到滚动容器的滚动）
+     *   2. `wheel`（Ctrl/⌘ + 滚轮缩放走这条）
+     *   3. `window.resize`（窗口尺寸变化）
+     *   4. `ResizeObserver`（阅读容器或页面元素尺寸变化 —— 换布局/缩放最可靠的一条）
+     */
+    const refresh = (): void => {
       engineRef.current?.refresh();
     };
+    const onWheel = (ev: WheelEvent): void => {
+      if (ev.ctrlKey || ev.metaKey) refresh();
+    };
+    const onResize = (): void => refresh();
+    let ro: ResizeObserver | null = null;
+    const scrollEl = scrollRef.current;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => refresh());
+      // 观察滚动容器本身，以及它内部的页面元素（页面尺寸随缩放变化）
+      if (scrollEl) {
+        ro.observe(scrollEl);
+        scrollEl.querySelectorAll('.rd-pdf-page').forEach((el) => ro?.observe(el));
+      }
+    }
     document.addEventListener('mousedown', onDown, true);
     document.addEventListener('mousemove', onMove, true);
     document.addEventListener('mouseup', onUp, true);
-    document.addEventListener('scroll', onScroll, true);
+    document.addEventListener('scroll', refresh, true);
+    document.addEventListener('wheel', onWheel, true);
+    window.addEventListener('resize', onResize);
     return () => {
       document.removeEventListener('mousedown', onDown, true);
       document.removeEventListener('mousemove', onMove, true);
       document.removeEventListener('mouseup', onUp, true);
-      document.removeEventListener('scroll', onScroll, true);
+      document.removeEventListener('scroll', refresh, true);
+      document.removeEventListener('wheel', onWheel, true);
+      window.removeEventListener('resize', onResize);
+      ro?.disconnect();
     };
   }, []);
 
@@ -2533,16 +2576,18 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
         <div className="rd-notice">PDF worker 未能加载，已切到主线程渲染（大文件会更慢）。</div>
       ) : null}
       {/*
-        划词高亮层：**固定在视口上**（引擎按行合并后给的就是客户端坐标的矩形）。
-        它必须盖在页面之上、且不吃指针事件（否则拖动会被自己挡住）。
-        为什么不用浏览器原生高亮：原生高亮的形状由浏览器按 DOM 顺序算，正是过去
-        "碎片化 / 跳过一截再拼接 / 跨栏"的来源；这里的矩形由字符模型按行算，一行一条。
+        划词高亮层：引擎按行合并后给的是**客户端坐标**的矩形，所以这一层必须固定在视口上。
+        它不吃指针事件（否则拖动会被自己挡住）。
+
+        ⚠️ 两条纪律：
+          1. **必须裁切在阅读区内**（`overflow: hidden` 的包裹层）：用户实测"高亮会露到屏幕/阅读区外"。
+             注意不能把 `overflow:hidden` 直接加在这一层上 —— 那样矩形会被"按自己的坐标"裁，
+             结果全被裁掉；所以外面套一层"只负责裁切"的壳。
+          2. 位置不能改回 per-page（每页挂一层）：坐标是客户端坐标，跟着页面走会算两次偏移。
       */}
-      <div
-        ref={engineOverlayRef}
-        className="rd-sel-overlay"
-        style={{ position: 'fixed', inset: 0, pointerEvents: 'none', zIndex: 40 }}
-      />
+      <div className="rd-sel-clip">
+        <div ref={engineOverlayRef} className="rd-sel-overlay" />
+      </div>
       <span className="rd-sr-only" aria-live="polite">
         第 {currentPage} / {total} 页
       </span>
