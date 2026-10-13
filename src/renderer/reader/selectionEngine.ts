@@ -315,25 +315,56 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
     .filter(([, v]) => v.n >= 3 && (v.hi - v.lo) / rowSpan >= 0.6)
     .map(([at, v]) => ({ at, span: (v.hi - v.lo) / rowSpan, n: v.n }));
   /**
-   * ## **硬边界只取"最主导的那一条缝"**
+   * ## 硬边界的形状判据：**缝两侧都要有"一整栏"的文字**
    *
-   * 这是这一轮才想通的关键（前面几轮都错在"把所有缝都当硬边界"）：
+   * 前面几轮我都错在"把所有缝都当硬边界"：
    *   · 第 4 页有表格 → 表格列缝很多（实测筛出 **18 条**）；
    *   · 正文行横跨 `142..955`，**它跨过了全部 18 条缝** → 任何"按缝切开"的 pass
    *     都切不动它（切一刀它还跨着另外 17 条）→ 最终块仍然是 `528字[142..955]`。
    *
-   * 而真正把页面分成两栏的只有**一条**缝 —— 纵向跨度最大、贯穿整段正文的那条。
-   * 所以：只保留"纵向跨度 ≥ 最长那条的 80%"的缝当硬边界；
-   * 其余的（表格列缝）不参与块的分栏，但**行内切分照旧会用它们把单元格切开**。
+   * 真栏缝和表格列缝的差别在**形状**：
+   *   · 真栏缝两侧是两栏正文，各占约 35~40% 页宽（离线实测：第 1 页 37%/38%、
+   *     第 2 页 37%/36%、第 3 页 37%/37%）；
+   *   · 表格列缝往往一侧只有标签列（离线实测第 8 页 155pt 缝：左 9% / 右 67%）。
+   *
+   * ⚠️ "两侧宽度"必须算**缝左边所有字的最右端**与**缝右边所有字的最左端**，
+   * **不能**用"完全落在缝某侧的那些整行"的宽度 —— 双栏页的行往往横跨缝，
+   * 那样算出来左侧会变成 0%（我第一版就是这么错的，把 5 个页面全部筛成 0 条）。
    */
-  let seams: number[] = [];
+  const seamsAll: number[] = [];
   if (seamCandidates.length) {
-    const maxSpan = Math.max(...seamCandidates.map((s) => s.span));
-    seams = seamCandidates
-      .filter((s) => s.span >= maxSpan * 0.8)
-      .map((s) => s.at)
-      .sort((a, b) => a - b);
+    const allRects = safe.map((c) => charRectOf(c));
+    const pageL = Math.min(...allRects.map((r) => r[0]));
+    const pageR = Math.max(...allRects.map((r) => r[2]));
+    const pageW = Math.max(1, pageR - pageL);
+    for (const s of seamCandidates) {
+      /**
+       * 门槛一：**纵向跨度 ≥ 85%**（真栏缝贯穿整段正文；表格列缝只覆盖表格那一段）。
+       * 离线实测真栏缝：第 1 页 86%、第 2 页 96%、第 3 页 96%。
+       */
+      if (s.span < 0.85) continue;
+      const leftRights = allRects.filter((r) => r[2] <= s.at + 1).map((r) => r[2]);
+      const leftLefts = allRects.filter((r) => r[2] <= s.at + 1).map((r) => r[0]);
+      const rightLefts = allRects.filter((r) => r[0] >= s.at - 1).map((r) => r[0]);
+      const rightRights = allRects.filter((r) => r[0] >= s.at - 1).map((r) => r[2]);
+      if (!leftRights.length || !rightLefts.length) continue;
+      const leftW = Math.max(...leftRights) - Math.min(...leftLefts);
+      const rightW = Math.max(...rightRights) - Math.min(...rightLefts);
+      const lp = leftW / pageW;
+      const rp = rightW / pageW;
+      /**
+       * 门槛二：**两侧都要有"一整栏"的文字，且宽度彼此相称**。
+       * 真栏缝：两栏宽度接近（离线实测 37%/38%、37%/36%、37%/37%）；
+       * 表格列缝：一侧只有标签列（实测第 8 页 9%/67%）。
+       */
+      if (lp < 0.28 || lp > 0.52) continue;
+      if (rp < 0.28 || rp > 0.52) continue;
+      const ratio = lp / rp;
+      if (ratio < 0.65 || ratio > 1.55) continue;
+      seamsAll.push(s.at);
+    }
   }
+  const seams = seamsAll.slice().sort((a, b) => a - b);
 
   /**
    * ## 判据二：**按纵向分带**找缝（判据一的**兜底**，不是并列）
