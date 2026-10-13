@@ -132,6 +132,8 @@ const rectOf = (c: ZoteroChar | undefined): readonly [number, number, number, nu
 /** 一行（视觉行） */
 interface Line {
   chars: number[];
+  /** 这一行**没有跨过**的栏缝（= 它属于哪一栏的判据）。块的合并用它当硬边界。 */
+  gutters: number[];
   top: number;
   bottom: number;
   left: number;
@@ -227,6 +229,67 @@ function pageColumnsOf(chars: readonly ZoteroChar[]): number[] {
 // ---------------------------------------------------------------- 行归一
 
 /**
+ * **整页栏缝**（竖直空白走廊）—— 用**逐字矩形**（`charRectOf`）算。
+ *
+ * 为什么要它：第 23 篇第 1 页是"页眉/标题/摘要（跨栏）+ 引言（左右两栏）"混排。
+ * 归行时左右栏的行会被并成一条（栏缝夹在行内部），后面按字距切分虽然能切开，
+ * **但块合并阶段又会把切开的两片并回同一块** → 在左栏里拖仍然会选到右栏
+ * （真机实测：选中 50 字、高亮 x[355..959]、越过了中线 701）。
+ * 所以栏缝必须作为**块的硬边界**：块不许跨缝合并。
+ *
+ * 判据（不用任何"字距比例"）：
+ *   · 把每个字的横向范围投到 2px 格子上，连续为空 = 一条竖直走廊；
+ *   · 走廊宽 ≥ 1.2 字宽；
+ *   · 走廊两侧都必须有**实质文字**（各 ≥ 12 个字、各占页宽 ≥ 15%），
+ *     否则只是行末留白/段首缩进，不是栏缝。
+ */
+function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
+  if (chars.length < 40) return [];
+  const rects = chars.map((c) => charRectOf(c)).filter((r) => r[2] > r[0]);
+  if (rects.length < 40) return [];
+  const ws = rects.map((r) => r[2] - r[0]).sort((a, b) => a - b);
+  const medianW = ws[Math.floor(ws.length / 2)] || 8;
+  const left = Math.min(...rects.map((r) => r[0]));
+  const right = Math.max(...rects.map((r) => r[2]));
+  const span = right - left;
+  if (!(span > 100)) return [];
+
+  const bin = 2;
+  const n = Math.ceil(span / bin) + 2;
+  const used = new Uint8Array(n);
+  for (const r of rects) {
+    const a = Math.max(0, Math.floor((r[0] - left) / bin));
+    const b = Math.min(n - 1, Math.floor((r[2] - left) / bin));
+    for (let i = a; i <= b; i += 1) used[i] = 1;
+  }
+
+  const minCorridor = Math.max(6, medianW * 1.2);
+  const minSideW = span * 0.15;
+  const out: number[] = [];
+  let run = -1;
+  for (let i = 0; i <= n; i += 1) {
+    const empty = i < n && used[i] === 0;
+    if (empty) {
+      if (run < 0) run = i;
+      continue;
+    }
+    if (run >= 0) {
+      const gFrom = left + run * bin;
+      const gTo = left + i * bin;
+      const leftSide = rects.filter((r) => r[2] <= gFrom + 1);
+      const rightSide = rects.filter((r) => r[0] >= gTo - 1);
+      const lw = leftSide.length >= 12 ? Math.max(...leftSide.map((r) => r[2])) - left : 0;
+      const rw = rightSide.length >= 12 ? right - Math.min(...rightSide.map((r) => r[0])) : 0;
+      if (gTo - gFrom >= minCorridor && lw >= minSideW && rw >= minSideW) {
+        out.push(Math.round((gFrom + gTo) / 2));
+      }
+      run = -1;
+    }
+  }
+  return out;
+}
+
+/**
  * 字 → 行。
  *
  * ⚠️ 必须按"行带纵向重叠"归行，**不能按 `inlineRect.top` 精确相等**：
@@ -257,6 +320,9 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
    */
   const maxInnerGap = Math.max(6, medianW * 2.5);
 
+  /** 整页栏缝（块的硬边界） */
+  const pageGutters = pageGuttersOf(chars);
+
   const order = Array.from({ length: chars.length }, (_, i) => i).filter((i) => chars[i]);
   order.sort((a, b) => rectOf(chars[a])[1] - rectOf(chars[b])[1] || rectOf(chars[a])[0] - rectOf(chars[b])[0]);
 
@@ -267,6 +333,20 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
       const overlap = Math.min(ln.bottom, r[3]) - Math.max(ln.top, r[1]);
       const minH = Math.min(ln.bottom - ln.top, r[3] - r[1]);
       if (!(minH > 0 && overlap >= minH * 0.6)) return false;
+      /**
+       * **绝不跨栏缝**：当前字与这一行已占的横向范围之间若隔着一条整页竖缝，
+       * 说明它们分属左右两栏 → 不能并成同一行。
+       * 这是"先分栏、再归行"的关键一步（人看版面就是这个顺序）。
+       */
+      for (const g of pageGutters) {
+        const curLeft = r[2] <= g + 1;
+        const curRight = r[0] >= g - 1;
+        if (!curLeft && !curRight) continue; // 这一行本身就跨着缝（跨栏标题），不拦
+        const lnLeft = ln.right <= g + 1;
+        const lnRight = ln.left >= g - 1;
+        if (lnLeft && curRight) return false;
+        if (lnRight && curLeft) return false;
+      }
       // 横向必须"接着"：与这一行已有的横向范围之间的空隙不能太大
       const gap = r[0] > ln.right ? r[0] - ln.right : ln.left > r[2] ? ln.left - r[2] : 0;
       return gap <= maxInnerGap;
@@ -278,7 +358,7 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
       line.left = Math.min(line.left, r[0]);
       line.right = Math.max(line.right, r[2]);
     } else {
-      open.push({ chars: [i], top: r[1], bottom: r[3], left: r[0], right: r[2], charHeight: medianH });
+      open.push({ chars: [i], gutters: [], top: r[1], bottom: r[3], left: r[0], right: r[2], charHeight: medianH });
     }
   }
 
@@ -302,54 +382,10 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
    */
   const splitLines: Line[] = [];
   const linesBefore = open.length;
-  if (typeof window !== 'undefined') {
-    (window as unknown as { __litshelfPageGutters?: unknown }).__litshelfPageGutters = pageColumnsOf(chars).map((g) => Math.round(g));
-  }
-  /**
-   * **按"页面级栏缝"切行**（见 pageColumnsOf 的注释）。
-   *
-   * 为什么不再用"行内字距中位数 × 1.8"：那个判据在"行宽不一致"的页面上时灵时不灵
-   * （第23篇第 1 页是通栏+双栏混排，实测 52 行只切开 47 行，剩下几行把左右栏并成一块）。
-   * 页面级栏缝是"竖直空白走廊"，与字距无关，对这种页面同样有效。
-   */
-  const pageGutters = pageColumnsOf(chars);
   for (const ln of open) {
     if (ln.chars.length < 2) {
       splitLines.push(ln);
       continue;
-    }
-    /** ① 先按页面级栏缝切：只要这一行有字落在栏缝两侧，就在栏缝处切开 */
-    const crossGutters = pageGutters.filter((g) => {
-      const leftN = ln.chars.filter((i2) => rectOf(chars[i2])[2] <= g + 2).length;
-      const rightN = ln.chars.filter((i2) => rectOf(chars[i2])[0] >= g - 2).length;
-      return leftN >= 4 && rightN >= 4;
-    });
-    if (crossGutters.length) {
-      const cuts = crossGutters.map((g) => {
-        // 切点 = 该栏缝右侧第一个字的序号
-        let k = ln.chars.length;
-        for (let j = 0; j < ln.chars.length; j += 1) {
-          if (rectOf(chars[ln.chars[j]])[0] >= g - 2) {
-            k = j;
-            break;
-          }
-        }
-        return k;
-      });
-      const uniq = [...new Set(cuts)].filter((k) => k > 0 && k < ln.chars.length).sort((a, b) => a - b);
-      if (typeof window !== 'undefined') {
-        const w1 = window as unknown as { __litshelfSplitPath?: unknown[] };
-        (w1.__litshelfSplitPath ??= []).push({ top: Math.round(ln.top), path: uniq.length ? '①栏缝切开' : '①栏缝但切点无效→走②', gutters: crossGutters.length, cuts: uniq.length, pageGutters: pageGutters.length });
-      }
-      if (uniq.length) {
-        let from = 0;
-        for (const cut of [...uniq, ln.chars.length]) {
-          const part = ln.chars.slice(from, cut);
-          if (part.length) splitLines.push(makeLine(part, chars, medianH));
-          from = cut;
-        }
-        continue;
-      }
     }
     /**
      * ② 兜底：按"行内字距"切断跨栏行。
@@ -447,7 +483,7 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
     let from = 0;
     for (const cut of [...breakAt, ordered.length]) {
       const part = ordered.slice(from, cut);
-      if (part.length) splitLines.push(makeLine(part, chars, medianH));
+      if (part.length) splitLines.push(makeLine(part, chars, medianH, pageGutters));
       from = cut;
     }
   }
@@ -516,7 +552,7 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
 }
 
 /** 用一组字符序号造一条行（保持纵向范围/字高中位数） */
-function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbackH: number): Line {
+function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbackH: number, gutters: readonly number[] = []): Line {
   const rects = part.map((i) => rectOf(chars[i]));
   const hs = rects
     .map((r) => r[3] - r[1])
@@ -524,6 +560,8 @@ function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbac
     .sort((a, b) => a - b);
   return {
     chars: part.slice().sort((a, b) => rectOf(chars[a])[0] - rectOf(chars[b])[0]),
+    // 这一行的横向范围**没有跨过**的栏缝（见 pageGuttersOf）
+    gutters: (gutters ?? []).filter((g) => !(Math.min(...rects.map((r) => r[0])) < g - 1 && Math.max(...rects.map((r) => r[2])) > g + 1)),
     top: Math.min(...rects.map((r) => r[1])),
     bottom: Math.max(...rects.map((r) => r[3])),
     left: Math.min(...rects.map((r) => r[0])),
@@ -613,6 +651,18 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
     let bestGap = Number.POSITIVE_INFINITY;
     for (const blk of blocks) {
       const span = blockSpan.get(blk) ?? [blk.left, blk.right];
+      /**
+       * **栏缝是块的硬边界**：块与行若落在栏缝的两侧（一边跨缝、另一边不跨，或跨的不是同一条），
+       * 就不许并进同一块。
+       *
+       * 为什么还需要这一条：按字距切分能把跨栏行**切成两行**，但合并阶段又会因为
+       * "横向重叠够大"把它们并回**同一块** → 用户在第 1 页左栏里拖仍然会选到右栏
+       * （真机实测：选中 50 字、高亮 x[355..959]，越过中线 701）。
+       */
+      const gA = blk.lines[0]?.gutters ?? [];
+      const gB = ln.gutters ?? [];
+      const sameGutters = gA.length === gB.length && gA.every((v, i2) => Math.abs(v - gB[i2]) < 2);
+      if (!sameGutters) continue;
       const ratio = overlapRatio(span, [ln.left, ln.right]);
       if (ratio < 0.6) continue; // 横向不是同一栏
       /**
