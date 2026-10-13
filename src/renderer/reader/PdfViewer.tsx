@@ -1130,7 +1130,25 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
 
     return () => {
       cancelled = true;
-      cbRef.current.onLayer?.(pageNumber, null);
+      /**
+       * ⚠️ **只在页面元素真的脱离文档时**才注销这一层。
+       *
+       * 这个 effect 的 cleanup 不是"卸载时才跑"：deps 一有变化（缩放、DPR、换文档、
+       * 看门狗重试）React 就会先跑上一轮的 cleanup，再跑新一轮的 effect —— 都是重绘。
+       * 以前这里**无条件** `onLayer(pageNumber, null)`，于是每次重绘都把这一页从父级的
+       * `layerByPageRef` 里删掉，而重新登记要等新一轮文本层画完（reportSelectionModel，
+       * 实测 ~250ms）。这 250ms 里引擎 `pages()` 看不到本页 → 按下时 `hit()` 找不到页
+       * → 完全不起锚（选区 null）；而同一时刻 DOM 文本层一直都在，纯粹是我们自己把页摘了。
+       *
+       * 判据两个方向都成立：
+       *   · 重绘：`rootRef` 是稳定 ref，指向的还是**同一条** DOM 元素且仍在文档里
+       *     （缩放只是改它的 width/height 样式）→ 不注销，登记继续有效；
+       *   · 真卸载：React 在 mutation 阶段就把这个节点从文档摘掉（HostComponent 分支：
+       *     safelyDetachRef → removeChild），passive 的 cleanup 跑在那之后 → isConnected 为假
+       *     → 照常注销，不留陈旧层。
+       * 依赖 React 19 的这个次序，见 node_modules/react-dom 的 commitDeletionEffectsOnFiber。
+       */
+      if (!rootRef.current?.isConnected) cbRef.current.onLayer?.(pageNumber, null);
       window.clearTimeout(watchdog);
       try {
         renderTask?.cancel();
