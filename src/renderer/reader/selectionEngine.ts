@@ -250,6 +250,49 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
   const ws = safe.map((r) => charRectOf(r)[2] - charRectOf(r)[0]).sort((a, b) => a - b);
   const medianW = ws[Math.floor(ws.length / 2)] || 8;
   const minCorridor = Math.max(6, medianW * 1.2);
+  const minSeam = 8;
+
+  /**
+   * ## 判据一（结构性、最稳）：**多行共有的竖直缝**
+   *
+   * 思路来自用户："页面上同一个 x 位置反复出现空隙" —— 那就是版面的分栏/分列缝。
+   * 它不依赖"缝有多大"这种绝对量（我为此调过 6 种阈值都不稳），而是看**重复性**：
+   *   · 双栏正文：栏缝在几十行里反复出现（离线实测第 2 页 34 行、第 3 页 26 行、第 1 页 12 行）；
+   *   · 表格：列缝只覆盖表格那一段高度（第 4 页 465pt/375pt/275pt 各 10~18 行）；
+   *   · 巧合的缩进：只出现在 1~2 行 → 直接被"≥3 行"挡掉。
+   *
+   * ⚠️ 离线验证数据（PDF 原始项，`tmp/sel-harness/structural-check.mjs`）：
+   *   第 1 页 325pt:12 行 ｜ 第 2 页 325pt:34 行 ｜ 第 3 页 325pt:26 行
+   *   第 4 页 325pt:15 / 465pt:13 / 375pt:8 / 195pt:7 / 275pt:7
+   * 而我原来那套"按带找空白走廊"在第 4 页**只找到 1 条**（x=456），明显不如这个判据。
+   */
+  const rowOf = (c: ZoteroChar): number => Math.round(charRectOf(c)[1]);
+  const byRow = new Map<number, ZoteroChar[]>();
+  for (const c of safe) {
+    const y = rowOf(c);
+    const list = byRow.get(y);
+    if (list) list.push(c);
+    else byRow.set(y, [c]);
+  }
+  const seamVotes = new Map<number, number>();
+  for (const list of byRow.values()) {
+    if (list.length < 4) continue;
+    const sorted = list.slice().sort((a, b) => charRectOf(a)[0] - charRectOf(b)[0]);
+    for (let i = 1; i < sorted.length; i += 1) {
+      const gap = charRectOf(sorted[i])[0] - charRectOf(sorted[i - 1])[2];
+      if (gap < minSeam) continue;
+      const at = (charRectOf(sorted[i - 1])[2] + charRectOf(sorted[i])[0]) / 2;
+      const key = Math.round(at / 5) * 5;
+      seamVotes.set(key, (seamVotes.get(key) || 0) + 1);
+    }
+  }
+  /**
+   * ⚠️ 这里是**两个判据合并**，不是二选一：
+   *   · 判据一（重复缝）：对"表格列缝 + 正文栏缝"都有效，但表格页上会给出很多条；
+   *   · 判据二（带内走廊，下面那段）：对"通栏 + 双栏混排"有效。
+   * 我一开始写成"判据一有结果就 return"，等于把判据二废掉了 —— 第 4 页因此只剩 1 条缝。
+   */
+  const seams = [...seamVotes.entries()].filter(([, n]) => n >= 3).map(([at]) => at);
 
   /**
    * ## 必须**按纵向分带**找缝，不能要求"整页从上到下都空"
@@ -317,11 +360,12 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
       }
     }
   }
-  // 至少被 2 条带支持才算栏缝（单条带可能是表格列缝/缩进）
-  return [...found.entries()]
+  // 判据二：至少被 2 条带支持才算栏缝（单条带可能是表格列缝/缩进）
+  const bandGutters = [...found.entries()]
     .filter(([, votes]) => votes >= 2)
-    .map(([at]) => at)
-    .sort((a, b) => a - b);
+    .map(([at]) => at);
+  // **两个判据合并**（判据一：重复缝；判据二：带内走廊），去重后按 x 排序
+  return [...new Set([...seams, ...bandGutters])].sort((a, b) => a - b);
 }
 
 /**
