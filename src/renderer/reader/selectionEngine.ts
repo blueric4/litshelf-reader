@@ -111,11 +111,22 @@ const num = (v: unknown, fallback: number): number => (typeof v === 'number' && 
  * 所以：**逐字一律用 `c.rect`**；只有"整条视觉行的纵向范围"这种本来就要项级语义的地方
  * 才显式用 `c.inlineRect`（见 charIndexAt 的 lineDy / lineContains）。
  */
-const rectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
+const charRectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
   c ? c.rect : [0, 0, 0, 0];
 
 /** 整项矩形（= 一条视觉行的行盒）—— 只在"判断这一点是否落在本行纵向范围内"时用 */
 const itemRectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
+  c ? (c.inlineRect ?? c.rect) : [0, 0, 0, 0];
+
+/**
+ * **行盒矩形**（= 整项矩形）—— 归行、行边界、行高这些"行级"运算都用它。
+ *
+ * ⚠️ 为什么不统一用逐字盒（`charRectOf`）：真机实测，用逐字盒做归行会把**同一栏的一行拆碎**
+ * （第 3 页块数 8 → 51、第 2 页 5 → 38），因为项内相邻字盒首尾相接甚至重叠，间隙是 0 或负数。
+ * 而"栏缝"这个量必须用逐字盒（项内插值会把项与项之间的真实空隙抹平）——
+ * 所以两者分开：行级用 `rectOf`，量栏缝用 `charRectOf`。
+ */
+const rectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
   c ? (c.inlineRect ?? c.rect) : [0, 0, 0, 0];
 
 /** 一行（视觉行） */
@@ -353,11 +364,12 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
      * 表现就是"第 23 篇第 1 页怎么调阈值都不切开"。
      * 现在：先把这一行的字符按 x 升序排好，再算相邻间隙 —— 栏缝立刻现形。
      */
-    const ordered = ln.chars.slice().sort((a, b) => rectOf(chars[a])[0] - rectOf(chars[b])[0]);
+    const ordered = ln.chars.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]);
     const gaps: { at: number; w: number; k: number }[] = [];
     for (let k = 1; k < ordered.length; k += 1) {
-      const prev = rectOf(chars[ordered[k - 1]]);
-      const cur = rectOf(chars[ordered[k]]);
+      // 栏缝必须用**逐字盒**量（整项盒会把项与项之间的真实空隙抹平）
+      const prev = charRectOf(chars[ordered[k - 1]]);
+      const cur = charRectOf(chars[ordered[k]]);
       gaps.push({ at: (prev[2] + cur[0]) / 2, w: cur[0] - prev[2], k });
     }
     const sortedW = gaps.map((g) => g.w).sort((a, b) => a - b);
