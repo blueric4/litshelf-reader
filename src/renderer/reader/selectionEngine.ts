@@ -615,6 +615,27 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
       if (leftChars >= 2 && rightChars >= 2) breakAt.push(g.k);
     }
     /**
+     * 诊断（本轮修完即删）：让引擎**自报每一行的切分决策**。
+     * 用途：查"栏缝明明检出（545）但 n=41 的行没切开"到底是哪一步。
+     */
+    if (typeof window !== 'undefined') {
+      const w = window as unknown as { __litshelfWhy2?: unknown[] };
+      if (!w.__litshelfWhy2) w.__litshelfWhy2 = [];
+      if (w.__litshelfWhy2.length < 120) {
+        (w.__litshelfWhy2 as unknown[]).push({
+          top: Math.round(ln.top),
+          n: ln.chars.length,
+          l: Math.round(ln.left),
+          r: Math.round(ln.right),
+          pageGutters,
+          thr: Math.round(thr * 10) / 10,
+          medianGap: Math.round(medianGap * 10) / 10,
+          breaks: breakAt.slice(),
+          gapsHead: gaps.slice(0, 12).map((g) => Math.round(g.w)),
+        });
+      }
+    }
+    /**
      * 诊断：记录"这一行为什么没切开"（阈值、最大间隙、两侧字数）。
      * 之前我离线复算说"该切"，运行时却没切 —— 只有让引擎自报才能定案。
      */
@@ -673,6 +694,55 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
       from = cut;
     }
   }
+  /**
+   * ## 最后一道保险：**任何还跨着栏缝的行片，必须继续按缝切开**
+   *
+   * 这是"栏缝是硬边界"的完整含义，也是我这一轮才想通的地方：
+   * 归行时遇到第一条缝（G1）会另起一行，于是**跨 G1 的那片自己成了一条行，而它又跨过了 G2** ——
+   * 这条片依然是"横跨两栏的行"，而它的 `gutters` 是空的（因为它跨着所有缝），
+   * 于是"两侧栏缝集合相同"的合并判据对它等于没约束 → 被任意合并 → 块横跨全页
+   * （真机实测第 4 页：栏缝检出 18 条、切分 46 行里切开 42 行，**块却仍然横跨** `528字[142..955]`）。
+   *
+   * 修法：对每条切好的行片，找出它跨过的所有栏缝，**每条缝都切一刀**，
+   * 然后只保留"不再跨任何缝"的片（安全兜底，最多 8 次迭代防死循环）。
+   */
+  const clampPieces: Line[] = [];
+  for (const ln of splitLines) {
+    let pieces: Line[] = [ln];
+    for (let iter = 0; iter < 8; iter += 1) {
+      let changed = false;
+      const next: Line[] = [];
+      for (const piece of pieces) {
+        // 这一片跨过的栏缝
+        const crossed = pageGutters.filter((g) => piece.left < g - 1 && piece.right > g + 1);
+        if (!crossed.length) {
+          next.push(piece);
+          continue;
+        }
+        const g = crossed[0];
+        const ord = piece.chars.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]);
+        let cut = -1;
+        for (let k = 0; k < ord.length; k += 1) {
+          if (charRectOf(chars[ord[k]])[0] >= g - 1) {
+            cut = k;
+            break;
+          }
+        }
+        if (cut <= 0 || cut >= ord.length) {
+          next.push(piece); // 切点无效，保持原样（避免丢字）
+          continue;
+        }
+        changed = true;
+        next.push(makeLine(ord.slice(0, cut), chars, medianH, pageGutters));
+        next.push(makeLine(ord.slice(cut), chars, medianH, pageGutters));
+      }
+      pieces = next;
+      if (!changed) break;
+    }
+    for (const p2 of pieces) clampPieces.push(p2);
+  }
+  splitLines.length = 0;
+  splitLines.push(...clampPieces);
   /**
    * 诊断：报告"哪些行被切开了、切成几段"。运行时自报，避免我在离线复算里自欺。
    */
@@ -895,6 +965,13 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
        * "横向重叠够大"把它们并回**同一块** → 用户在第 1 页左栏里拖仍然会选到右栏
        * （真机实测：选中 50 字、高亮 x[355..959]，越过中线 701）。
        */
+      if (typeof window !== 'undefined') {
+        const w = window as unknown as { __litshelfMerge?: unknown[] };
+        if (!w.__litshelfMerge) w.__litshelfMerge = [];
+        if ((w.__litshelfMerge as unknown[]).length < 200) {
+          (w.__litshelfMerge as unknown[]).push({ lineTop: Math.round(ln.top), lineL: Math.round(ln.left), lineR: Math.round(ln.right), blkL: Math.round(blk.left), blkR: Math.round(blk.right), gutters: pageGutters.length, gA: (blk.lines[0]?.gutters ?? []).length, gB: (ln.gutters ?? []).length });
+        }
+      }
       const gA = blk.lines[0]?.gutters ?? [];
       const gB = ln.gutters ?? [];
       const sameGutters = gA.length === gB.length && gA.every((v, i2) => Math.abs(v - gB[i2]) < 2);
