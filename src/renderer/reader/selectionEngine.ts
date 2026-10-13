@@ -327,12 +327,30 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
   order.sort((a, b) => rectOf(chars[a])[1] - rectOf(chars[b])[1] || rectOf(chars[a])[0] - rectOf(chars[b])[0]);
 
   const open: Line[] = [];
+  /** 每一条行内已经出现过的"横向间隙"（用来定这条行允许的最大横向距离，见下） */
+  const lineGaps = new Map<Line, number[]>();
   for (const i of order) {
     const r = rectOf(chars[i]);
     const line = open.find((ln) => {
       const overlap = Math.min(ln.bottom, r[3]) - Math.max(ln.top, r[1]);
       const minH = Math.min(ln.bottom - ln.top, r[3] - r[1]);
       if (!(minH > 0 && overlap >= minH * 0.6)) return false;
+      /**
+       * ## 人眼判据：**先看基线，再看横向**
+       *
+       * 人判断"这两块字是不是同一行"，第一眼看的是**它们在不在同一条水平线上**；
+       * 基线对得上，才接着看"横着是不是挨着"。我原来的判据只有后半句 ——
+       * 于是"横向够近"就把**左栏的行尾**和**右栏的行首**缝成了一条行
+       * （用户截图实测："……满足选择标准：① 典型" 与 "成调研小组，通过现场观察……"
+       * 被连成一条，横跨两栏，两栏之间的缝被压成了几十像素）。
+       *
+       * 这里补上第一眼：**两行的纵向中心必须接近**（差 ≤ 0.5 倍字高中位数）。
+       * 两栏的行在版面上常常是错开的，这一条能挡掉大部分"跨栏缝线"，
+       * 剩下的由"整页栏缝"硬边界兜底。
+       */
+      const cyA = (ln.top + ln.bottom) / 2;
+      const cyB = (r[1] + r[3]) / 2;
+      if (Math.abs(cyA - cyB) > Math.max(2, medianH * 0.5)) return false;
       /**
        * **绝不跨栏缝**：当前字与这一行已占的横向范围之间若隔着一条整页竖缝，
        * 说明它们分属左右两栏 → 不能并成同一行。
@@ -347,9 +365,42 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
         if (lnLeft && curRight) return false;
         if (lnRight && curLeft) return false;
       }
-      // 横向必须"接着"：与这一行已有的横向范围之间的空隙不能太大
+      /**
+       * ## 人眼判据（两个条件必须**同时**满足）
+       *
+       * 人判断"这两块字是不是同一行"，看的是：
+       *   ① 在不在**同一条水平线上**（基线接近）；**并且**
+       *   ② 横向**距离不能太远**。
+       *
+       * 只有 ②（我原来的代码）→ 左栏行尾与右栏行首因为"横着够近"被缝成一条行
+       * （用户截图实测："……满足选择标准：① 典型" 与 "成调研小组，通过现场观察……"
+       * 被连成一条，横跨两栏）。
+       *
+       * 这里把 ② 也定成"距离"判据：允许的最大横向距离 = **该行内已出现间隙的中位数 × 2.2**
+       * （下限 1.5 个中文字宽，上限 6 个字宽）。
+       * 用"该行自己的间隙中位数"当基准，是因为页面之间字号差异很大
+       * （第 1 页字宽 ≈ 22px、第 2 页 ≈ 18px），拍一个固定像素必然在某页上失效。
+       */
       const gap = r[0] > ln.right ? r[0] - ln.right : ln.left > r[2] ? ln.left - r[2] : 0;
-      return gap <= maxInnerGap;
+      if (gap <= 0) return true; // 挨着或重叠，直接算同一行
+      /**
+       * **距离不能太远**（人眼判据的第二条）。
+       *
+       * 基准不拍像素，而是**该行自己的行内间隙中位数**：
+       *   · 同一句话里字与字之间的间隙 ≈ 0~2px；
+       *   · 栏与栏 / 表格单元格之间是 30~80px；
+       * 两者差 20 倍以上，用"中位数 × 2.2"就足以把后者挡在行外，
+       * 而且能自适应不同页面/字号（第 1 页字宽 ≈ 22px、第 2 页 ≈ 18px、第 4 页 ≈ 15px）。
+       * 没有历史间隙时（这一行刚开始）先用 1.5 字宽当基准。
+       */
+      const gs = lineGaps.get(ln) ?? [];
+      const sortedG = gs.slice().sort((a, b) => a - b);
+      const medG = sortedG.length >= 3 ? sortedG[Math.floor(sortedG.length / 2)] : medianW * 0.1;
+      const limit = Math.max(medG * 2.2, medianW * 1.2);
+      if (gap > limit) return false;
+      gs.push(gap);
+      lineGaps.set(ln, gs);
+      return true;
     });
     if (line) {
       line.chars.push(i);
