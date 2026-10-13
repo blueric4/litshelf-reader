@@ -331,7 +331,7 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
  * 真实 PDF 里同一视觉行的 top 会差 1~4px（字体 ascent 不同），
  * 按 top 相等归行会把标题行拆成 3~4 行（真机实测），后面全跟着错。
  */
-function buildLines(chars: readonly ZoteroChar[]): Line[] {
+function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly number[]): Line[] {
   const heights: number[] = [];
   const widths: number[] = [];
   for (const c of chars) {
@@ -355,8 +355,14 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
    */
   const maxInnerGap = Math.max(6, medianW * 2.5);
 
-  /** 整页栏缝（块的硬边界） */
-  const pageGutters = pageGuttersOf(chars);
+  /**
+   * 整页栏缝（块的硬边界）。
+   *
+   * ⚠️ 由调用方（blocksFor）算好传进来：**同一页的行与块必须用同一份栏缝**。
+   * 原来在 buildLines 里算、buildBlocks 里又算一次，两处都可能拿到别的页重算覆盖后的值，
+   * 于是块不许跨栏缝这条约束时灵时不灵（真机实测：同一页块结构一会儿切开一会儿没切开）。
+   */
+  const pageGutters = pageGuttersIn ?? pageGuttersOf(chars);
   if (typeof window !== 'undefined') {
     (window as unknown as Record<string, unknown>).__litshelfPageGutters = pageGutters.slice();
     const lens = pageGutters.map((g) => chars.filter((c) => c.rect[2] <= g + 1).length);
@@ -525,7 +531,15 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
       if (g.w <= thr) continue;
       const leftChars = g.k;
       const rightChars = ln.chars.length - g.k;
-      if (leftChars >= 6 && rightChars >= 6) breakAt.push(g.k);
+      /**
+       * ⚠️ 两侧字数门槛**不能设成 6**：
+       * 栏缝常常**紧邻行首或行尾**（表格行、段首行、行末只有标点），
+       * 一侧不到 6 个字就被跳过 → 整行保持缝合。
+       * 真机实测（第 4 页，x=456 那条栏缝）：46 行里有 **41 行**因为这条守卫而没被切开，
+       * 于是后面的"块不许跨缝"范围约束面对的是已经缝好的行，拦不住 → 拖起来仍然跨栏。
+       * 改成"两侧各至少 2 个字"（真正的窄缝由上面 `thr` 拦）。
+       */
+      if (leftChars >= 2 && rightChars >= 2) breakAt.push(g.k);
     }
     /**
      * 诊断：记录"这一行为什么没切开"（阈值、最大间隙、两侧字数）。
@@ -626,6 +640,7 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
         const w2 = window as unknown as { litshelf?: { invoke?: (m: string, a: unknown[]) => Promise<unknown> } };
         void w2.litshelf?.invoke?.('writeDiag', ['final-pg' + (((window as unknown as Record<string, unknown>).__litshelfPageNo as number) ?? 0) + '.json', JSON.stringify({ chars: chars.length, rows })]);
       }
+      (window as unknown as Record<string, unknown>).__litshelfLinesPage = diagPageNo;
       (window as unknown as { __litshelfLines?: unknown }).__litshelfLines = open.map((ln) => ({
         t: Math.round(ln.top),
         n: ln.chars.length,
@@ -643,6 +658,12 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
     } catch {
       /* 诊断失败不影响功能 */
     }
+  }
+  if (typeof window !== 'undefined') {
+    try {
+      const w3 = window as unknown as { litshelf?: { invoke?: (m: string, a: unknown[]) => Promise<unknown> } };
+      void w3.litshelf?.invoke?.('writeDiag', ['split-pg' + diagPageNo + '.json', JSON.stringify(splitLines.map((l) => ({ t: Math.round(l.top), n: l.chars.length, l: Math.round(l.left), r: Math.round(l.right), g: l.gutters.slice(), x: l.chars.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]).map((i) => Math.round(charRectOf(chars[i])[0])) })) )]);
+    } catch { /* ignore */ }
   }
   open.length = 0;
   open.push(...splitLines);
@@ -739,7 +760,7 @@ function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbac
  *
  * 教训：判据必须落在"人眼看到的整体结构"上（条带 + 带内断口），不要用"逐行聚合出来的统计量"。
  */
-function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], medianCharWidth: number): Block[] {
+function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], medianCharWidth: number, pageGutters: readonly number[] = []): Block[] {
   if (!lines.length) return [];
 
   /** 行高：全页相邻行的垂直间隙中位数（下面用它判断"这一段结束了"） */
@@ -805,6 +826,29 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
       const gB = ln.gutters ?? [];
       const sameGutters = gA.length === gB.length && gA.every((v, i2) => Math.abs(v - gB[i2]) < 2);
       if (!sameGutters) continue;
+      /**
+       * ## **块的范围不许跨过任何一条栏缝**（范围约束，比上面的集合比较有牙齿）
+       *
+       * 上面那条"栏缝集合不同就拒绝"有个漏洞：当一条块里**所有行都跨着同一条缝**时，
+       * 两边集合相等，它等于没生效 —— 真机实测第 4 页因此出现
+       * `528字[142..955]`、`241字[138..945]` 这种横跨两栏的块，拖起来就跨栏。
+       *
+       * 这里改成对**合并后的范围**做检查：只要合并结果跨过了某条栏缝（而原来两边都没跨过它），
+       * 就不许合并。这样"块"在结构上永远只属于栏缝的一侧。
+       */
+      const mergedL = Math.min(blk.left, ln.left);
+      const mergedR = Math.max(blk.right, ln.right);
+      let crossesNewGutter = false;
+      for (const g of pageGutters) {
+        const blkCrosses = blk.left < g - 1 && blk.right > g + 1;
+        const lnCrosses = ln.left < g - 1 && ln.right > g + 1;
+        const mergedCrosses = mergedL < g - 1 && mergedR > g + 1;
+        if (mergedCrosses && !blkCrosses && !lnCrosses) {
+          crossesNewGutter = true;
+          break;
+        }
+      }
+      if (crossesNewGutter) continue;
       const ratio = overlapRatio(span, [ln.left, ln.right]);
       if (ratio < 0.6) continue; // 横向不是同一栏
       /**
@@ -869,6 +913,9 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
   return blocks;
 }
 
+/** 诊断用：当前算的页号（1 起） */
+let diagPageNo = 0;
+
 /** 分块结果缓存：模型对象 + 页面像素尺寸为键（缩放后尺寸变 → 自动重算） */
 const blockCache = new WeakMap<PageCharModel, { key: string; blocks: Block[] }>();
 
@@ -879,14 +926,17 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
   if (cached && cached.key === key) return { blocks: cached.blocks };
 
   const chars = model.chars;
+  diagPageNo = model.pageIndex + 1;
   (window as unknown as Record<string, unknown>).__litshelfPageNo = model.pageIndex + 1;
-  const lines = buildLines(chars);
+  /** 这一页的栏缝 —— **只算一次**，行与块共用（避免跨页覆盖） */
+  const pageGutters = pageGuttersOf(chars);
+  const lines = buildLines(chars, pageGutters);
   const widths = chars
     .map((c) => c.rect[2] - c.rect[0])
     .filter((w) => w > 0)
     .sort((a, b) => a - b);
   const medianCharWidth = widths.length ? widths[Math.floor(widths.length / 2)] : 8;
-  const blocks = buildBlocks(lines, chars, medianCharWidth);
+  const blocks = buildBlocks(lines, chars, medianCharWidth, pageGutters);
   blockCache.set(model, { key, blocks });
 
   // 诊断：把"行 + 行内间隙 + 分块"写到磁盘（CDP 返回值有大小限制，写文件没有）
