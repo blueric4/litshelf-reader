@@ -569,11 +569,20 @@ html[data-theme='dark'] .rd-root[data-reader-theme='light'] {
   user-select: text;
 }
 
+/**
+ * ⚠️ **单页模式下的"相邻页"必须隐藏**。
+ *
+ * 原来这里是 `opacity: 0.55`（半透明显示）。但单页模式下当前页被撑满整个阅读区，
+ * 预渲染的相邻页就贴在它左右两侧（实测：当前页 x 0..1179，上一页 -1191..-12，
+ * 阅读区宽 1401）—— 只要缩放小一点（页宽 < 阅读区宽的 1/2），
+ * **三页会同时出现在屏幕上**（用户实测反馈："单页模式我能看到三页"）。
+ *
+ * 相邻页的作用只是**预渲染**（切页时不闪白），不该显示，所以这里直接不占位、不绘制。
+ * 连续模式下渲染的是 `.rd-page-slot`（不是这两个类），不受影响。
+ */
 .rd-pdf-page.is-adjacent {
-  opacity: 0.55;
-  filter: saturate(0.9);
+  display: none;
 }
-
 .rd-pdf-page.is-current {
   box-shadow: var(--rd-shadow-page);
 }
