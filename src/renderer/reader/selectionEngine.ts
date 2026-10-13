@@ -243,209 +243,201 @@ function pageColumnsOf(chars: readonly ZoteroChar[]): number[] {
  *   · 走廊两侧都必须有**实质文字**（各 ≥ 12 个字、各占页宽 ≥ 15%），
  *     否则只是行末留白/段首缩进，不是栏缝。
  */
-function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
+/**
+ * 一条**栏缝**（硬边界）。
+ *
+ * `at` = 缝的 x（页面坐标）；`lo..hi` = **这条缝生效的纵向范围**（它所在的那个"带"）。
+ *
+ * ## 为什么栏缝必须带纵向范围（这一轮的关键，别再退回"整页一条缝"）
+ *
+ * 第 23 篇第 4 页的真实版面是：**上半部一张通栏表格 + 下半部两栏正文**。
+ * 两处的"竖直缝"性质完全不同：
+ *   · 表格的列缝（实测 x≈285/440/630/800，只覆盖表格那一段高度）；
+ *   · 正文的栏缝（实测走廊 `507..564`，只覆盖正文那一段高度）。
+ * 把其中任何一条当成"整页硬边界"都会出事：
+ *   · 拿表格列缝当整页边界 → 正文行被从中间劈开。实测 x=456 落在**左栏文字内部**
+ *     （有行在 `457..507` 还有 6 个字），于是左栏被切成 `[142..455]` + `[457..507]` 两截，
+ *     块碎成 114 片、拖选在碎片边界断掉；
+ *   · 拿正文栏缝当整页边界 → 表格单元格被劈开。
+ *
+ * 人看版面本来就是"**先分带（表格带/正文带），再在带内分栏**"，这里照这个顺序做。
+ */
+interface Seam {
+  at: number;
+  lo: number;
+  hi: number;
+}
+
+/** 这条缝在 y 处是否生效（带内才生效 —— 表格列缝不许去管正文行） */
+function seamActiveAt(s: Seam, y: number): boolean {
+  return y >= s.lo && y <= s.hi;
+}
+
+/**
+ * 页面级栏缝（硬边界）：**先按纵向空白分带，再在每条带内找"多行共有的竖直缝"**。
+ *
+ * 判据（只用位置/空白/字形三样，跨页面自适）：
+ *   ① 归行：按逐字盒的 y 聚类（容差 0.45 字高，吸收同一行不同项的 ascent 差）；
+ *   ② 分带：相邻行之间出现"明显大于行距"的纵向空白就断开；
+ *   ③ 带内缝投票：每行找宽度 ≥ 1.2 个字宽的横向空隙，位置取整到 5px；
+ *      一个 x 要成为**带内栏缝**，必须同时满足
+ *        · **多行共有**：≥ 60% 的带内行且至少 3 行（结构性的重复缝，挡掉段落缩进）；
+ *        · **纵向贯穿本带**：≥ 70% 带高（挡掉表格里偶发的空隙）；
+ *        · **两侧都有实质宽度**：各 ≥ 25% 带宽，且宽窄相称（0.6 ~ 1.67）——
+ *          真栏缝两侧是两栏正文（实测第 1/2/3 页宽度比 ≈ 1.0），表格列缝往往一侧只有窄标签列。
+ *
+ * ⚠️ 历史教训（别再踩）：
+ *   · "把所有缝都当硬边界"：第 4 页表格筛出 18 条 → 正文行跨过全部 18 条 → 一条都切不动，
+ *     块仍是 `528字[142..955]`；
+ *   · "只取跨度最大的那条缝 / 跨度是相对整页算的"：第 4 页表格占了 2/3 页高，
+ *     正文栏缝只有 36% → 被 60% 门槛筛掉，最后退回"空白走廊"兜底，
+ *     兜出一条 x=456（表格列缝）当栏缝 —— 左栏反而被劈碎。
+ *
+ * @returns 栏缝列表（带纵向范围；单栏带不产出栏缝）
+ */
+function pageGuttersOf(chars: readonly ZoteroChar[]): Seam[] {
   if (chars.length < 40) return [];
   const safe = chars.filter((c) => c && c.rect[2] > c.rect[0]);
   if (safe.length < 40) return [];
-  const ws = safe.map((r) => charRectOf(r)[2] - charRectOf(r)[0]).sort((a, b) => a - b);
+  const ws = safe.map((c) => charRectOf(c)[2] - charRectOf(c)[0]).sort((a, b) => a - b);
   const medianW = ws[Math.floor(ws.length / 2)] || 8;
-  const minCorridor = Math.max(6, medianW * 1.2);
-  const minSeam = 8;
+  const hs = safe.map((c) => charRectOf(c)[3] - charRectOf(c)[1]).filter((h) => h > 0).sort((a, b) => a - b);
+  const medianH = hs[Math.floor(hs.length / 2)] || 10;
+  const minSeam = Math.max(8, medianW * 1.2);
+
+  /** ① 归行：按逐字盒的 y 聚类（容差 0.45 字高，吸收同一行不同项的 ascent 差） */
+  type Row = { y: number; bottom: number; chars: ZoteroChar[] };
+  const rows: Row[] = [];
+  for (const c of safe.slice().sort((a, b) => charRectOf(a)[1] - charRectOf(b)[1])) {
+    const r = charRectOf(c);
+    const last = rows[rows.length - 1];
+    if (last && r[1] - last.y <= medianH * 0.45) {
+      last.chars.push(c);
+      if (r[3] > last.bottom) last.bottom = r[3];
+      continue;
+    }
+    rows.push({ y: r[1], bottom: r[3], chars: [c] });
+  }
+  if (rows.length < 5) return [];
 
   /**
-   * ## 判据一（结构性、最稳）：**多行共有的竖直缝**
+   * ② 空隙在 x 上的**覆盖直方图**（5px 桶）：某个 x 被多少行的"字间空隙"覆盖。
    *
-   * 思路来自用户："页面上同一个 x 位置反复出现空隙" —— 那就是版面的分栏/分列缝。
-   * 它不依赖"缝有多大"这种绝对量（我为此调过 6 种阈值都不稳），而是看**重复性**：
-   *   · 双栏正文：栏缝在几十行里反复出现（离线实测第 2 页 34 行、第 3 页 26 行、第 1 页 12 行）；
-   *   · 表格：列缝只覆盖表格那一段高度（第 4 页 465pt/375pt/275pt 各 10~18 行）；
-   *   · 巧合的缩进：只出现在 1~2 行 → 直接被"≥3 行"挡掉。
-   *
-   * ⚠️ 离线验证数据（PDF 原始项，`tmp/sel-harness/structural-check.mjs`）：
-   *   第 1 页 325pt:12 行 ｜ 第 2 页 325pt:34 行 ｜ 第 3 页 325pt:26 行
-   *   第 4 页 325pt:15 / 465pt:13 / 375pt:8 / 195pt:7 / 275pt:7
-   * 而我原来那套"按带找空白走廊"在第 4 页**只找到 1 条**（x=456），明显不如这个判据。
+   * ⚠️ 为什么不是"给空隙中点归 5px 桶、按桶投票"（我的前两版，都在真实页面上漏检）：
+   *   · 中点归桶：双栏页左栏行末是**参差**的（第 4 页实测行末有 507/525/535 三种），
+   *     同一条走廊的中点会落进 525/535/545 多个桶，每桶只分到一部分行 →
+   *     "连续段"被打散（实测栏缝范围只剩 y901..1135，下半页退回"横向不重叠"兜底）；
+   *   · 按区间贪心聚类：结果依赖空隙的排序，先来的宽空隙会把后面的窄空隙"包"进同一条走廊。
+   * 直方图是**无序、可叠加**的：只要某一列空白在多数行里都出现，那里的覆盖数就会堆起来，
+   * 与行的顺序、行末的参差都无关。
    */
-  const rowOf = (c: ZoteroChar): number => Math.round(charRectOf(c)[1]);
-  const byRow = new Map<number, ZoteroChar[]>();
-  for (const c of safe) {
-    const y = rowOf(c);
-    const list = byRow.get(y);
-    if (list) list.push(c);
-    else byRow.set(y, [c]);
-  }
-  const seamVotes = new Map<number, { n: number; lo: number; hi: number }>();
-  const rowList = [...byRow.keys()].sort((a, b) => a - b);
-  const rowSpan = Math.max(1, rowList[rowList.length - 1] - rowList[0]);
-  for (const y of rowList) {
-    const list = byRow.get(y) as ZoteroChar[];
+  const pageL = Math.min(...safe.map((c) => charRectOf(c)[0]));
+  const pageR = Math.max(...safe.map((c) => charRectOf(c)[2]));
+  const bin = 5;
+  const nb = Math.ceil((pageR - pageL) / bin) + 2;
+  const cover = new Int32Array(nb);
+  const gapRows: { ri: number; from: number; to: number }[] = [];
+  for (let ri = 0; ri < rows.length; ri += 1) {
+    const list = rows[ri].chars;
     if (list.length < 4) continue;
     const sorted = list.slice().sort((a, b) => charRectOf(a)[0] - charRectOf(b)[0]);
     for (let i = 1; i < sorted.length; i += 1) {
-      const gap = charRectOf(sorted[i])[0] - charRectOf(sorted[i - 1])[2];
-      if (gap < minSeam) continue;
-      const at = (charRectOf(sorted[i - 1])[2] + charRectOf(sorted[i])[0]) / 2;
-      const key = Math.round(at / 5) * 5;
-      const cur = seamVotes.get(key);
-      if (cur) {
-        cur.n += 1;
-        if (y < cur.lo) cur.lo = y;
-        if (y > cur.hi) cur.hi = y;
-      } else {
-        seamVotes.set(key, { n: 1, lo: y, hi: y });
-      }
+      const from = charRectOf(sorted[i - 1])[2];
+      const to = charRectOf(sorted[i])[0];
+      if (to - from < minSeam) continue;
+      gapRows.push({ ri, from, to });
+      const a = Math.max(0, Math.floor((from - pageL) / bin));
+      const b = Math.min(nb - 1, Math.floor((to - pageL) / bin));
+      for (let k = a; k <= b; k += 1) cover[k] += 1;
     }
   }
+
+  /** ③ 取覆盖直方图的**局部峰值**当走廊候选（连续平台只留最高那格） */
+  const peaks: { at: number; n: number }[] = [];
+  for (let i = 0; i < nb; i += 1) {
+    if (cover[i] < 3) continue;
+    if (i > 0 && cover[i - 1] > cover[i]) continue;
+    if (i + 1 < nb && cover[i + 1] > cover[i]) continue;
+    peaks.push({ at: pageL + i * bin + bin / 2, n: cover[i] });
+  }
+  peaks.sort((a, b) => b.n - a.n);
+
   /**
-   * ## 用**缝的纵向跨度**区分"正文栏缝"和"表格列缝"（用户思路的延伸）
+   * ④ 每个候选：投票行 = "空隙覆盖了这一点"的那些行；再把投票行**聚成连续段**，
+   * 段 = 这条缝真正贯穿的纵向范围（`Seam.lo/hi`）。
    *
-   * 用户的观察："第四页上面是个表格，表格下面才是正文。"
-   * 这两类缝在几何上的差别正是**纵向跨度**：
-   *   · 表格列缝：只覆盖表格那一小段高度（第 4 页 465pt 缝只跨 13 行 ≈ 页面 50%）；
-   *   · 正文栏缝：覆盖整段正文高度（第 2 页 325pt 缝跨 34 行 ≈ 页面 **96%**）。
-   *
-   * 所以：**只把"纵向跨度 ≥ 页面文字高度的 60%"的缝当作栏缝**（块的硬边界）；
-   * 跨度小的缝（表格列缝、局部对齐）不参与块合并，交给"行内切分"处理 ——
-   * 表格仍然能按单元格切开，但不会把"块"切得七零八落。
-   *
-   * ⚠️ 我原来的写法是"≥3 行就算缝"，于是第 4 页的表格列缝（8~18 行）全部混进来，
-   * 真正的正文栏缝反而淹没在里面（实测第 4 页仍出现 `528字[142..955]` 这种横跨两栏的块）。
+   * ⚠️ 为什么段要按投票行算，而不是"先给整页分带、再在带内找缝"（上一版，第 1、3 页漏检）：
+   * 真实页面常是"通栏元素 + 双栏正文"混排（第 1 页标题/摘要通栏 + 下半双栏；
+   * 第 3 页图题通栏 + 下半双栏）。按整页纵向空白分带时通栏行和双栏行会落进**同一条带**，
+   * 缝的投票率被通栏行稀释（实测 4/8、6/15 都卡在 60% 门槛下）→ 明明存在的栏缝被判没有。
+   * 从缝本身出发就自然了：通栏行不投票 → 段自动断开 → 缝的范围收敛到双栏那一段。
    */
-  const seamCandidates = [...seamVotes.entries()]
-    .filter(([, v]) => v.n >= 3 && (v.hi - v.lo) / rowSpan >= 0.6)
-    .map(([at, v]) => ({ at, span: (v.hi - v.lo) / rowSpan, n: v.n }));
-  /**
-   * ## 硬边界的形状判据：**缝两侧都要有"一整栏"的文字**
-   *
-   * 前面几轮我都错在"把所有缝都当硬边界"：
-   *   · 第 4 页有表格 → 表格列缝很多（实测筛出 **18 条**）；
-   *   · 正文行横跨 `142..955`，**它跨过了全部 18 条缝** → 任何"按缝切开"的 pass
-   *     都切不动它（切一刀它还跨着另外 17 条）→ 最终块仍然是 `528字[142..955]`。
-   *
-   * 真栏缝和表格列缝的差别在**形状**：
-   *   · 真栏缝两侧是两栏正文，各占约 35~40% 页宽（离线实测：第 1 页 37%/38%、
-   *     第 2 页 37%/36%、第 3 页 37%/37%）；
-   *   · 表格列缝往往一侧只有标签列（离线实测第 8 页 155pt 缝：左 9% / 右 67%）。
-   *
-   * ⚠️ "两侧宽度"必须算**缝左边所有字的最右端**与**缝右边所有字的最左端**，
-   * **不能**用"完全落在缝某侧的那些整行"的宽度 —— 双栏页的行往往横跨缝，
-   * 那样算出来左侧会变成 0%（我第一版就是这么错的，把 5 个页面全部筛成 0 条）。
-   */
-  const seamsAll: number[] = [];
-  if (seamCandidates.length) {
-    const allRects = safe.map((c) => charRectOf(c));
-    const pageL = Math.min(...allRects.map((r) => r[0]));
-    const pageR = Math.max(...allRects.map((r) => r[2]));
-    const pageW = Math.max(1, pageR - pageL);
-    for (const s of seamCandidates) {
+  const rowTol = Math.max(medianH * 3, 40);
+  type Cand = { at: number; n: number; lo: number; hi: number; ratio: number; score: number };
+  const cands: Cand[] = [];
+  for (const pk of peaks) {
+    const at = pk.at;
+    const ys = [...new Set(gapRows.filter((g) => g.from <= at && g.to >= at).map((g) => g.ri))].sort((a, b) => a - b);
+    if (ys.length < 3) continue;
+    let start = 0;
+    for (let i = 1; i <= ys.length; i += 1) {
+      const isBreak = i === ys.length || rows[ys[i]].y - rows[ys[i - 1]].y > rowTol;
+      if (!isBreak) continue;
+      const cluster = ys.slice(start, i);
+      start = i;
       /**
-       * 门槛一：**纵向跨度 ≥ 85%**（真栏缝贯穿整段正文；表格列缝只覆盖表格那一段）。
-       * 离线实测真栏缝：第 1 页 86%、第 2 页 96%、第 3 页 96%。
+       * 至少 **5 行**共有才算"结构性缝"。
+       *
+       * 数字是实测标定的：第 4 页正文栏缝连续 **17 行**（y916..1382），
+       * 而表格内部"凑巧对齐"的空隙只有 **2~3 行**（实测 x=545 在表格里 y510..549 三行、
+       * x=435 在 y341..349 两行）→ 门槛设 3 时表格列缝会混进来把表格切碎（块数 41 → 51）。
+       * 第 1 页下半双栏那一段是 5 行，所以门槛取 5 而不是 8。
        */
-      if (s.span < 0.85) continue;
-      const leftRights = allRects.filter((r) => r[2] <= s.at + 1).map((r) => r[2]);
-      const leftLefts = allRects.filter((r) => r[2] <= s.at + 1).map((r) => r[0]);
-      const rightLefts = allRects.filter((r) => r[0] >= s.at - 1).map((r) => r[0]);
-      const rightRights = allRects.filter((r) => r[0] >= s.at - 1).map((r) => r[2]);
+      if (cluster.length < 5) continue; // 至少 5 行共有才算"结构性缝"（见下）
+      const lo = rows[cluster[0]].y;
+      const hi = rows[cluster[cluster.length - 1]].y;
+      /** 段内覆盖率：这一段 y 范围内的行里，**绝大多数行**都要在这里有空隙
+       * （真栏缝实测 1.00；表格里"凑巧对齐"的缝隙只有 0.6~0.75 → 挡掉） */
+      const inRange = rows.filter((r) => r.y >= lo - medianH && r.y <= hi + medianH);
+      if (cluster.length / Math.max(1, inRange.length) < 0.8) continue;
+      const rects = inRange.flatMap((r) => r.chars.map((c) => charRectOf(c)));
+      if (rects.length < 30) continue;
+      const bandL = Math.min(...rects.map((r) => r[0]));
+      const bandR = Math.max(...rects.map((r) => r[2]));
+      const bandW = bandR - bandL;
+      if (!(bandW > 100)) continue;
+      const leftRights = rects.filter((r) => r[2] <= at + 1).map((r) => r[2]);
+      const leftLefts = rects.filter((r) => r[2] <= at + 1).map((r) => r[0]);
+      const rightLefts = rects.filter((r) => r[0] >= at - 1).map((r) => r[0]);
+      const rightRights = rects.filter((r) => r[0] >= at - 1).map((r) => r[2]);
       if (!leftRights.length || !rightLefts.length) continue;
       const leftW = Math.max(...leftRights) - Math.min(...leftLefts);
       const rightW = Math.max(...rightRights) - Math.min(...rightLefts);
-      const lp = leftW / pageW;
-      const rp = rightW / pageW;
+      const lp = leftW / bandW;
+      const rp = rightW / bandW;
       /**
-       * 门槛二：**两侧都要有"一整栏"的文字，且宽度彼此相称**。
-       * 真栏缝：两栏宽度接近（离线实测 37%/38%、37%/36%、37%/37%）；
-       * 表格列缝：一侧只有标签列（实测第 8 页 9%/67%）。
+       * 两侧都要有实质文字宽度，且**宽窄相称**：真栏缝两侧是两栏正文
+       * （实测第 1~4 页宽度比 0.98~1.05），而表格列缝一侧往往只有窄标签列
+       * （第 4 页 x=455 实测 39%/61% = 0.64、x=620 实测 1.5）→ 用 [0.75, 1.33] 挡掉它们，
+       * 否则表格会被自己的列缝切碎（实测块数 39 → 50）。
        */
-      if (lp < 0.28 || lp > 0.52) continue;
-      if (rp < 0.28 || rp > 0.52) continue;
+      if (lp < 0.25 || rp < 0.25) continue;
       const ratio = lp / rp;
-      if (ratio < 0.65 || ratio > 1.55) continue;
-      seamsAll.push(s.at);
+      if (ratio < 0.75 || ratio > 1.33) continue;
+      cands.push({ at, n: cluster.length, lo, hi, ratio, score: cluster.length - Math.abs(1 - ratio) * 2 });
     }
   }
-  const seams = seamsAll.slice().sort((a, b) => a - b);
 
-  /**
-   * ## 判据二：**按纵向分带**找缝（判据一的**兜底**，不是并列）
-   *
-   * ⚠️ 两个判据的优先级（我在这里改过两轮，记下来）：
-   *   · 判据一（重复缝 + 纵向跨度 ≥60%）**有结果时就用它** —— 它是"结构性证据"，最稳；
-   *   · 判据一没结果时，才退回判据二（按带找走廊）。
-   *
-   * 为什么不能让判据二一起参与：实测第 1 页两个判据合并后**检出 11 条缝**
-   * （165/225/245/345/495/545/590/625/745/820/845），
-   * 页面上根本没有 11 个分栏 —— 判据二在"行宽参差"的页面上会给出大量假缝，
-   * 把真正的栏缝淹没掉。所以它是**兜底**，不是并列。
-   *
-   * 判据二自身的价值：第 4 页中间有通栏表格时，判据一可能一条都挑不出来
-   * （表格列缝跨度不够 60%），这时靠它兜底。
-   */
-  const rowsY = [...new Set(safe.map((r) => Math.round(charRectOf(r)[1])))]
-    .sort((a, b) => a - b);
-  const bands: { lo: number; hi: number }[] = [];
-  // 用字高中位数当"同一行"的容差
-  const hs = safe.map((r) => charRectOf(r)[3] - charRectOf(r)[1]).filter((h) => h > 0).sort((a, b) => a - b);
-  const medianH = hs[Math.floor(hs.length / 2)] || 10;
-  for (const y of rowsY) {
-    const last = bands[bands.length - 1];
-    if (last && y - last.hi <= medianH * 2.2) last.hi = y;
-    else bands.push({ lo: y, hi: y });
+  /** ⑤ 去重：同一条走廊的相邻峰值只留分数最高的那条 */
+  cands.sort((a, b) => b.score - a.score);
+  const seams: Seam[] = [];
+  const minApart = Math.max(30, medianW * 3);
+  for (const c of cands) {
+    const dup = seams.some((s) => Math.abs(s.at - c.at) < minApart && Math.min(s.hi, c.hi) - Math.max(s.lo, c.lo) > -medianH);
+    if (dup) continue;
+    seams.push({ at: c.at, lo: c.lo - medianH, hi: c.hi + medianH });
   }
-
-  const found = new Map<number, number>(); // 取整到 6px 的缝位置 → 出现次数（多少条带支持）
-  for (const band of bands) {
-    const inBand = safe.filter((r) => {
-      const y = charRectOf(r)[1];
-      return y >= band.lo - medianH && y <= band.hi + medianH;
-    });
-    if (inBand.length < 30) continue; // 带太小，不足以判栏
-    const left = Math.min(...inBand.map((r) => charRectOf(r)[0]));
-    const right = Math.max(...inBand.map((r) => charRectOf(r)[2]));
-    const span = right - left;
-    if (!(span > 100)) continue;
-
-    const bin = 2;
-    const n = Math.ceil(span / bin) + 2;
-    const used = new Uint8Array(n);
-    for (const r of inBand) {
-      const rr = charRectOf(r);
-      const a = Math.max(0, Math.floor((rr[0] - left) / bin));
-      const b = Math.min(n - 1, Math.floor((rr[2] - left) / bin));
-      for (let i = a; i <= b; i += 1) used[i] = 1;
-    }
-    let run = -1;
-    for (let i = 0; i <= n; i += 1) {
-      const empty = i < n && used[i] === 0;
-      if (empty) {
-        if (run < 0) run = i;
-        continue;
-      }
-      if (run >= 0) {
-        const gFrom = left + run * bin;
-        const gTo = left + i * bin;
-        const leftSide = inBand.filter((r) => charRectOf(r)[2] <= gFrom + 1);
-        const rightSide = inBand.filter((r) => charRectOf(r)[0] >= gTo - 1);
-        const lw = leftSide.length >= 12 ? Math.max(...leftSide.map((r) => charRectOf(r)[2])) - left : 0;
-        const rw = rightSide.length >= 12 ? right - Math.min(...rightSide.map((r) => charRectOf(r)[0])) : 0;
-        if (gTo - gFrom >= minCorridor && lw >= span * 0.15 && rw >= span * 0.15) {
-          const key = Math.round((gFrom + gTo) / 2 / 6) * 6;
-          found.set(key, (found.get(key) || 0) + 1);
-        }
-        run = -1;
-      }
-    }
-  }
-  /**
-   * 判据一优先（结构性证据最稳）；判据一没有结果时才用判据二兜底。
-   * 实测：两个判据"合并"会在第 1 页检出 11 条缝（假缝淹没真缝）；
-   * "判据一优先、判据二兜底"则在第 2 页检出 2 条、第 4 页检出 1 条（都是对的）。
-   */
-  if (seams.length) return seams;
-  const bandGutters = [...found.entries()]
-    .filter(([, votes]) => votes >= 2)
-    .map(([at]) => at);
-  return [...new Set(bandGutters)].sort((a, b) => a - b);
+  return seams.sort((a, b) => a.lo - b.lo || a.at - b.at);
 }
 
 /**
@@ -455,7 +447,7 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
  * 真实 PDF 里同一视觉行的 top 会差 1~4px（字体 ascent 不同），
  * 按 top 相等归行会把标题行拆成 3~4 行（真机实测），后面全跟着错。
  */
-function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly number[]): Line[] {
+function buildLines(chars: readonly ZoteroChar[], seamsIn?: readonly Seam[]): Line[] {
   const heights: number[] = [];
   const widths: number[] = [];
   for (const c of chars) {
@@ -480,17 +472,22 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
   const maxInnerGap = Math.max(6, medianW * 2.5);
 
   /**
-   * 整页栏缝（块的硬边界）。
+   * 整页栏缝（块的硬边界）—— **带纵向范围**，见 pageGuttersOf。
    *
    * ⚠️ 由调用方（blocksFor）算好传进来：**同一页的行与块必须用同一份栏缝**。
    * 原来在 buildLines 里算、buildBlocks 里又算一次，两处都可能拿到别的页重算覆盖后的值，
    * 于是块不许跨栏缝这条约束时灵时不灵（真机实测：同一页块结构一会儿切开一会儿没切开）。
    */
-  const pageGutters = pageGuttersIn ?? pageGuttersOf(chars);
+  const seams = seamsIn ?? pageGuttersOf(chars);
   if (typeof window !== 'undefined') {
-    (window as unknown as Record<string, unknown>).__litshelfPageGutters = pageGutters.slice();
-    const lens = pageGutters.map((g) => chars.filter((c) => c.rect[2] <= g + 1).length);
-    (window as unknown as Record<string, unknown>).__litshelfGutterInfo = { n: pageGutters.length, gutters: pageGutters.slice(), leftCounts: lens };
+    (window as unknown as Record<string, unknown>).__litshelfPageGutters = seams.map((s) => s.at);
+    const lens = seams.map((s) => chars.filter((c) => c.rect[2] <= s.at + 1).length);
+    (window as unknown as Record<string, unknown>).__litshelfGutterInfo = {
+      n: seams.length,
+      gutters: seams.map((s) => s.at),
+      bands: seams.map((s) => [Math.round(s.lo), Math.round(s.hi)]),
+      leftCounts: lens,
+    };
   }
 
   const order = Array.from({ length: chars.length }, (_, i) => i).filter((i) => chars[i]);
@@ -522,11 +519,17 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
       const cyB = (r[1] + r[3]) / 2;
       if (Math.abs(cyA - cyB) > Math.max(2, medianH * 0.5)) return false;
       /**
-       * **绝不跨栏缝**：当前字与这一行已占的横向范围之间若隔着一条整页竖缝，
+       * **绝不跨栏缝**：当前字与这一行已占的横向范围之间若隔着一条**在此 y 生效**的竖缝，
        * 说明它们分属左右两栏 → 不能并成同一行。
        * 这是"先分栏、再归行"的关键一步（人看版面就是这个顺序）。
+       *
+       * ⚠️ 必须带 `seamActiveAt` 的纵向判据：第 4 页表格带里的列缝（x≈440/630）
+       * 与正文带的栏缝（x≈545）**不是一回事**，表格列缝不许去管正文行（否则正文行会被劈开）。
        */
-      for (const g of pageGutters) {
+      const cy = (r[1] + r[3]) / 2;
+      for (const s of seams) {
+        if (!seamActiveAt(s, cy)) continue;
+        const g = s.at;
         const curLeft = r[2] <= g + 1;
         const curRight = r[0] >= g - 1;
         if (!curLeft && !curRight) continue; // 这一行本身就跨着缝（跨栏标题），不拦
@@ -678,7 +681,8 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
           n: ln.chars.length,
           l: Math.round(ln.left),
           r: Math.round(ln.right),
-          pageGutters,
+          pageGutters: seams.map((s2) => s2.at),
+          seamBands: seams.map((s2) => [Math.round(s2.lo), Math.round(s2.hi)]),
           thr: Math.round(thr * 10) / 10,
           medianGap: Math.round(medianGap * 10) / 10,
           breaks: breakAt.slice(),
@@ -741,7 +745,7 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
     let from = 0;
     for (const cut of [...breakAt, ordered.length]) {
       const part = ordered.slice(from, cut);
-      if (part.length) splitLines.push(makeLine(part, chars, medianH, pageGutters));
+      if (part.length) splitLines.push(makeLine(part, chars, medianH, seams));
       from = cut;
     }
   }
@@ -756,7 +760,15 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
    *
    * 修法：对每条切好的行片，找出它跨过的所有栏缝，**每条缝都切一刀**，
    * 然后只保留"不再跨任何缝"的片（安全兜底，最多 8 次迭代防死循环）。
+   *
+   * ⚠️ **两个补丁（这一轮实测后加的）**：
+   *   ① 缝必须**在本片的 y 处生效**（`seamActiveAt`）—— 表格带的列缝不许切正文行，
+   *      正文带的栏缝也不许切表格单元格；
+   *   ② 切点处**必须真的有空隙**（`gap >= 1.2 字宽`）—— 否则会把一个**跨缝的表格单元格**
+   *      （或通栏标题）从文字中间劈成两条行，选中时凭空多出一个断点。
+   *      真栏缝一定是空白（左右两栏之间没有字），所以这条不会漏切真跨栏行。
    */
+  const minCutGap = Math.max(6, medianW * 1.2);
   const clampPieces: Line[] = [];
   for (const ln of splitLines) {
     let pieces: Line[] = [ln];
@@ -764,28 +776,30 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
       let changed = false;
       const next: Line[] = [];
       for (const piece of pieces) {
-        // 这一片跨过的栏缝
-        const crossed = pageGutters.filter((g) => piece.left < g - 1 && piece.right > g + 1);
+        // 这一片跨过的、且**在它这个 y 处生效**的栏缝
+        const cy = (piece.top + piece.bottom) / 2;
+        const crossed = seams.filter((s) => seamActiveAt(s, cy) && piece.left < s.at - 1 && piece.right > s.at + 1);
         if (!crossed.length) {
           next.push(piece);
           continue;
         }
-        const g = crossed[0];
+        const s = crossed[0];
         const ord = piece.chars.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]);
         let cut = -1;
-        for (let k = 0; k < ord.length; k += 1) {
-          if (charRectOf(chars[ord[k]])[0] >= g - 1) {
-            cut = k;
-            break;
-          }
+        for (let k = 1; k < ord.length; k += 1) {
+          const prev = charRectOf(chars[ord[k - 1]]);
+          const cur = charRectOf(chars[ord[k]]);
+          if (cur[0] < s.at - 1) continue; // 还没走到缝
+          if (cur[0] - prev[2] >= minCutGap) cut = k; // 缝处确有空白 → 可以切
+          break; // 只看"跨过缝的那一处字距"
         }
         if (cut <= 0 || cut >= ord.length) {
-          next.push(piece); // 切点无效，保持原样（避免丢字）
+          next.push(piece); // 切点无效（缝落在文字中间）→ 保持原样（避免丢字/劈开单元格）
           continue;
         }
         changed = true;
-        next.push(makeLine(ord.slice(0, cut), chars, medianH, pageGutters));
-        next.push(makeLine(ord.slice(cut), chars, medianH, pageGutters));
+        next.push(makeLine(ord.slice(0, cut), chars, medianH, seams));
+        next.push(makeLine(ord.slice(cut), chars, medianH, seams));
       }
       pieces = next;
       if (!changed) break;
@@ -909,20 +923,48 @@ function buildLines(chars: readonly ZoteroChar[], pageGuttersIn?: readonly numbe
 }
 
 /** 用一组字符序号造一条行（保持纵向范围/字高中位数） */
-function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbackH: number, gutters: readonly number[] = []): Line {
-  const rects = part.map((i) => rectOf(chars[i]));
-  const hs = rects
+function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbackH: number, seams: readonly Seam[] = []): Line {
+  /**
+   * ## ⚠️ 横向范围必须用**逐字盒**算（`charRectOf`），不能用行盒（`rectOf`）
+   *
+   * 这是队友 engine-fix 查出来的关键点（真实 dump `tmp/sel-harness/split-pg4.json`）：
+   * 170 条切好的行片里 **164 条仍被判为"跨 x=456"**，而且多数片子的 `l/r` 根本不是自己字的位置 ——
+   * 例如 t=96 的片 n=20、字实际在 `x 464..827`，却报 `l=157 r=938`。
+   *
+   * 原因：`rectOf` 是**整项矩形**（inlineRect），一个项有 36 个字时 36 个字共用同一个盒子；
+   * 于是"从整项里切出来的那一小片"**继承了整项的盒子** →
+   * 下游 `clampPieces` 的判据 `piece.left < g-1 && piece.right > g+1` 切完仍然为真
+   * → 那个"跨缝强制切开"的 pass **永远切不完**（不是没进入，而是判据用错了几何量）。
+   *
+   * 纵向（top/bottom）仍用**行盒**（`rectOf`）：行的上下边界本来就是"整条视觉行的高度带"，
+   * 归行/并块用的纵向间隙也依赖它（见 buildLines 的注释）。
+   * 若改用逐字盒，行高会缩到字形高度、纵向间隙凭空变大 → 并块判据失效（实测块数 24 → 114）。
+   */
+  const rects = part.map((i) => charRectOf(chars[i]));
+  const boxes = part.map((i) => rectOf(chars[i]));
+  const hs = boxes
     .map((r) => r[3] - r[1])
     .filter((h) => h > 0)
     .sort((a, b) => a - b);
+  const top = Math.min(...boxes.map((r) => r[1]));
+  const bottom = Math.max(...boxes.map((r) => r[3]));
+  const left = Math.min(...rects.map((r) => r[0]));
+  const right = Math.max(...rects.map((r) => r[2]));
+  const cy = (top + bottom) / 2;
   return {
-    chars: part.slice().sort((a, b) => rectOf(chars[a])[0] - rectOf(chars[b])[0]),
-    // 这一行的横向范围**没有跨过**的栏缝（见 pageGuttersOf）
-    gutters: (gutters ?? []).filter((g) => !(Math.min(...rects.map((r) => r[0])) < g - 1 && Math.max(...rects.map((r) => r[2])) > g + 1)),
-    top: Math.min(...rects.map((r) => r[1])),
-    bottom: Math.max(...rects.map((r) => r[3])),
-    left: Math.min(...rects.map((r) => r[0])),
-    right: Math.max(...rects.map((r) => r[2])),
+    chars: part.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]),
+    /**
+     * 这一行**没有跨过**的栏缝（= 它属于哪一栏的判据，见 pageGuttersOf）。
+     * 只算**在它这个 y 处生效**的缝：表格带的列缝与正文带的栏缝不是一回事。
+     */
+    gutters: (seams ?? [])
+      .filter((s) => seamActiveAt(s, cy))
+      .filter((s) => !(left < s.at - 1 && right > s.at + 1))
+      .map((s) => s.at),
+    top,
+    bottom,
+    left,
+    right,
     charHeight: hs.length ? hs[Math.floor(hs.length / 2)] : fallbackH,
   };
 }
@@ -954,17 +996,42 @@ function makeLine(part: readonly number[], chars: readonly ZoteroChar[], fallbac
  *
  * 教训：判据必须落在"人眼看到的整体结构"上（条带 + 带内断口），不要用"逐行聚合出来的统计量"。
  */
-function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], medianCharWidth: number, pageGutters: readonly number[] = []): Block[] {
+function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], medianCharWidth: number, seams: readonly Seam[] = []): Block[] {
   if (!lines.length) return [];
 
-  /** 行高：全页相邻行的垂直间隙中位数（下面用它判断"这一段结束了"） */
-  const gaps: number[] = [];
-  for (let k = 1; k < lines.length; k += 1) {
-    const g = lines[k].top - lines[k - 1].bottom;
-    if (g > 0) gaps.push(g);
+  /**
+   * ## 行距（**必须按"同栏上下相邻两行"量**，这一条是第 4 页碎成 114 块的直接原因）
+   *
+   * 原来用的是"把全部行按 top 排好、相邻两行的纵向间隙取中位数"。
+   * 双栏页左右栏的行是**交错**的：相邻两项常常分属左右两栏（纵向间隙 ≈ 0 或负数），
+   * 于是中位数被拉到 1~8px → 阈值 `max(4, 行距×1.4)` ≈ 5px →
+   * **同栏上下相邻的两行（真实间隙 13px）永远并不到一块** → 每行各自成块
+   * （真机实测第 4 页 114 块、下半部 33 块，典型块只有 5~13 字；拖选在块边界就断）。
+   *
+   * 现在：只统计**横向重叠 ≥ 50%（= 同一栏）**的上下两行的**行距（top 差）**，
+   * 取中位数当"正常行距"；并块阈值放宽到 0.85 倍行距（允许段间距并入同一栏，
+   * 但"换带"那种 2 倍以上的空白仍然断得开）。
+   */
+  const pitchOf = (a: Line, b: Line): boolean => {
+    const ov = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    const minLen = Math.min(a.right - a.left, b.right - b.left);
+    return minLen > 0 && ov / minLen >= 0.5;
+  };
+  const pitches: number[] = [];
+  for (const a of lines) {
+    let best = Number.POSITIVE_INFINITY;
+    for (const b of lines) {
+      if (b.top <= a.top + 1) continue;
+      if (!pitchOf(a, b)) continue;
+      const d = b.top - a.top;
+      if (d < best) best = d;
+    }
+    if (Number.isFinite(best) && best > 0 && best < 400) pitches.push(best);
   }
-  gaps.sort((a, b) => a - b);
-  const lineH = gaps.length ? Math.max(4, gaps[Math.floor(gaps.length / 2)]) : 12;
+  pitches.sort((a, b) => a - b);
+  const linePitch = pitches.length ? pitches[Math.floor(pitches.length / 2)] : Math.max(12, medianCharWidth * 2);
+  /** 纵向并块容差：小于"一个行距的 0.85 倍"的空白才算"紧跟着的下一行" */
+  const vTol = Math.max(4, linePitch * 0.85);
   /** 全页 x 范围与"块宽上限"：单栏正文一般 <= 页宽的 55%，超过就说明并块过头了 */
   const pageLeft0 = Math.min(...lines.map((l) => l.left));
   const pageRight0 = Math.max(...lines.map((l) => l.right));
@@ -992,22 +1059,26 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
   };
 
   const blocks: Block[] = [];
-  /**
-   * 每一块的**横向基准范围**（开块时定死，之后不再变）。
-   *
-   * ⚠️ 这里是我踩过的最深的一个坑：原来用"整块累计的包围盒"去和行比横向重叠，
-   * 而块每并入一行包围盒就变宽 —— 第 1 页那些行的宽度很不一致（129..399、362..669…），
-   * 包围盒一路涨宽，最后把**左右两栏的行都包含进来**，重叠比例永远 >= 0.6，
-   * 于是左右栏并成一块（真机实测：326 字/7 行横跨 [154..1024]）。
-   * 第 2 页的行宽整齐，所以那一页没事 —— 这就是"这篇文献特别"的真正原因。
-   * 现在：开块时把横向范围定死，之后只能并入**横向落在它里面**的行。
-   */
-  const blockSpan = new Map<Block, [number, number]>();
   for (const ln of lines) {
     let best: Block | null = null;
     let bestGap = Number.POSITIVE_INFINITY;
     for (const blk of blocks) {
-      const span = blockSpan.get(blk) ?? [blk.left, blk.right];
+      /**
+       * 横向基准 = **这一块已累计的包围盒**（`blk.left/right`）。
+       *
+       * ⚠️ 这里两个方向都踩过，写清楚：
+       *   · 用"开块那一行的范围"定死：段首行是**缩进**的（第 4 页左栏首行 `181..525`，
+       *     其余行 `142..525`），于是段落末行 `（表１）。`（`142..213`）与它的重叠只有
+       *     32/71 = 0.45 < 0.6 → 被拒 → 左栏末尾三行各自成块，**拖选到那里就断**
+       *     （离线实测：`5字1行[142..213]`、`32字1行[181..524]` 独立成块）；
+       *   · 用"无上限的包围盒"：一个**通栏行**（跨缝那类，`gutters=[]`）并进来后包围盒变满宽，
+       *     之后左右栏的行都"重叠 ≥0.6"了 → 整页一块（历史实测 326 字横跨 `[154..1024]`）。
+       *
+       * 现在两头都堵住了：跨缝行与非跨缝行的 `gutters` 集合天然不同（`sameGutters` 直接拒绝，
+       * 见 makeLine），而包围盒的膨胀又被下面的 `maxBlockWidth`（页宽的 58%）卡死 ——
+       * 所以可以安全地用包围盒当基准，让"缩进/末行"这类窄行也能并进来。
+       */
+      const span: [number, number] = [blk.left, blk.right];
       /**
        * **栏缝是块的硬边界**：块与行若落在栏缝的两侧（一边跨缝、另一边不跨，或跨的不是同一条），
        * 就不许并进同一块。
@@ -1020,7 +1091,7 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
         const w = window as unknown as { __litshelfMerge?: unknown[] };
         if (!w.__litshelfMerge) w.__litshelfMerge = [];
         if ((w.__litshelfMerge as unknown[]).length < 200) {
-          (w.__litshelfMerge as unknown[]).push({ lineTop: Math.round(ln.top), lineL: Math.round(ln.left), lineR: Math.round(ln.right), blkL: Math.round(blk.left), blkR: Math.round(blk.right), gutters: pageGutters.length, gA: (blk.lines[0]?.gutters ?? []).length, gB: (ln.gutters ?? []).length });
+          (w.__litshelfMerge as unknown[]).push({ lineTop: Math.round(ln.top), lineL: Math.round(ln.left), lineR: Math.round(ln.right), blkL: Math.round(blk.left), blkR: Math.round(blk.right), gutters: seams.length, gA: (blk.lines[0]?.gutters ?? []).length, gB: (ln.gutters ?? []).length });
         }
       }
       const gA = blk.lines[0]?.gutters ?? [];
@@ -1036,11 +1107,17 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
        *
        * 这里改成对**合并后的范围**做检查：只要合并结果跨过了某条栏缝（而原来两边都没跨过它），
        * 就不许合并。这样"块"在结构上永远只属于栏缝的一侧。
+       *
+       * ⚠️ 只对**在这一行 y 处生效**的缝做检查（`seamActiveAt`）：表格带里的行不受正文栏缝约束，
+       * 否则表格里"跨过正文栏缝 x 的那些单元格"会连不到自己那一列上去（碎块）。
        */
       const mergedL = Math.min(blk.left, ln.left);
       const mergedR = Math.max(blk.right, ln.right);
+      const cyLn = (ln.top + ln.bottom) / 2;
       let crossesNewGutter = false;
-      for (const g of pageGutters) {
+      for (const s of seams) {
+        if (!seamActiveAt(s, cyLn)) continue;
+        const g = s.at;
         const blkCrosses = blk.left < g - 1 && blk.right > g + 1;
         const lnCrosses = ln.left < g - 1 && ln.right > g + 1;
         const mergedCrosses = mergedL < g - 1 && mergedR > g + 1;
@@ -1065,7 +1142,7 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
       if (mergedRight - mergedLeft > maxBlockWidth && ratio < 0.95) continue;
       const vOverlap = Math.min(blk.bottom, ln.bottom) - Math.max(blk.top, ln.top);
       const vGap = Math.max(blk.top, ln.top) - Math.min(blk.bottom, ln.bottom);
-      if (vOverlap <= 0 && vGap > Math.max(4, lineH * 1.4)) continue; // 离得太远，是另一段（段间距通常 <= 1 行高）
+      if (vOverlap <= 0 && vGap > vTol) continue; // 离得太远，是另一段/另一带（见上面的行距说明）
       // 字号突变（标题/正文/脚注）也断开 —— 但要和"同一块里的正常波动"区分：只在差 > 30% 时断
       const hi = Math.max(blk.size, ln.charHeight);
       const lo = Math.min(blk.size, ln.charHeight);
@@ -1092,7 +1169,6 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
         size: ln.charHeight,
       };
       blocks.push(created);
-      blockSpan.set(created, [ln.left, ln.right]); // 横向范围开块即定死
     }
   }
 
@@ -1106,7 +1182,7 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
   blocks.sort((a, b) => a.top - b.top || a.left - b.left);
   if (typeof window !== 'undefined') {
     (window as unknown as { __litshelfStripDiag?: unknown }).__litshelfStripDiag = {
-      lineH: Math.round(lineH),
+      lineH: Math.round(linePitch),
       lines: lines.length,
       blocks: blocks.map((b) => ({ chars: b.order.length, lines: b.lines.length, left: Math.round(b.left), right: Math.round(b.right) })),
     };
@@ -1129,15 +1205,15 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
   const chars = model.chars;
   diagPageNo = model.pageIndex + 1;
   (window as unknown as Record<string, unknown>).__litshelfPageNo = model.pageIndex + 1;
-  /** 这一页的栏缝 —— **只算一次**，行与块共用（避免跨页覆盖） */
-  const pageGutters = pageGuttersOf(chars);
-  const lines = buildLines(chars, pageGutters);
+  /** 这一页的栏缝（带纵向范围）—— **只算一次**，行与块共用（避免跨页覆盖） */
+  const seams = pageGuttersOf(chars);
+  const lines = buildLines(chars, seams);
   const widths = chars
     .map((c) => c.rect[2] - c.rect[0])
     .filter((w) => w > 0)
     .sort((a, b) => a - b);
   const medianCharWidth = widths.length ? widths[Math.floor(widths.length / 2)] : 8;
-  const blocks = buildBlocks(lines, chars, medianCharWidth, pageGutters);
+  const blocks = buildBlocks(lines, chars, medianCharWidth, seams);
   blockCache.set(model, { key, blocks });
 
   // 诊断：把"行 + 行内间隙 + 分块"写到磁盘（CDP 返回值有大小限制，写文件没有）
