@@ -99,8 +99,11 @@ const num = (v: unknown, fallback: number): number => (typeof v === 'number' && 
  * ⚠️⚠️ 这里曾经是 `c.inlineRect ?? c.rect` —— **这是"第23篇第1页怎么调阈值都切不开"的真正原因**，
  * 我为此白查了好几轮，必须写清楚：
  *
- * `inlineRect` 的语义是"**整个文本项**的矩形"（Zotero 拿它做整行盒高亮），
- * 于是一个 36 字的项里 36 个字的 `inlineRect` **完全相同**。真机实测那一条行：
+ * `inlineRect` 的语义是"**视觉行盒**"：由 `selectionModel.ts::buildLines`（L664-703）按
+ * "同一基线（中心差 ≤ size/2）"分桶后回填的**整桶并集盒**。⚠️ 它**不是**"单个 pdf.js item 的矩形"
+ * —— 这个说法曾经写在注释里、也误导过一轮排查（真机实测：第 4 页一条行盒 = x 142..945，
+ * 横跨左右两栏，而左栏文字只到 x 467；纵向只有一行高）。同一个桶里的字共用同一个盒子，
+ * 于是 36 个字的 `inlineRect` **完全相同**。真机实测那一条行：
  *   #0 [611,1121,1024,1142] 宽=413
  *   #1 [611,1121,1024,1142] 宽=413   ← 每个字都一样
  *   …
@@ -108,18 +111,24 @@ const num = (v: unknown, fallback: number): number => (typeof v === 'number' && 
  * 阈值 `max(6, 中位×1.8)` 退化成 6，而"最大正间隙"恒为 0 → **任何栏缝都切不开**。
  * 表现就是：无论把阈值调成 8 / 6 / 1.5 倍，第 23 篇第 1 页永远不切。
  *
- * 所以：**逐字一律用 `c.rect`**；只有"整条视觉行的纵向范围"这种本来就要项级语义的地方
- * 才显式用 `c.inlineRect`（见 charIndexAt 的 lineDy / lineContains）。
+ * 所以：**只要问"这个字在哪 / 指针落在哪个字上"，一律用 `c.rect`**（`charRectOf`）；
+ * `inlineRect` 只留给"行级"运算（见 `rectOf`）。
  */
 const charRectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
   c ? c.rect : [0, 0, 0, 0];
 
-/** 整项矩形（= 一条视觉行的行盒）—— 只在"判断这一点是否落在本行纵向范围内"时用 */
+/**
+ * **视行盒矩形**（= `inlineRect`，语义见上）—— 只用于**行级**运算（归行、行边界、行高、行矩形合并）。
+ *
+ * ⚠️ **不要用它判"指针落在哪个字上"**：它比字自己的盒子高（包住上下伸部），会把相邻字算成
+ * "同一行带内"，指针明明在「２」上却选到左邻的「（」。真机实测（5 页 × 4px 网格 = 107619 点）
+ * 旧判据错 333 点，改成逐字盒后错 0 点、且 0 劣化 —— 见 `charIndexAt` 的注释。
+ */
 const itemRectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
   c ? (c.inlineRect ?? c.rect) : [0, 0, 0, 0];
 
 /**
- * **行盒矩形**（= 整项矩形）—— 归行、行边界、行高这些"行级"运算都用它。
+ * **行盒矩形**（= 视行盒 `inlineRect`）—— 归行、行边界、行高这些"行级"运算都用它。
  *
  * ⚠️ 为什么不统一用逐字盒（`charRectOf`）：真机实测，用逐字盒做归行会把**同一栏的一行拆碎**
  * （第 3 页块数 8 → 51、第 2 页 5 → 38），因为项内相邻字盒首尾相接甚至重叠，间隙是 0 或负数。
@@ -1355,38 +1364,59 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
   const charIndexAt = (page: PageHandle, x: number, y: number, hitTol: number): number => {
     const chars = page.model.chars;
     if (!chars.length) return -1;
-    const lineContains = (c: ZoteroChar): boolean => {
-      // 项的纵向范围 —— 这里**有意**用整项矩形（判断指针是否落在这一行的高度带里）
-      const line = itemRectOf(c);
-      return y >= line[1] && y <= line[3];
-    };
-    const scoreInLine = (c: ZoteroChar): number => {
-      if (x >= c.rect[0] && x <= c.rect[2]) return 0;
-      return 1 + Math.abs(x - (c.rect[0] + c.rect[2]) / 2) / 1000;
-    };
+    /**
+     * ## ⚠️ 判"指针落在哪个字上"必须用**逐字盒**（`charRectOf`），不能用行盒（`itemRectOf`）
+     *
+     * `itemRectOf` 是**视觉行盒**（`selectionModel.buildLines` 回填的、同一基线所有项的并集盒，
+     * 横向还会横跨左右两栏）。拿它当"这一行的高度带"的后果：多认出一圈"行内"的点 ——
+     * 这些点其实落在**相邻字的盒子里**，却走了"行内按 x 打分"的分支，而 `key < bestKey - 1e-9`
+     * 稳定偏向**更早的字**，于是锚点落到左邻那个字上。
+     *
+     * 真机实测（5 页真机模型 × 4px 网格 = **107619** 个"逐字盒含点"的点，
+     * 工具 `tmp/sel-harness/hit-regress.mjs`，两个变体都是 esbuild 打真源码跑真 `begin()`）：
+     *   · 旧判据命中 **99.70%**（错 333 点，全是上下标/括号这类紧邻字：指针在「２」上却选到「（」）；
+     *   · 逐字盒 + "到字盒的距离"判据 **100.00%（错 0）**，且**没有任何一点由对变错**（劣化 0）。
+     */
     const lineDy = (c: ZoteroChar): number => {
-      const line = itemRectOf(c);
-      if (y < line[1]) return line[1] - y;
-      if (y > line[3]) return y - line[3];
+      const r = charRectOf(c);
+      if (y < r[1]) return r[1] - y;
+      if (y > r[3]) return y - r[3];
+      return 0;
+    };
+    /** 指针到"这个字自己"的横向距离（0 = 指针在它的左右范围内） */
+    const lineDx = (c: ZoteroChar): number => {
+      const r = charRectOf(c);
+      if (x < r[0]) return r[0] - x;
+      if (x > r[2]) return x - r[2];
       return 0;
     };
     let best = -1;
     let bestKey = Number.POSITIVE_INFINITY;
     for (let k = 0; k < chars.length; k += 1) {
       const c = chars[k];
-      if (lineDy(c) > hitTol) continue;
-      const key = lineContains(c) ? scoreInLine(c) : 2 + lineDy(c) / 1000;
+      const dy = lineDy(c);
+      if (dy > hitTol) continue;
+      /**
+       * 指针就在这个字盒里 → 0 分（不可能更优）；否则按**到字盒的距离**打分，纵向权重 ×8
+       * （与下面"容差内一个都没有"的兜底循环同一套度量）。
+       *
+       * ⚠️ 不要写成"先纵向、后横向"的字典序（也不要 `dy*100 + x` 这类极端权重）：那样只要某个字
+       * 的 y 范围盖住指针（哪怕它在**另一栏**、横向 800px 外），就会压过同一行里横向 100px 的字。
+       * 真机实测第 4 页"点在右侧页边空白"处，字典序把锚点甩到左栏 **871px** 外；
+       * 距离度量选的是同一条带上 104px 外的字 —— 与人的直觉一致。
+       */
+      const key = lineDx(c) + dy * 8;
       if (key < bestKey - 1e-9) {
         bestKey = key;
         best = k;
       }
     }
     if (best >= 0) return best;
-    // 容差内一个都没有（指针在行间/栏缝里）：横向为主 + 纵向重罚
+    // 容差内一个都没有（指针在行间/栏缝里）：到**逐字盒**的距离，横向为主 + 纵向重罚
     let near = -1;
     let nearKey = Number.POSITIVE_INFINITY;
     for (let k = 0; k < chars.length; k += 1) {
-      const line = itemRectOf(chars[k]);
+      const line = charRectOf(chars[k]);
       const dx = x < line[0] ? line[0] - x : x > line[2] ? x - line[2] : 0;
       const dy = y < line[1] ? line[1] - y : y > line[3] ? y - line[3] : 0;
       const key = dx + dy * 8;
