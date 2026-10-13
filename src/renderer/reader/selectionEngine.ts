@@ -274,8 +274,11 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
     if (list) list.push(c);
     else byRow.set(y, [c]);
   }
-  const seamVotes = new Map<number, number>();
-  for (const list of byRow.values()) {
+  const seamVotes = new Map<number, { n: number; lo: number; hi: number }>();
+  const rowList = [...byRow.keys()].sort((a, b) => a - b);
+  const rowSpan = Math.max(1, rowList[rowList.length - 1] - rowList[0]);
+  for (const y of rowList) {
+    const list = byRow.get(y) as ZoteroChar[];
     if (list.length < 4) continue;
     const sorted = list.slice().sort((a, b) => charRectOf(a)[0] - charRectOf(b)[0]);
     for (let i = 1; i < sorted.length; i += 1) {
@@ -283,27 +286,49 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
       if (gap < minSeam) continue;
       const at = (charRectOf(sorted[i - 1])[2] + charRectOf(sorted[i])[0]) / 2;
       const key = Math.round(at / 5) * 5;
-      seamVotes.set(key, (seamVotes.get(key) || 0) + 1);
+      const cur = seamVotes.get(key);
+      if (cur) {
+        cur.n += 1;
+        if (y < cur.lo) cur.lo = y;
+        if (y > cur.hi) cur.hi = y;
+      } else {
+        seamVotes.set(key, { n: 1, lo: y, hi: y });
+      }
     }
   }
   /**
-   * ⚠️ 这里是**两个判据合并**，不是二选一：
-   *   · 判据一（重复缝）：对"表格列缝 + 正文栏缝"都有效，但表格页上会给出很多条；
-   *   · 判据二（带内走廊，下面那段）：对"通栏 + 双栏混排"有效。
-   * 我一开始写成"判据一有结果就 return"，等于把判据二废掉了 —— 第 4 页因此只剩 1 条缝。
+   * ## 用**缝的纵向跨度**区分"正文栏缝"和"表格列缝"（用户思路的延伸）
+   *
+   * 用户的观察："第四页上面是个表格，表格下面才是正文。"
+   * 这两类缝在几何上的差别正是**纵向跨度**：
+   *   · 表格列缝：只覆盖表格那一小段高度（第 4 页 465pt 缝只跨 13 行 ≈ 页面 50%）；
+   *   · 正文栏缝：覆盖整段正文高度（第 2 页 325pt 缝跨 34 行 ≈ 页面 **96%**）。
+   *
+   * 所以：**只把"纵向跨度 ≥ 页面文字高度的 60%"的缝当作栏缝**（块的硬边界）；
+   * 跨度小的缝（表格列缝、局部对齐）不参与块合并，交给"行内切分"处理 ——
+   * 表格仍然能按单元格切开，但不会把"块"切得七零八落。
+   *
+   * ⚠️ 我原来的写法是"≥3 行就算缝"，于是第 4 页的表格列缝（8~18 行）全部混进来，
+   * 真正的正文栏缝反而淹没在里面（实测第 4 页仍出现 `528字[142..955]` 这种横跨两栏的块）。
    */
-  const seams = [...seamVotes.entries()].filter(([, n]) => n >= 3).map(([at]) => at);
+  const seams = [...seamVotes.entries()]
+    .filter(([, v]) => v.n >= 3 && (v.hi - v.lo) / rowSpan >= 0.6)
+    .map(([at]) => at);
 
   /**
-   * ## 必须**按纵向分带**找缝，不能要求"整页从上到下都空"
+   * ## 判据二：**按纵向分带**找缝（判据一的**兜底**，不是并列）
    *
-   * 我原来要求"一条竖直走廊贯穿整页"，结果**通栏元素会把缝堵死**：
-   * 第 4 页中间有一张通栏表格（x 157..938），任何竖直走廊都被它截断 →
-   * 实测检出 **0 条栏缝** → "块不许跨缝合并"这条保护形同虚设 →
-   * 24 个块里出现 `528字[142..955]`、`241字[138..945]` 这种横跨两栏的大块。
+   * ⚠️ 两个判据的优先级（我在这里改过两轮，记下来）：
+   *   · 判据一（重复缝 + 纵向跨度 ≥60%）**有结果时就用它** —— 它是"结构性证据"，最稳；
+   *   · 判据一没结果时，才退回判据二（按带找走廊）。
    *
-   * 人怎么看？**分段看**：页眉那一段是通栏、表格那一段是通栏、正文那一段是两栏，
-   * 每段各自看有没有缝。所以这里先按"纵向空白"把字符切成带，再在**每条带内部**找走廊。
+   * 为什么不能让判据二一起参与：实测第 1 页两个判据合并后**检出 11 条缝**
+   * （165/225/245/345/495/545/590/625/745/820/845），
+   * 页面上根本没有 11 个分栏 —— 判据二在"行宽参差"的页面上会给出大量假缝，
+   * 把真正的栏缝淹没掉。所以它是**兜底**，不是并列。
+   *
+   * 判据二自身的价值：第 4 页中间有通栏表格时，判据一可能一条都挑不出来
+   * （表格列缝跨度不够 60%），这时靠它兜底。
    */
   const rowsY = [...new Set(safe.map((r) => Math.round(charRectOf(r)[1])))]
     .sort((a, b) => a - b);
@@ -360,12 +385,16 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
       }
     }
   }
-  // 判据二：至少被 2 条带支持才算栏缝（单条带可能是表格列缝/缩进）
+  /**
+   * 判据一优先（结构性证据最稳）；判据一没有结果时才用判据二兜底。
+   * 实测：两个判据"合并"会在第 1 页检出 11 条缝（假缝淹没真缝）；
+   * "判据一优先、判据二兜底"则在第 2 页检出 2 条、第 4 页检出 1 条（都是对的）。
+   */
+  if (seams.length) return seams.sort((a, b) => a - b);
   const bandGutters = [...found.entries()]
     .filter(([, votes]) => votes >= 2)
     .map(([at]) => at);
-  // **两个判据合并**（判据一：重复缝；判据二：带内走廊），去重后按 x 排序
-  return [...new Set([...seams, ...bandGutters])].sort((a, b) => a - b);
+  return [...new Set(bandGutters)].sort((a, b) => a - b);
 }
 
 /**
