@@ -93,7 +93,29 @@ export interface SelectionEngine {
 
 const num = (v: unknown, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
 
+/**
+ * **逐字矩形**（几何操作的唯一入口）。
+ *
+ * ⚠️⚠️ 这里曾经是 `c.inlineRect ?? c.rect` —— **这是"第23篇第1页怎么调阈值都切不开"的真正原因**，
+ * 我为此白查了好几轮，必须写清楚：
+ *
+ * `inlineRect` 的语义是"**整个文本项**的矩形"（Zotero 拿它做整行盒高亮），
+ * 于是一个 36 字的项里 36 个字的 `inlineRect` **完全相同**。真机实测那一条行：
+ *   #0 [611,1121,1024,1142] 宽=413
+ *   #1 [611,1121,1024,1142] 宽=413   ← 每个字都一样
+ *   …
+ * 拿它做逐字运算的后果：相邻字间隙 = 611 - 1024 = **-413**，整行间隙中位数 -413.5，
+ * 阈值 `max(6, 中位×1.8)` 退化成 6，而"最大正间隙"恒为 0 → **任何栏缝都切不开**。
+ * 表现就是：无论把阈值调成 8 / 6 / 1.5 倍，第 23 篇第 1 页永远不切。
+ *
+ * 所以：**逐字一律用 `c.rect`**；只有"整条视觉行的纵向范围"这种本来就要项级语义的地方
+ * 才显式用 `c.inlineRect`（见 charIndexAt 的 lineDy / lineContains）。
+ */
 const rectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
+  c ? c.rect : [0, 0, 0, 0];
+
+/** 整项矩形（= 一条视觉行的行盒）—— 只在"判断这一点是否落在本行纵向范围内"时用 */
+const itemRectOf = (c: ZoteroChar | undefined): readonly [number, number, number, number] =>
   c ? (c.inlineRect ?? c.rect) : [0, 0, 0, 0];
 
 /** 一行（视觉行） */
@@ -304,6 +326,10 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
         return k;
       });
       const uniq = [...new Set(cuts)].filter((k) => k > 0 && k < ln.chars.length).sort((a, b) => a - b);
+      if (typeof window !== 'undefined') {
+        const w1 = window as unknown as { __litshelfSplitPath?: unknown[] };
+        (w1.__litshelfSplitPath ??= []).push({ top: Math.round(ln.top), path: uniq.length ? '①栏缝切开' : '①栏缝但切点无效→走②', gutters: crossGutters.length, cuts: uniq.length, pageGutters: pageGutters.length });
+      }
       if (uniq.length) {
         let from = 0;
         for (const cut of [...uniq, ln.chars.length]) {
@@ -314,11 +340,24 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
         continue;
       }
     }
-    /** ② 兜底：仍用原来的"字距比例"判据（对没有明显栏缝的页面有效） */
+    /**
+     * ② 兜底：按"行内字距"切断跨栏行。
+     *
+     * ⚠️⚠️ **必须先按 x 排序再算间隙**（我在这里错过整整几轮，记下来）：
+     * `ln.chars` 是"字符序号"数组，它的顺序**不是 x 升序** ——
+     * 引擎接管时按阅读顺序重排过 DOM 与模型，中文期刊的内容流又是左右栏交替的，
+     * 于是相邻两个"序号"在几何上可能天各一方。
+     * 原来直接对序号相邻项相减，结果：
+     *   实测 top=1184 那一行（左右栏并排、真实栏缝 52px）算出 **间距中位数 = -828.5**、
+     *   **最大间隙 = 0**（负数全被忽略）→ 阈值 = max(6, 负数) = 6 → **永远切不开**。
+     * 表现就是"第 23 篇第 1 页怎么调阈值都不切开"。
+     * 现在：先把这一行的字符按 x 升序排好，再算相邻间隙 —— 栏缝立刻现形。
+     */
+    const ordered = ln.chars.slice().sort((a, b) => rectOf(chars[a])[0] - rectOf(chars[b])[0]);
     const gaps: { at: number; w: number; k: number }[] = [];
-    for (let k = 1; k < ln.chars.length; k += 1) {
-      const prev = rectOf(chars[ln.chars[k - 1]]);
-      const cur = rectOf(chars[ln.chars[k]]);
+    for (let k = 1; k < ordered.length; k += 1) {
+      const prev = rectOf(chars[ordered[k - 1]]);
+      const cur = rectOf(chars[ordered[k]]);
       gaps.push({ at: (prev[2] + cur[0]) / 2, w: cur[0] - prev[2], k });
     }
     const sortedW = gaps.map((g) => g.w).sort((a, b) => a - b);
@@ -341,13 +380,61 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
       const rightChars = ln.chars.length - g.k;
       if (leftChars >= 6 && rightChars >= 6) breakAt.push(g.k);
     }
+    /**
+     * 诊断：记录"这一行为什么没切开"（阈值、最大间隙、两侧字数）。
+     * 之前我离线复算说"该切"，运行时却没切 —— 只有让引擎自报才能定案。
+     */
+    if (typeof window !== 'undefined') {
+      type SplitWhy = { top: number; n: number; left: number; right: number; medianGap: number; thr: number; maxGap: number; maxAt: number; leftChars: number; rightChars: number; breakAt: number[]; text: string; rects: number[][]; charsText: string };
+      const w0 = window as unknown as { __litshelfSplitWhy?: SplitWhy[] };
+      if (!w0.__litshelfSplitWhy) w0.__litshelfSplitWhy = [];
+      if (w0.__litshelfSplitWhy.length >= 400) w0.__litshelfSplitWhy.length = 0;
+      {
+        const sortedG = gaps.slice().sort((a, b) => a.w - b.w);
+        const mg = sortedG.length ? sortedG[Math.floor(sortedG.length / 2)].w : 0;
+        const thr = Math.max(6, mg * 1.8);
+        let maxG = 0;
+        let maxAt = -1;
+        for (const g of gaps) if (g.w > maxG) { maxG = g.w; maxAt = g.k; }
+        w0.__litshelfSplitWhy.push({
+          top: Math.round(ln.top),
+          n: ln.chars.length,
+          left: Math.round(ln.left),
+          right: Math.round(ln.right),
+          medianGap: Math.round(mg * 10) / 10,
+          thr: Math.round(thr * 10) / 10,
+          maxGap: Math.round(maxG * 10) / 10,
+          maxAt,
+          leftChars: maxAt,
+          rightChars: ln.chars.length - maxAt,
+          breakAt: breakAt.slice(),
+          /**
+           * 该行**排序后的逐字矩形**（只取前 30 个）—— 用来直接看"栏缝到底在不在"。
+           * 之前的诊断只给我 x[0]，被我误读了两轮；这里给完整 [x0,y0,x1,y1]。
+           */
+          rects: ordered.slice(0, 30).map((i2) => {
+            const rr = rectOf(chars[i2]);
+            return [Math.round(rr[0]), Math.round(rr[1]), Math.round(rr[2]), Math.round(rr[3])];
+          }),
+          charsText: ordered
+            .slice(0, 30)
+            .map((i2) => chars[i2].c)
+            .join(''),
+          text: ln.chars.map((i2) => chars[i2]?.c ?? '').join('').replace(/\s+/g, ' ').slice(0, 20),
+        });
+      }
+    }
+    if (typeof window !== 'undefined') {
+      const w2 = window as unknown as { __litshelfSplitPath?: unknown[] };
+      (w2.__litshelfSplitPath ??= []).push({ top: Math.round(ln.top), path: breakAt.length ? '②字距切开' : '②未切开', breaks: breakAt.length });
+    }
     if (!breakAt.length) {
       splitLines.push(ln);
       continue;
     }
     let from = 0;
-    for (const cut of [...breakAt, ln.chars.length]) {
-      const part = ln.chars.slice(from, cut);
+    for (const cut of [...breakAt, ordered.length]) {
+      const part = ordered.slice(from, cut);
       if (part.length) splitLines.push(makeLine(part, chars, medianH));
       from = cut;
     }
@@ -617,6 +704,44 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
     };
     const w = window as unknown as { litshelf?: { invoke?: (m: string, a: unknown[]) => Promise<unknown> } };
     void w.litshelf?.invoke?.('writeDiag', ['rows-p' + (model.pageIndex + 1) + '.json', JSON.stringify(dump)]);
+    /**
+     * 诊断（只写盘、不影响行为）：把**模型算出的逐字盒子** dump 出来，
+     * 供离线与 PDF 原始项、DOM 字形逐项对照。
+     * 用途：判定"栏缝消失"发生在模型构建（itemGeometry/charBoxesOf）还是分块判据。
+     *
+     * 模型对象上不再有"项"的结构（PairInfo 只存在于构建期），所以这里按
+     * "相邻字 x 跳变 / 换行"切出"项段"，足以做对照。
+     */
+    {
+      const segsOut: { text: string; x0: number; x1: number; top: number }[] = [];
+      let cur: number[] = [];
+      const flush = (): void => {
+        if (!cur.length) return;
+        segsOut.push({
+          text: cur.map((i2) => chars[i2].c).join('').slice(0, 24),
+          x0: Math.round(Math.min(...cur.map((i2) => chars[i2].rect[0]))),
+          x1: Math.round(Math.max(...cur.map((i2) => chars[i2].rect[2]))),
+          top: Math.round(chars[cur[0]].rect[1]),
+        });
+        cur = [];
+      };
+      for (let i2 = 0; i2 < chars.length; i2 += 1) {
+        const prev = chars[i2 - 1];
+        const me = chars[i2];
+        const far = !!prev && Math.abs(me.rect[0] - prev.rect[2]) > Math.max(6, medianCharWidth * 0.6);
+        const otherLine = !!prev && Math.abs(me.rect[1] - prev.rect[1]) > 2;
+        if (far || otherLine) flush();
+        cur.push(i2);
+      }
+      flush();
+      const dom = Array.from(pageEl.querySelectorAll('.rd-pdf-text span:not(.markedContent)'))
+        .slice(0, 400)
+        .map((s) => {
+          const b = s.getBoundingClientRect();
+          return { t: (s.textContent || '').slice(0, 20), x0: Math.round(b.left), x1: Math.round(b.right) };
+        });
+      void w.litshelf?.invoke?.('writeDiag', ['items-p' + (model.pageIndex + 1) + '.json', JSON.stringify({ page: model.pageIndex + 1, items: segsOut, dom })]);
+    }
     const gut = pageColumnsOf(chars).map((g) => Math.round(g));
     // 直方图（用字中心、2px 格子），写盘供离线分析
     {
@@ -699,7 +824,8 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     const chars = page.model.chars;
     if (!chars.length) return -1;
     const lineContains = (c: ZoteroChar): boolean => {
-      const line = rectOf(c);
+      // 项的纵向范围 —— 这里**有意**用整项矩形（判断指针是否落在这一行的高度带里）
+      const line = itemRectOf(c);
       return y >= line[1] && y <= line[3];
     };
     const scoreInLine = (c: ZoteroChar): number => {
@@ -707,7 +833,7 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
       return 1 + Math.abs(x - (c.rect[0] + c.rect[2]) / 2) / 1000;
     };
     const lineDy = (c: ZoteroChar): number => {
-      const line = rectOf(c);
+      const line = itemRectOf(c);
       if (y < line[1]) return line[1] - y;
       if (y > line[3]) return y - line[3];
       return 0;
@@ -728,7 +854,7 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     let near = -1;
     let nearKey = Number.POSITIVE_INFINITY;
     for (let k = 0; k < chars.length; k += 1) {
-      const line = rectOf(chars[k]);
+      const line = itemRectOf(chars[k]);
       const dx = x < line[0] ? line[0] - x : x > line[2] ? x - line[2] : 0;
       const dy = y < line[1] ? line[1] - y : y > line[3] ? y - line[3] : 0;
       const key = dx + dy * 8;
@@ -791,7 +917,7 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     for (const i of idx) {
       const c = chars[i];
       if (!c) continue;
-      const line = rectOf(c);
+      const line = itemRectOf(c);
       const key = Math.round(line[1]);
       const cur = byLine.get(key);
       if (!cur) {
