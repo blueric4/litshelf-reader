@@ -245,48 +245,83 @@ function pageColumnsOf(chars: readonly ZoteroChar[]): number[] {
  */
 function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
   if (chars.length < 40) return [];
-  const rects = chars.map((c) => charRectOf(c)).filter((r) => r[2] > r[0]);
-  if (rects.length < 40) return [];
-  const ws = rects.map((r) => r[2] - r[0]).sort((a, b) => a - b);
+  const safe = chars.filter((c) => c && c.rect[2] > c.rect[0]);
+  if (safe.length < 40) return [];
+  const ws = safe.map((r) => charRectOf(r)[2] - charRectOf(r)[0]).sort((a, b) => a - b);
   const medianW = ws[Math.floor(ws.length / 2)] || 8;
-  const left = Math.min(...rects.map((r) => r[0]));
-  const right = Math.max(...rects.map((r) => r[2]));
-  const span = right - left;
-  if (!(span > 100)) return [];
-
-  const bin = 2;
-  const n = Math.ceil(span / bin) + 2;
-  const used = new Uint8Array(n);
-  for (const r of rects) {
-    const a = Math.max(0, Math.floor((r[0] - left) / bin));
-    const b = Math.min(n - 1, Math.floor((r[2] - left) / bin));
-    for (let i = a; i <= b; i += 1) used[i] = 1;
-  }
-
   const minCorridor = Math.max(6, medianW * 1.2);
-  const minSideW = span * 0.15;
-  const out: number[] = [];
-  let run = -1;
-  for (let i = 0; i <= n; i += 1) {
-    const empty = i < n && used[i] === 0;
-    if (empty) {
-      if (run < 0) run = i;
-      continue;
+
+  /**
+   * ## 必须**按纵向分带**找缝，不能要求"整页从上到下都空"
+   *
+   * 我原来要求"一条竖直走廊贯穿整页"，结果**通栏元素会把缝堵死**：
+   * 第 4 页中间有一张通栏表格（x 157..938），任何竖直走廊都被它截断 →
+   * 实测检出 **0 条栏缝** → "块不许跨缝合并"这条保护形同虚设 →
+   * 24 个块里出现 `528字[142..955]`、`241字[138..945]` 这种横跨两栏的大块。
+   *
+   * 人怎么看？**分段看**：页眉那一段是通栏、表格那一段是通栏、正文那一段是两栏，
+   * 每段各自看有没有缝。所以这里先按"纵向空白"把字符切成带，再在**每条带内部**找走廊。
+   */
+  const rowsY = [...new Set(safe.map((r) => Math.round(charRectOf(r)[1])))]
+    .sort((a, b) => a - b);
+  const bands: { lo: number; hi: number }[] = [];
+  // 用字高中位数当"同一行"的容差
+  const hs = safe.map((r) => charRectOf(r)[3] - charRectOf(r)[1]).filter((h) => h > 0).sort((a, b) => a - b);
+  const medianH = hs[Math.floor(hs.length / 2)] || 10;
+  for (const y of rowsY) {
+    const last = bands[bands.length - 1];
+    if (last && y - last.hi <= medianH * 2.2) last.hi = y;
+    else bands.push({ lo: y, hi: y });
+  }
+
+  const found = new Map<number, number>(); // 取整到 6px 的缝位置 → 出现次数（多少条带支持）
+  for (const band of bands) {
+    const inBand = safe.filter((r) => {
+      const y = charRectOf(r)[1];
+      return y >= band.lo - medianH && y <= band.hi + medianH;
+    });
+    if (inBand.length < 30) continue; // 带太小，不足以判栏
+    const left = Math.min(...inBand.map((r) => charRectOf(r)[0]));
+    const right = Math.max(...inBand.map((r) => charRectOf(r)[2]));
+    const span = right - left;
+    if (!(span > 100)) continue;
+
+    const bin = 2;
+    const n = Math.ceil(span / bin) + 2;
+    const used = new Uint8Array(n);
+    for (const r of inBand) {
+      const rr = charRectOf(r);
+      const a = Math.max(0, Math.floor((rr[0] - left) / bin));
+      const b = Math.min(n - 1, Math.floor((rr[2] - left) / bin));
+      for (let i = a; i <= b; i += 1) used[i] = 1;
     }
-    if (run >= 0) {
-      const gFrom = left + run * bin;
-      const gTo = left + i * bin;
-      const leftSide = rects.filter((r) => r[2] <= gFrom + 1);
-      const rightSide = rects.filter((r) => r[0] >= gTo - 1);
-      const lw = leftSide.length >= 12 ? Math.max(...leftSide.map((r) => r[2])) - left : 0;
-      const rw = rightSide.length >= 12 ? right - Math.min(...rightSide.map((r) => r[0])) : 0;
-      if (gTo - gFrom >= minCorridor && lw >= minSideW && rw >= minSideW) {
-        out.push(Math.round((gFrom + gTo) / 2));
+    let run = -1;
+    for (let i = 0; i <= n; i += 1) {
+      const empty = i < n && used[i] === 0;
+      if (empty) {
+        if (run < 0) run = i;
+        continue;
       }
-      run = -1;
+      if (run >= 0) {
+        const gFrom = left + run * bin;
+        const gTo = left + i * bin;
+        const leftSide = inBand.filter((r) => charRectOf(r)[2] <= gFrom + 1);
+        const rightSide = inBand.filter((r) => charRectOf(r)[0] >= gTo - 1);
+        const lw = leftSide.length >= 12 ? Math.max(...leftSide.map((r) => charRectOf(r)[2])) - left : 0;
+        const rw = rightSide.length >= 12 ? right - Math.min(...rightSide.map((r) => charRectOf(r)[0])) : 0;
+        if (gTo - gFrom >= minCorridor && lw >= span * 0.15 && rw >= span * 0.15) {
+          const key = Math.round((gFrom + gTo) / 2 / 6) * 6;
+          found.set(key, (found.get(key) || 0) + 1);
+        }
+        run = -1;
+      }
     }
   }
-  return out;
+  // 至少被 2 条带支持才算栏缝（单条带可能是表格列缝/缩进）
+  return [...found.entries()]
+    .filter(([, votes]) => votes >= 2)
+    .map(([at]) => at)
+    .sort((a, b) => a - b);
 }
 
 /**
@@ -322,6 +357,11 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
 
   /** 整页栏缝（块的硬边界） */
   const pageGutters = pageGuttersOf(chars);
+  if (typeof window !== 'undefined') {
+    (window as unknown as Record<string, unknown>).__litshelfPageGutters = pageGutters.slice();
+    const lens = pageGutters.map((g) => chars.filter((c) => c.rect[2] <= g + 1).length);
+    (window as unknown as Record<string, unknown>).__litshelfGutterInfo = { n: pageGutters.length, gutters: pageGutters.slice(), leftCounts: lens };
+  }
 
   const order = Array.from({ length: chars.length }, (_, i) => i).filter((i) => chars[i]);
   order.sort((a, b) => rectOf(chars[a])[1] - rectOf(chars[b])[1] || rectOf(chars[a])[0] - rectOf(chars[b])[0]);
@@ -383,20 +423,28 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
        */
       const gap = r[0] > ln.right ? r[0] - ln.right : ln.left > r[2] ? ln.left - r[2] : 0;
       if (gap <= 0) return true; // 挨着或重叠，直接算同一行
+      const gs = lineGaps.get(ln) ?? [];
+      const sortedG = gs.slice().sort((a, b) => a - b);
+      const medG = sortedG.length >= 3 ? sortedG[Math.floor(sortedG.length / 2)] : medianW * 0.1;
       /**
        * **距离不能太远**（人眼判据的第二条）。
        *
        * 基准不拍像素，而是**该行自己的行内间隙中位数**：
        *   · 同一句话里字与字之间的间隙 ≈ 0~2px；
        *   · 栏与栏 / 表格单元格之间是 30~80px；
-       * 两者差 20 倍以上，用"中位数 × 2.2"就足以把后者挡在行外，
+       * 两者差 20 倍以上，用"中位数 × 3"就足以把后者挡在行外，
        * 而且能自适应不同页面/字号（第 1 页字宽 ≈ 22px、第 2 页 ≈ 18px、第 4 页 ≈ 15px）。
-       * 没有历史间隙时（这一行刚开始）先用 1.5 字宽当基准。
+       *
+       * ⚠️ 下限**必须贴着"正常字距"的量级**，不能取"1 个字宽"：
+       *
+       * 第 4 页实测（183% 缩放）：同一句话里的字距是 0~2px，
+       * 而**两栏之间的间隙被压缩成了 ≈23px**（左栏"① 典型"结束 677 → 右栏"成调研小组"开始 700）。
+       * 绝对阈值（6px / 24px / 1.2 字宽 / 2.5 字宽）我都试过，每一个都在某页上与它擦肩而过。
+       *
+       * 真正**稳定**的差别是**倍数**：栏缝 / 单元格缝 ≈ 正常字距的 10 倍以上。
+       * 所以用**该行已有间隙的中位数 × 3**（下限 6px）当判据 —— 相对量，跨页面自适。
        */
-      const gs = lineGaps.get(ln) ?? [];
-      const sortedG = gs.slice().sort((a, b) => a - b);
-      const medG = sortedG.length >= 3 ? sortedG[Math.floor(sortedG.length / 2)] : medianW * 0.1;
-      const limit = Math.max(medG * 2.2, medianW * 1.2);
+      const limit = Math.max(medG * 3, 6);
       if (gap > limit) return false;
       gs.push(gap);
       lineGaps.set(ln, gs);
@@ -552,6 +600,49 @@ function buildLines(chars: readonly ZoteroChar[]): Line[] {
         .slice(0, 12)
         .map((l) => ({ top: Math.round(l.top), n: l.chars.length, l: Math.round(l.left), r: Math.round(l.right), text: l.chars.map((i) => chars[i]?.c ?? '').join('').slice(0, 18) })),
     });
+  }
+  /**
+   * 诊断（本轮修完即删）：把"归行前每一行的间隙序列"写到磁盘。
+   * 用途：用真实数字定"多大的横向距离才算栏缝/单元格缝"，不再拍脑袋调阈值。
+   */
+  if (typeof window !== 'undefined') {
+    try {
+      const rows = open.slice(0, 60).map((ln) => {
+        const ord = ln.chars.slice().sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0]);
+        const gs: number[] = [];
+        for (let k = 1; k < ord.length; k += 1) gs.push(Math.round(charRectOf(chars[ord[k]])[0] - charRectOf(chars[ord[k - 1]])[2]));
+        return {
+          top: Math.round(ln.top),
+          n: ln.chars.length,
+          l: Math.round(ln.left),
+          r: Math.round(ln.right),
+          gaps: gs,
+          text: ord.map((i) => chars[i].c).join('').replace(/\s+/g, ' ').slice(0, 24),
+        };
+      });
+      const w = window as unknown as { litshelf?: { invoke?: (m: string, a: unknown[]) => Promise<unknown> } };
+      (window as unknown as { __litshelfGaps?: unknown }).__litshelfGaps = rows;
+      {
+        const w2 = window as unknown as { litshelf?: { invoke?: (m: string, a: unknown[]) => Promise<unknown> } };
+        void w2.litshelf?.invoke?.('writeDiag', ['final-pg' + (((window as unknown as Record<string, unknown>).__litshelfPageNo as number) ?? 0) + '.json', JSON.stringify({ chars: chars.length, rows })]);
+      }
+      (window as unknown as { __litshelfLines?: unknown }).__litshelfLines = open.map((ln) => ({
+        t: Math.round(ln.top),
+        n: ln.chars.length,
+        l: Math.round(ln.left),
+        r: Math.round(ln.right),
+        g: ln.gutters.slice(),
+        text: ln.chars
+          .slice()
+          .sort((a, b) => charRectOf(chars[a])[0] - charRectOf(chars[b])[0])
+          .map((i) => chars[i].c)
+          .join('')
+          .replace(/\s+/g, ' ')
+          .slice(0, 26),
+      }));
+    } catch {
+      /* 诊断失败不影响功能 */
+    }
   }
   open.length = 0;
   open.push(...splitLines);
@@ -788,6 +879,7 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
   if (cached && cached.key === key) return { blocks: cached.blocks };
 
   const chars = model.chars;
+  (window as unknown as Record<string, unknown>).__litshelfPageNo = model.pageIndex + 1;
   const lines = buildLines(chars);
   const widths = chars
     .map((c) => c.rect[2] - c.rect[0])
