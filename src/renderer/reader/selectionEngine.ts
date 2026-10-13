@@ -311,9 +311,29 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
    * ⚠️ 我原来的写法是"≥3 行就算缝"，于是第 4 页的表格列缝（8~18 行）全部混进来，
    * 真正的正文栏缝反而淹没在里面（实测第 4 页仍出现 `528字[142..955]` 这种横跨两栏的块）。
    */
-  const seams = [...seamVotes.entries()]
+  const seamCandidates = [...seamVotes.entries()]
     .filter(([, v]) => v.n >= 3 && (v.hi - v.lo) / rowSpan >= 0.6)
-    .map(([at]) => at);
+    .map(([at, v]) => ({ at, span: (v.hi - v.lo) / rowSpan, n: v.n }));
+  /**
+   * ## **硬边界只取"最主导的那一条缝"**
+   *
+   * 这是这一轮才想通的关键（前面几轮都错在"把所有缝都当硬边界"）：
+   *   · 第 4 页有表格 → 表格列缝很多（实测筛出 **18 条**）；
+   *   · 正文行横跨 `142..955`，**它跨过了全部 18 条缝** → 任何"按缝切开"的 pass
+   *     都切不动它（切一刀它还跨着另外 17 条）→ 最终块仍然是 `528字[142..955]`。
+   *
+   * 而真正把页面分成两栏的只有**一条**缝 —— 纵向跨度最大、贯穿整段正文的那条。
+   * 所以：只保留"纵向跨度 ≥ 最长那条的 80%"的缝当硬边界；
+   * 其余的（表格列缝）不参与块的分栏，但**行内切分照旧会用它们把单元格切开**。
+   */
+  let seams: number[] = [];
+  if (seamCandidates.length) {
+    const maxSpan = Math.max(...seamCandidates.map((s) => s.span));
+    seams = seamCandidates
+      .filter((s) => s.span >= maxSpan * 0.8)
+      .map((s) => s.at)
+      .sort((a, b) => a - b);
+  }
 
   /**
    * ## 判据二：**按纵向分带**找缝（判据一的**兜底**，不是并列）
@@ -390,7 +410,7 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): number[] {
    * 实测：两个判据"合并"会在第 1 页检出 11 条缝（假缝淹没真缝）；
    * "判据一优先、判据二兜底"则在第 2 页检出 2 条、第 4 页检出 1 条（都是对的）。
    */
-  if (seams.length) return seams.sort((a, b) => a - b);
+  if (seams.length) return seams;
   const bandGutters = [...found.entries()]
     .filter(([, votes]) => votes >= 2)
     .map(([at]) => at);
