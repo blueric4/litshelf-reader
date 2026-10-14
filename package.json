@@ -3,6 +3,8 @@
   "productName": "文献架 LitShelf",
   "version": "1.0.0",
   "private": true,
+  "license": "MIT",
+  "author": "blueric4",
   "type": "module",
   "description": "文献架 LitShelf —— 本地文献阅读与管理软件：扫描你的文献文件夹，在软件内直接阅读 PDF，文件夹变了软件内自动跟着变。",
   "main": "dist/main/index.mjs",
