@@ -1233,6 +1233,23 @@ export function ReaderView(): React.ReactElement | null {
 
         {isPdf ? (
           <div className="rd-page-jump">
+            {/*
+              上一页 / 下一页按钮。
+              为什么补这两个：这个工具栏原来**只有页码输入框**（没有翻页箭头），
+              用户的原话是"必须点缩略图才能到那一页" —— 缩略图是唯一的图形化跳页入口。
+              这两个按钮走同一个 goToPage，键盘/输入框的行为不变。
+            */}
+            <button
+              type="button"
+              className="icon-btn rd-page-step"
+              title="上一页（↑ / PageUp）"
+              disabled={page <= 1}
+              onClick={() => viewerRef.current?.goToPage(Math.max(1, page - 1))}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m15 6-6 6 6 6" />
+              </svg>
+            </button>
             <input
               className="rd-page-input"
               value={pageInput}
@@ -1249,6 +1266,17 @@ export function ReaderView(): React.ReactElement | null {
               onBlur={() => setPageInput(String(page))}
             />
             <span className="rd-page-total">/ {totalPages || '—'}</span>
+            <button
+              type="button"
+              className="icon-btn rd-page-step"
+              title="下一页（↓ / PageDown）"
+              disabled={!totalPages || page >= totalPages}
+              onClick={() => viewerRef.current?.goToPage(Math.min(totalPages, page + 1))}
+            >
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="m9 6 6 6-6 6" />
+              </svg>
+            </button>
           </div>
         ) : (
           <span className="rd-page-total">{item.kind === 'epub' ? 'EPUB' : formatBytes(item.size)}</span>

@@ -124,7 +124,7 @@ try {
   await sleep(1200);
 
   // 库是否加载（打包后路径/资源有问题的话这里就空了）
-  const snap = await cdp.eval(`(async () => { const s = await window.litshelf.invoke('getSnapshot', []); return { items: s.items.length, roots: s.roots.length, version: s.app?.version ?? '?' }; })()`);
+  const snap = await cdp.eval(`(async () => { const s = await window.litshelf.invoke('getSnapshot', []); return { items: s.items.length, roots: s.roots.length, version: s.version ?? '?' }; })()`);
   console.log(`  库：条目 ${snap.items} / 库 ${snap.roots} / 版本 ${snap.version}`);
   check(snap.items > 0, `库加载正常（${snap.items} 条）`);
 
@@ -188,10 +188,19 @@ try {
     }
     await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: anchor.x, y: anchor.y + 48, button: 'left', buttons: 0, clickCount: 1 });
     await sleep(900);
-    const sel = await cdp.eval('(window.getSelection()?.toString() || "").length');
+    /**
+     * ⚠️ 必须读**引擎自己的选区**，不能读 `window.getSelection()`。
+     *
+     * 划词已由自研引擎接管（Zotero 式）：文本层设了 `user-select: none`，选区是引擎自绘的
+     * （`.rd-sel-overlay` 里的 `.sel-line`），剪贴板也由引擎自己写。
+     * 因此**原生选区按设计就是空的** —— 继续读 `window.getSelection()` 会永远得到 0 字，
+     * 把"测试脚本过时"误报成"打包版划词坏了"（真机实测：工具条能弹出，说明拖拽其实被正确处理了）。
+     */
+    const sel = await cdp.eval('(window.__litshelfEngineSel && window.__litshelfEngineSel.text ? window.__litshelfEngineSel.text.length : 0)');
+    const lines = await cdp.eval(`document.querySelectorAll('.rd-sel-overlay .sel-line').length`);
     const tb = await cdp.eval(`document.querySelectorAll('[class*="sel-toolbar"]').length`);
-    console.log(`  拖选：${sel} 字，工具条 ${tb} 个`);
-    check(sel > 0, `拖选能选中文字（${sel} 字）`);
+    console.log(`  拖选：引擎选中 ${sel} 字 / ${lines} 条高亮，工具条 ${tb} 个`);
+    check(sel > 0 || lines > 0, `拖选能选中文字（引擎 ${sel} 字 / ${lines} 条高亮）`);
     check(tb > 0, '划词工具条出现');
   }
 

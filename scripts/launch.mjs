@@ -25,6 +25,48 @@ function exists(rel) {
   return fs.existsSync(path.join(ROOT, rel));
 }
 
+/** 目录里最新的 mtime（拿不到返回 0） */
+function newestMtime(dir) {
+  let newest = 0;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      newest = Math.max(newest, newestMtime(full));
+      continue;
+    }
+    try {
+      newest = Math.max(newest, fs.statSync(full).mtimeMs);
+    } catch {
+      /* 竞争删掉了就算了 */
+    }
+  }
+  return newest;
+}
+
+/**
+ * 源码是否比产物新：`src/` 或构建相关配置比 `dist/` 新 → 需要重建。
+ * 见 main() 里这段的注释（为什么不能只看"产物在不在"）。
+ */
+function distIsStale() {
+  const newestSource = Math.max(
+    newestMtime(path.join(ROOT, 'src')),
+    ...['package.json', 'vite.config.ts', 'tsconfig.json'].map((rel) => {
+      try {
+        return fs.statSync(path.join(ROOT, rel)).mtimeMs;
+      } catch {
+        return 0;
+      }
+    }),
+  );
+  return newestSource > newestMtime(path.join(ROOT, 'dist'));
+}
+
 async function main() {
   log('');
   log('  ============================================');
@@ -54,7 +96,15 @@ async function main() {
     }
   }
 
-  if (!exists('dist/main/index.mjs') || !exists('dist/renderer/index.html')) {
+  /**
+   * 构建判定：**产物缺失，或者源码比产物新**都要重建。
+   *
+   * 为什么不能只看"产物在不在"（踩过）：改了 `src/` 之后双击启动器，它会因为 `dist/` 存在而
+   * **直接跳过构建**，于是打开的还是旧代码 —— 用户以为"改了没生效"，排查半天才发现跑的是旧产物。
+   * 构建只要几百毫秒，判断一次源文件 mtime 完全值得。
+   */
+  const needsBuild = !exists('dist/main/index.mjs') || !exists('dist/renderer/index.html') || distIsStale();
+  if (needsBuild) {
     log('  [2/3] 正在构建（第一次会慢一点）…');
     const code = await run(process.execPath, ['scripts/build.mjs']);
     if (code !== 0) {

@@ -569,11 +569,29 @@ html[data-theme='dark'] .rd-root[data-reader-theme='light'] {
   user-select: text;
 }
 
-.rd-pdf-page.is-adjacent {
-  opacity: 0.55;
-  filter: saturate(0.9);
+/**
+ * 页面在"非连续"布局下的呈现。
+ *
+ * ## 单页模式：相邻页只预渲染，不显示
+ *
+ * 单页模式下当前页被撑满整个阅读区，预渲染的相邻页就贴在它左右两侧
+ * （实测：当前页 x 0..1179，上一页 -1191..-12，阅读区宽 1401）——
+ * 只要缩放小一点（页宽 < 阅读区宽的一半），**三页会同时出现在屏幕上**
+ * （用户实测反馈："单页模式我能看到三页"）。相邻页的唯一作用是预渲染
+ * （切页不闪白），所以单页模式下不占位、不绘制。
+ *
+ * ## ⚠️ 为什么必须用 `.rd-pdf-scroll.is-single` 限定作用域
+ *
+ * 我第一版把这条写成全局的 `.rd-pdf-page.is-adjacent { display: none }`，
+ * 结果**双页模式也被打回单页**：双页模式下"当前页 + 下一页"这对里，
+ * 下一页的 className 同样是 `is-adjacent`
+ * （渲染代码是 `pageNumber === currentPage ? 'is-current' : 'is-adjacent'`），
+ * 于是双页模式的第二页被隐藏了（用户实测反馈："双页模式又成单页模式了"）。
+ * 所以只在 `is-single` 下隐藏 —— 双页模式必须照旧显示两页。
+ */
+.rd-pdf-scroll.is-single .rd-pdf-page.is-adjacent {
+  display: none;
 }
-
 .rd-pdf-page.is-current {
   box-shadow: var(--rd-shadow-page);
 }

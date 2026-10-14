@@ -9,6 +9,7 @@
  * 浏览器形态（src/server/index.ts）实现同一套语义，二者必须保持一致。
  */
 import path from 'node:path';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { stat } from 'node:fs/promises';
 import { BrowserWindow, app, clipboard, dialog, ipcMain, shell } from 'electron';
 import type { Host } from '../core/host';
@@ -307,6 +308,23 @@ const HANDLERS: Record<string, Handler> = {
   // ---- 撤销 ----
   // Host.undo(name) 目前只按名字匹配撤销栈；payload 由渲染层保留，宿主暂不使用。
   undo: ({ host }, [name]) => host.undo(str(name)),
+
+  /**
+   * **只写诊断文件**（把渲染层的内部结构 dump 到 tmp/sel-harness/）。
+   *
+   * 为什么需要它：调试划词时，"模型内部的行/块结构"这种大对象经 CDP 返回会被截断成
+   * undefined（我为此白查过好几轮）；写文件没有大小限制。
+   * 安全边界：只允许写到 `<cwd>/tmp/sel-harness/` 下、只接受 .json 文件名，
+   * 不读文件、不执行任何东西。
+   */
+  writeDiag: (_ctx, [name, json]) => {
+    const safeName = str(name).replace(/[^A-Za-z0-9._-]/g, '');
+    if (!safeName.endsWith('.json')) return { ok: false, error: '只允许 .json' };
+    const dir = path.join(process.cwd(), 'tmp', 'sel-harness');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, safeName), str(json), 'utf8');
+    return { ok: true, file: path.join(dir, safeName) };
+  },
 };
 
 /** 供主进程与调试使用：当前白名单覆盖的方法名 */

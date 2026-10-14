@@ -157,6 +157,48 @@ export function bandItemsFromItems(
 }
 
 /**
+ * 把文本项的基线原点平移到页面可视区（`page.view` = [x0, y0, x1, y1]）的左下角。
+ *
+ * 为什么必须做：CropBox/MediaBox 的左下角不一定是 (0, 0)（真实 CNKI 论文 x0≈28、y0≈14）。
+ * pdf.js 的 viewport 会把它减掉再缩放，所以 DOM 里的 span 坐标 = (e - x0) × scale；
+ * 若直接拿原始 e 算栏带，整套栏带会整体右移 x0×scale（实测约 54px），span 一落进"栏外"
+ * 的桶就被排到整页的最后，夹取与重排全部错位。
+ */
+export function itemsInViewSpace(items: readonly PdfTextItemLike[], view: ArrayLike<number> | null | undefined): PdfTextItemLike[] {
+  const x0 = num(view?.[0], 0);
+  const y0 = num(view?.[1], 0);
+  if (!x0 && !y0) return [...items];
+  return items.map((it) => {
+    const tf = it?.transform;
+    if (!tf || tf.length < 6) return it;
+    return { ...it, transform: [tf[0], tf[1], tf[2], tf[3], Number(tf[4]) - x0, Number(tf[5]) - y0] };
+  });
+}
+
+/**
+ * 每个文本项在页面上的横向范围（PDF 用户空间、未缩放），与入参**同序一一对应**。
+ * 几何与 bandItemsFromItems 一致（旋转项投到 x 轴上），但**不丢项**：拿不到几何的项返回 null。
+ * 夹取端点时用它判"这个字整段在哪一栏"，不再用 DOM 的 rect 判。
+ */
+export function itemXRangesFromItems(items: readonly PdfTextItemLike[] | null | undefined): ({ x0: number; x1: number } | null)[] {
+  return (items ?? []).map((it) => {
+    const tf = it?.transform;
+    if (!tf || tf.length < 6) return null;
+    const a = Number(tf[0]);
+    const b = Number(tf[1]);
+    const e = Number(tf[4]);
+    if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(e)) return null;
+    const rawW = Math.abs(num(it.width, 0));
+    const rawH = Math.abs(num(it.height, 0));
+    const theta = Math.atan2(b, a);
+    const sin = Math.abs(Math.sin(theta));
+    const w = sin > 0.05 ? rawW * Math.abs(Math.cos(theta)) + rawH * sin : rawW;
+    if (!(w > 0)) return null;
+    return { x0: e, x1: e + w };
+  });
+}
+
+/**
  * 找栏缝：x 方向上**在多数 y 带上都没有正文**的通道，且缝的左右两侧都在多个 y 带上都有正文。
  *
  * 三个约束缺一不可（都是真实页面逼出来的）：
@@ -316,8 +358,8 @@ export interface BandRegion {
   full: boolean;
 }
 
-/** 一行（y 行带）的横向跨度是否算"横跨整幅" */
-const DEFAULTS_WIDE_ROW_RATIO = 0.6;
+/** 一行（y 行带）的横向跨度是否算"横跨整幅"（**从严**：0.8，见下方注释） */
+const DEFAULTS_WIDE_ROW_RATIO = 0.8;
 
 /**
  * 把页面按 y 切成若干**版式一致**的区域，每个区域各给一套栏带。
@@ -452,6 +494,33 @@ export function columnRegionsFromItems(
     cur.rows.push(k);
   }
   flush();
+  /**
+   * 通栏判定**从严**（用户反馈的关键）：只有"真通栏段落"才允许不夹取。
+   *
+   * 夹在多栏段之间的**孤立宽行**（双栏正文里的通栏小标题、表格行、图注行）不算通栏区：
+   * 它的上下都是多栏文字，把它当通栏会让夹取在这几行上失效（实测案例研究那篇 p6/p9 整页被选中）。
+   * 处理：把这种"薄"的全宽区降级为非通栏，并沿用相邻多栏区的栏带。
+   */
+  for (let i = 0; i < regions.length; i += 1) {
+    const r = regions[i];
+    if (!r.full) continue;
+    const thin = r.bottom - r.top <= rowSize * 3;
+    if (!thin) continue;
+    /**
+     * **只有"夹在两段多栏之间"的孤立宽行才降级**（上下都必须是多栏区）。
+     *
+     * 只要求"有一个多栏邻居"是不够的：论文第 1 页的**整幅标题/作者/摘要块**也是薄的宽区，
+     * 它下面紧跟双栏正文 —— 那种页面会把标题区也降级成多栏，于是在**本来就横跨整幅**的
+     * 标题行上横向拖选被硬性夹成一小段（实测 `acceptance-columns` 的 [1b]：通栏区拖选只出
+     * 3 字 / x 覆盖 40px，还打出了"选区跨栏，已夹回…"日志；交接文档 §3.2 明确要求
+     * "该分区只有一条栏带 → 不夹"）。
+     * 顶部/底部贴着页面内容边缘的宽区（`regions[0]` / `regions[n-1]`）一律保持通栏。
+     */
+    const prevR = regions[i - 1];
+    const nextR = regions[i + 1];
+    if (!prevR || !nextR || prevR.full || nextR.full) continue;
+    regions[i] = { top: r.top, bottom: r.bottom, full: false, bands: prevR.bands };
+  }
   return regions.filter((r) => r.bands.length > 0);
 }
 

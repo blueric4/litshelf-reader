@@ -153,3 +153,25 @@
 | 刚加完库打开很慢（十几秒） | 宿主抽取正文时每页让出宏任务，别饿死主进程 I/O | 首次打开 15–25s → 约 150ms |
 | 文内搜索输入完没反应 | 边打边搜（防抖 300ms）+ 建索引提示 | 不按回车即得命中 |
 | 打开第 3 页却是空白（阅读位置恢复） | 当前页判定改看所有页槽位；当前页必须在渲染集合里 | 标签 3/4、该页正常渲染 |
+
+---
+
+## 调试钩子（只读，可随时删）
+
+`src/renderer/reader/selectionEngine.ts` 里留了几个挂在 `window` 上的**只读观测钩子**，用于自动化验收和现场排查。
+它们**不影响功能**（不改变几何、不改变选区结果），只在划词/建块时写入几个数组供外部读取。
+如果觉得碍事，可以直接删掉对应的 `if (typeof window !== 'undefined') { ... }` 块：
+
+| 钩子 | 用途 |
+|---|---|
+| `__litshelfBlocks()` | **验收钩子（建议保留）**：返回每页的分块结构（字数/行数/左右边界），自动化验收读它 |
+| `__litshelfEngineSel` | 当前选区（引擎自绘的选区状态），运行时探针 |
+| `__litshelfEnginePages` | 引擎当前"看到"的页数；用于诊断"按下没反应"（值 < 实际页数 = 页表缺页） |
+| `__litshelfWhy2` / `__litshelfSplitWhy` / `__litshelfSplitPath` / `__litshelfSplitSample` | 逐行切分决策记录（阈值/间隙/切点），排查"栏缝没切开" |
+| `__litshelfGaps` / `__litshelfLines` / `__litshelfLinesPage` | 归行后的行与间隙 dump（注意 `__litshelfLinesPage` 是**全局单值**，跨页读会串页） |
+| `__litshelfMerge` | 块合并观测（每次合并尝试的两侧范围与栏缝数） |
+| `__litshelfGutterInfo` / `__litshelfPageGutters` | 栏缝检测结果（位置 + 生效的 y 范围） |
+| `__litshelfStripDiag` / `__litshelfRowDiag` / `__litshelfCoordCheck` / `__litshelfGroupDiag` | 早期排查用的行/块/坐标 dump |
+
+另有一个宿主侧调试通道：`writeDiag(name, json)`（`src/main/ipc.ts`）——**只允许写 `tmp/sel-harness/<name>.json`**，
+不读文件、不执行任何东西；渲染层用它把模型内部结构落盘（CDP 返回值有大小限制，大对象会被截断成 `undefined`）。

@@ -1,5 +1,87 @@
 # 交接文档：划词"禁止跨栏"的残留泄漏怎么修
 
+> ⚠️ **2026-10 更新：本文档 §2/§3/§4 描述的"自研夹取"路线已经被整体替换。**
+> 现在划词走的是 **Zotero reader 的字符模型路线**（照抄 `zotero/reader` 的真实实现），
+> 见下面 §-1。§2 及之后的内容**只作为历史取证记录**保留（那些数字仍然有价值：它们是"为什么不能
+> 用几何判据夹栏"的证据），但**不要再按 §3 的处方改代码**。
+
+---
+
+## -1. 现行架构（Zotero 式划词）——先读这一节
+
+用户的结论是："选取问题一直解决不了，直接照抄 Zotero 的代码"。所以这一版把 §2/§3 那套
+"拖动中改锚点 + 按 DOM span 的 rect 判栏归属 + 松手后锁 0.7~2.5 秒看护"整段删掉了。
+
+### 文件分工（新增 5 个文件，都在 `src/renderer/reader/`）
+
+| 文件 | 对应 Zotero 的 | 干什么 |
+|---|---|---|
+| `zoteroSelection.ts` | `src/pdf/selection.js` | 字符模型上的 range 计算（rectsDist / getClosestOffset / getRangeByPosition / getRangeByRects / getSelectionRanges / getModifiedSelectionRanges / getWordSelectionRanges …） |
+| `selectionFlow.ts` | `src/pdf/selection-flow.mjs` + `native-text-selection-map.mjs` | 归一化单位对齐（`alignTextUnits` / `buildReaderUnitMap` / `getNormalizedUnits`）、DOM↔字符 的 `TextLayerBoundaryMap`、栏流隔离 `isolateCharsToAnchorFlow` |
+| `selectionModel.ts` | `pdf-document-data.mjs` 给的 `chars`（Zotero 在 worker 里抽）+ `page.js` | 把 pdf.js 的文本项 + 栏带变成**字符模型**（`ZoteroChar[]`，每个字符带 rect / inlineRect / lineBreakAfter / flowClass） |
+| `selectionKernel.ts` | `src/pdf/native-text-selection.js` | 划词内核：读原生选区的两个端点 → 映射进模型 → **跨栏硬禁止**（收窄到锚点栏流）→ 只写一次 `setBaseAndExtent` |
+| `selectionTypes.ts` | — | 上面四块之间的**冻结接口**（纯类型 + rectsDist / quickIntersectRect / getCenterRect） |
+
+接线在 `PdfViewer.tsx`：`PdfPage` 在"文本层挂好 + 重排完"之后建模型并 `onSelectionModel` 上报；
+父级拿着内核在 `mouseup` / `selectionchange`（非拖动中）时收一次选区，矩形与文字**都从模型算**。
+
+### ⚠️ 首轮交付"一项都不符合"的三个真因（都已修，务必别再犯）
+
+第一版交付**构建通过、292 个单测全过、我自己以为没问题**，但用户拿真实论文一验：一项都不符合。
+三个真因都是"接线细节"，没有任何一个能被 tsc / 单测发现 —— 所以下面每一条都配了**取证方式**：
+
+| # | 真因 | 症状 | 现在怎么保证 |
+|---|---|---|---|
+| ① | **页号基准错位**：`.rd-pdf-page[data-page-index]` 是 **1 起**，模型是 **0 起**；`selectionModelsRef` 用 1 起存、内核用 0 起取 → `resolveDomPosition` 永远 null | 夹取**一次都没运行过** | 模型映射表统一 0 起键；`PdfViewer` 里三处换算都写了注释 |
+| ② | **span 与文本项配错**：pdf.js `TextLayer#processItems` 对**每个 `str !== undefined` 的项**都建 span（**空串项也建**，只是没文字）。按"非空 str"配对 → 每页差 2 个 → 模型每页 null | 整篇夹取全失效（13 页里 12 页模型都建不出来） | 配对判据与 pdf.js 同源（`str !== undefined`，空串项贡献 0 字符）；`span:not(.markedContent)` 且**保留空串 span** |
+| ③ | **一个病项废掉整页**：个别文本项没有可用 transform/尺寸，原来的 `itemGeometry` 返回 null 就**整页不建模型** | p1 有 1221 个正常项 + 1 个病项 → 整页不可选 | 建字符时用 `strict = false`：病项给一个退化盒子，只影响它自己的字符位置 |
+
+**取证工具（别再只靠 tsc + 单测）**：`tmp/diag-paper/probe.mjs`（+ `bundle.mjs.config.mjs` + `probe-tail.mjs`）。
+它用**真实 PDF** 把整条链路跑一遍（jsdom 造页面 DOM，与产品同参取文本项），三项都判：
+
+```powershell
+node tmp/diag-paper/bundle.mjs.config.mjs                  # 把真实源码打成 bundle
+node tmp/diag-paper/probe.mjs "<真实论文.pdf>"              # ① 建模率 ② 对齐 ③ 跨栏探针
+```
+
+实测这一篇（`在危机冲击中组织韧性如何影响制造业企业可持续发展`，13 页）：
+`模型建成 13/13 页；对齐 13/13 页；跨栏探针 10/10 页停在栏缝`。
+
+> 另一个教训：探针的**判据**比探针本身更容易错。第一版探针用"夹取后文字里是否含栏 2 的某个字"
+> 判泄漏 —— 而「的 / 一 / 了」两栏都有，于是把**正确的夹取**报成"仍跨栏"，白折腾半天。
+> 正确判据是**字符区间**：夹取后两端下标必须都落在"锚点流的连续区间"内。
+
+### 这一版的三条硬规矩（改代码请遵守）
+1. **拖动交给浏览器，我们只在选区成型后收窄端点。** 历史上"拖动中逐帧改写选区"的实现
+   与浏览器打架，快拖时会出现 1~3 字碎选区（commit 8cce94a）。
+2. **跨栏判据是离散的**：看"这个字符属于哪条栏流（`flowClass`）"，**不是**看
+   "x 有没有越过栏带上界"。因为两端对齐的中文会把行末单字推进栏缝（实测 `「连」` 在
+   `[595~613]` 而栏缝是 `555~595`），几何判据必然在栏缝里来回跳。
+3. **单栏页整页同一条栏流。** 单栏页被切成多条流，纵向拖过行间距就会被误夹
+   （历史上"行间距拖 31 字 → 2 字"就是这么来的）。
+
+### 与 Zotero 的唯一差异
+
+Zotero 的 `isolateCharsToAnchorFlow()` 在两端 `flowClass` 不同时返回 `null`（语义：这是一次
+跨流选择，保留用户完整的扫动）。多栏 PDF 里那个 `null` 正好就是用户抱怨的"选区越过栏缝"，
+所以本产品改成：两端不同流时**收窄到锚点那一栏**（`selectionFlow.ts` 里有注释说明）。
+
+### 验收（与旧版不同，注意）
+
+- `node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit` → 必须 exit 0；
+- `node scripts/build.mjs` → 必须成功（产物在 `dist/`）；
+- 手感/跨栏的**真实验收请在真机上跑**（用户明确要求由他来验证）。
+- `tools/col-scan.mjs`（旧门槛）里的"栏带模型"是脚本自己用 DOM span 的 y 覆盖率独立算的，
+  与本版内核的"字符 flowClass"不是同一套判据，跑出来的数字**需要重新校准**，
+  不要把它当成本版的通过标准（它的历史价值见 §2 的取证）。
+
+---
+
+> ⚠️ 以下 §0~§7 是**旧路线**的记录（自研夹取）。保留原因：§2 的真因（CropBox 原点、栏缝里的
+> 行末字、口径坑）至今仍然是有效证据，§5 的环境坑（Electron 单实例、dist 是共用产物、
+> 别用 PowerShell 改源码）也仍然适用。
+
+
 > 写给下一个接手的人/模型。**先读这一页，再动代码**。本文件记录：现状、真因（带数字）、处方（改哪个函数/什么判据）、
 > 验收门槛（必须全绿才能发布）、以及所有踩过的坑。仓库：`D:\dsh\litshelf`。
 
@@ -21,6 +103,29 @@
 ---
 
 ## 2. 真因（三条，全部有原始数据支撑）
+
+> **更正（2026-10-11，以本段为准）**：下面 §2.1 / §2.2 的原诊断被后续取证推翻，保留原文仅供追溯。
+>
+> **真因：栏带坐标没有减去页面原点。** 真实 CNKI 论文的 `page.view` 左下角是 (28.35, 14.17)（CropBox 偏移），
+> pdf.js 渲染时会减掉它（`viewport.transform` 的平移量就是 -28.35），而产品的 `columnBands` / `columnRegions`
+> 直接用了原始 `transform[4]/[5]`。结果整套栏带、分区、重排的比例都整体偏移约 54px（x0×scale）：
+> - 栏 1 的右界被算成 PDF x≈317 ≈ 像素 612 —— 这**就是**"右端停在 613"的来源。613 不是 span 归属的问题，而是栏带边界本身；
+>   `「连」[595~613]` 在真实版式里本来就是栏 2 的开头字（栏 2 从 594 起）。
+> - 栏内靠左的 span 落进"栏外"的桶，被排到整页末尾 —— 这**就是**症状 A（苏敬勤 p6 栏 1 选中 1913 字）的来源，
+>   **不是**页面级开关。
+>
+> **修复（已落地）**：
+> 1. `columnBands.ts::itemsInViewSpace()`：把文本项平移到 `page.view` 原点，分区与栏带都只用它的输出；
+> 2. `PdfViewer.tsx`：取文本项的参数与 TextLayerBuilder 完全一致（`TEXT_LAYER_PARAMS = { includeMarkedContent: true, disableNormalization: true }`）。
+>    参数不一致时文本项数量对不上（实测 1438 vs 1392），span 序号与文本项序号错位；
+> 3. 打标只对 `str` 非空的文本项做：pdf.js 的 `#appendText` 只给 `hasText` 为真的项挂 span。
+>
+> **验证（苏敬勤 p6 栏 1，同一拖动）**：修复前 `1913 字 rect=2102 越界 995`；修复后 `256 字 rect=367 越界 0`。
+> 全量 `col-scan`：修复前 22 处失败（16 处越界 + 6 处 0 字），修复后 14 处（7 处越界 + 7 处 0 字）。
+> 其中 7 处"越界"已逐页核对为 **col-scan 自身模型的误报**：模型算出的栏带比产品栏带窄（如宁德时代 p2 模型栏 1 为 171~523，
+> 产品为 143~555），而选区全部落在产品栏带之内；这一点见 §4 的"已知限制"。
+
+### 2.0 原诊断（已被上面的更正推翻，仅供追溯）
 
 ### 2.1 页面级开关（本轮引入的回归，已在 wip 分支修掉）
 上一版为修混排页（整幅摘要 + 双栏正文）加了"按 y 分区"，其中带了一条**页面级结论**：
@@ -141,3 +246,11 @@ node tools/acceptance-columns.mjs                                     # 期望 2
   做法：确认要推的提交 diff 与**提交信息**都干净；必要时把若干提交 `git reset --soft origin/main` 压成一个再提交（本仓库做过一次）。
 - 上传 Release 附件用 `git credential fill` 在内存里取 token，**不打印、不落盘**；替换附件时先删旧再传新，避免同名两个 zip。
 - 打包：`node tools/make-portable.mjs` → `D:\dsh\文献架整合`；自检 `tools/smoke-portable.mjs`（13/13）+ 真实论文探针（8/8，确认只读）。
+
+
+---
+
+## 最新（引擎接管版）
+
+划词已改为**由 selectionEngine 接管**，不再使用浏览器原生选区。
+详见 `docs/划词引擎接管说明.md`。
