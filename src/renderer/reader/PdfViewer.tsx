@@ -290,8 +290,10 @@ export interface PdfViewerProps {
   searchQuery: string;
   /** 点搜索命中后自增，触发高亮重算 */
   searchVersion: number;
-  /** 当前命中在整篇里的序号（0 起） */
+  /** 当前命中在整篇里的序号（0 起，**按"处"计**） */
   searchActiveIndex: number;
+  /** 每页命中数（有序），用于把全局命中序号映射成"某页第几处" */
+  searchPageCounts: { page: number; count: number }[];
   onSearchHitCounts?: (counts: Map<number, number>) => void;
   onPageMaps: (maps: Map<number, PageTextMap>) => void;
   /** 右键菜单命令：菜单只负责回调，具体执行在 ReaderView */
@@ -1280,6 +1282,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     searchQuery,
     searchVersion,
     searchActiveIndex,
+    searchPageCounts,
     onSearchHitCounts,
     onPageMaps,
     onContextCommand,
@@ -1378,9 +1381,15 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     },
     [onPageMaps],
   );
+  /**
+   * 页面文本层就绪版本号：切页/重绘后文本层是**异步**就绪的，
+   * 搜索高亮重算必须等它就绪 —— 否则跳页后高亮要等到下一次无关状态变化才出现（用户观感：找不到）。
+   */
+  const [layerVersion, setLayerVersion] = useState(0);
   const registerSearchLayer = useCallback((page: number, root: HTMLElement | null, container: HTMLElement | null) => {
     if (root && container) layersRef.current.set(page, { root, container });
     else layersRef.current.delete(page);
+    setLayerVersion((v) => v + 1);
   }, []);
   const onPageElement = useCallback((page: number, el: HTMLElement | null) => {
     if (el) pageEls.current.set(page, el);
@@ -1459,7 +1468,29 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [searchQuery, searchVersion, renderSetKey, uniformScale, containerSize.width]);
+  }, [searchQuery, searchVersion, renderSetKey, uniformScale, containerSize.width, layerVersion]);
+
+  /**
+   * 把**当前命中**滚进视野。
+   *
+   * 没有这一步时：点"下一处"只会翻到对应页，但页面内部的命中位置可能在视野外
+   * （长页尤其中文期刊页很高），用户看到的就是"跳了页、可是根本找不到在哪"。
+   */
+  useEffect(() => {
+    if (!searchQuery.trim() || searchActiveIndex < 0) return;
+    const timer = window.setTimeout(() => {
+      const scroller = scrollRef.current;
+      if (!scroller) return;
+      const cur = scroller.querySelector<HTMLElement>('.rd-search-hit.is-current');
+      if (!cur) return;
+      const r = cur.getBoundingClientRect();
+      const s = scroller.getBoundingClientRect();
+      const margin = 48;
+      if (r.top >= s.top + margin && r.bottom <= s.bottom - margin) return; // 已在视野内
+      cur.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+    }, 80);
+    return () => window.clearTimeout(timer);
+  }, [searchQuery, searchActiveIndex, stripsByPage, layerVersion]);
 
   useEffect(() => {
     onSearchHitCounts?.(hitCounts);
@@ -1470,12 +1501,15 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     (page: number) => {
       if (!searchQuery.trim() || searchActiveIndex < 0) return -1;
       let head = 0;
-      for (let p = 1; p < page; p += 1) head += hitCounts.get(p) ?? 0;
+      for (const item of searchPageCounts) {
+        if (item.page < page) head += item.count;
+        else break;
+      }
       const local = searchActiveIndex - head;
-      const count = hitCounts.get(page) ?? 0;
+      const count = searchPageCounts.find((item) => item.page === page)?.count ?? 0;
       return local >= 0 && local < count ? local : -1;
     },
-    [searchQuery, searchActiveIndex, hitCounts],
+    [searchQuery, searchActiveIndex, searchPageCounts],
   );
 
   // -------- 滚动 -> 当前页 / 进度 --------
@@ -1829,6 +1863,8 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       }
       layerByPageRef.current.set(page, layer);
       pageResizeObserverRef.current?.observe(layer.pageEl);
+      // 文本层就绪 → 通知搜索高亮重算（跳页/重绘后没有这个信号，高亮会一直空着）
+      setLayerVersion((v) => v + 1);
       scheduleEngineRefresh();
     },
     [scheduleEngineRefresh],

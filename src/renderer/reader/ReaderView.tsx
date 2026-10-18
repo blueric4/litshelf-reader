@@ -38,6 +38,8 @@ interface PendingSelection {
 interface SearchHit {
   page: number;
   snippet: string;
+  /** 这一页有多少处命中（页面级列表按页显示，但"第 n / N 处"按**命中数**计数） */
+  count: number;
 }
 
 interface ViewerHandle {
@@ -629,7 +631,8 @@ export function ReaderView(): React.ReactElement | null {
         }
         const hits: SearchHit[] = [];
         text.pages.forEach((pageText, index) => {
-          if (countHits(pageText, query) > 0) hits.push({ page: index + 1, snippet: snippetAround(pageText, query) });
+          const count = countHits(pageText, query);
+          if (count > 0) hits.push({ page: index + 1, snippet: snippetAround(pageText, query), count });
         });
         setSearchHits(hits);
         setSearchActive(hits.length ? 0 : -1);
@@ -643,6 +646,41 @@ export function ReaderView(): React.ReactElement | null {
     [item, isPdf, pushToast],
   );
 
+  /** 总命中数（按"处"计，不是按页） */
+  const searchTotal = useMemo(() => searchHits.reduce((sum, h) => sum + h.count, 0), [searchHits]);
+
+  /** 每页命中数（传给 PdfViewer，把"第 n 处"映射成"某页的第几处"） */
+  const searchHitCounts = useMemo(() => searchHits.map((h) => ({ page: h.page, count: h.count })), [searchHits]);
+
+  /** 第 n 处命中落在哪一页、是这一页的第几处（0 起） */
+  const hitAt = useCallback(
+    (index: number): { page: number; local: number } | null => {
+      let head = 0;
+      for (const hit of searchHits) {
+        if (index < head + hit.count) return { page: hit.page, local: index - head };
+        head += hit.count;
+      }
+      return null;
+    },
+    [searchHits],
+  );
+
+  /** 某一页的第一处命中在全局里的序号（点侧栏某页时用） */
+  const firstHitIndexOfPage = useCallback(
+    (page: number): number => {
+      let head = 0;
+      for (const hit of searchHits) {
+        if (hit.page === page) return head;
+        head += hit.count;
+      }
+      return 0;
+    },
+    [searchHits],
+  );
+
+  /** 当前命中所在页（侧栏列表按页高亮） */
+  const searchActivePage = searchActive >= 0 ? (hitAt(searchActive)?.page ?? -1) : -1;
+
   const openSearch = useCallback(() => {
     setSearchOpen(true);    window.requestAnimationFrame(() => {
       const input = document.querySelector<HTMLInputElement>('.rd-search-panel input');
@@ -653,13 +691,13 @@ export function ReaderView(): React.ReactElement | null {
 
   const stepSearch = useCallback(
     (delta: number) => {
-      if (!searchHits.length) return;
-      const next = (searchActive + delta + searchHits.length) % searchHits.length;
+      if (!searchTotal) return;
+      const next = (searchActive + delta + searchTotal) % searchTotal;
       setSearchActive(next);
-      const hit = searchHits[next];
-      if (hit) viewerRef.current?.goToPage(hit.page);
+      const at = hitAt(next);
+      if (at) viewerRef.current?.goToPage(at.page);
     },
-    [searchHits, searchActive],
+    [searchTotal, searchActive, hitAt],
   );
 
   /**
@@ -1550,7 +1588,7 @@ export function ReaderView(): React.ReactElement | null {
                 </svg>
               </button>
               <span className="rd-search-count">
-                {searchLoading ? '查找中…' : searchHits.length ? `${searchActive + 1} / ${searchHits.length} 处` : searchQuery ? '没有命中' : ''}
+                {searchLoading ? '查找中…' : searchTotal ? `${searchActive + 1} / ${searchTotal} 处` : searchQuery ? '没有命中' : ''}
               </span>
             </div>
             <div className="rd-search-list">
@@ -1558,13 +1596,13 @@ export function ReaderView(): React.ReactElement | null {
                 <button
                   key={`${hit.page}-${index}`}
                   type="button"
-                  className={`rd-search-hitrow${index === searchActive ? ' is-on' : ''}`}
+                  className={`rd-search-hitrow${hit.page === searchActivePage ? ' is-on' : ''}`}
                   onClick={() => {
-                    setSearchActive(index);
+                    setSearchActive(firstHitIndexOfPage(hit.page));
                     viewerRef.current?.goToPage(hit.page);
                   }}
                 >
-                  <span className="rd-search-page">P{hit.page}</span>
+                  <span className="rd-search-page">P{hit.page}{hit.count > 1 ? ` ×${hit.count}` : ''}</span>
                   <span className="rd-search-snippet">{hit.snippet}</span>
                 </button>
               ))}
@@ -1628,6 +1666,7 @@ export function ReaderView(): React.ReactElement | null {
                 searchQuery={searchQuery}
                 searchVersion={searchVersion}
                 searchActiveIndex={searchActive}
+                searchPageCounts={searchHitCounts}
                 onSearchHitCounts={setHitCounts}
                 onPageMaps={handlePageMaps}
               />
