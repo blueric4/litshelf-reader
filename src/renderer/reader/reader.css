@@ -24,10 +24,30 @@
 }
 
 .rd-root[data-reader-theme='sepia'] {
-  --rd-stage-bg: #f3ece0;
+  --rd-stage-bg: #efe7d8;
   --rd-page-bg: #fbf6ec;
   --rd-page-line: rgba(120, 90, 40, 0.16);
   --rd-shadow-page: 0 1px 2px rgba(90, 70, 40, 0.1), 0 8px 22px rgba(90, 70, 40, 0.1);
+
+  /* 阅读器的 UI 也一起走暖色（侧栏 / 搜索 / 批注卡 / 菜单），否则只有边框变色、纸还是白的 */
+  --bg: #efe7d8;
+  --bg-elevated: #f7f0e3;
+  --card: #f7f0e3;
+  --card-hover: rgba(120, 90, 40, 0.08);
+  --toolbar-bg: rgba(251, 246, 236, 0.82);
+  --text: #3b3427;
+  --text-2: #6f6757;
+  --text-3: #8a8172;
+  --line: rgba(120, 90, 40, 0.16);
+  --line-strong: rgba(120, 90, 40, 0.28);
+  --accent: #8a6a2a;
+  --accent-soft: rgba(138, 106, 42, 0.14);
+  color-scheme: light;
+}
+
+/* 护眼：画布轻微 sepia（白纸 → 米色，黑字 → 深褐），比纯白刺眼小 */
+.rd-root[data-reader-theme='sepia'] .rd-pdf-canvas {
+  filter: sepia(0.18) saturate(0.94) brightness(1.01);
 }
 
 .rd-root[data-reader-theme='dark'] {
@@ -36,6 +56,67 @@
   --rd-page-line: rgba(255, 255, 255, 0.08);
   --rd-shadow-page: 0 1px 2px rgba(0, 0, 0, 0.5), 0 10px 28px rgba(0, 0, 0, 0.45);
   --rd-blend: normal;
+
+  /**
+   * ## 阅读器 UI 一起走深色
+   *
+   * 这些是**全局调色板 token**（tokens.css 里由 html[data-theme] 定义）。
+   * 阅读主题原来只覆盖了 `--rd-*` 的几个底色 → 侧栏、搜索面板、批注卡、菜单
+   * 仍拿全局的浅色 token，结果夜里只有页面周围"一圈黑"、侧栏和纸还是白的（用户原话：
+   * "就那么一圈是黑的，这不是扯淡吗"）。
+   * 这里在 `.rd-root` 内部局部覆盖，**只影响阅读器**，不动应用其它界面。
+   */
+  --bg: #161618;
+  --bg-elevated: #232326;
+  --sidebar-bg: rgba(22, 22, 24, 0.82);
+  --card: #232326;
+  --card-hover: rgba(255, 255, 255, 0.06);
+  --toolbar-bg: rgba(24, 24, 26, 0.82);
+  --text: #f2f2f5;
+  --text-2: #a1a1a8;
+  --text-3: #8e8e93;
+  --line: rgba(255, 255, 255, 0.1);
+  --line-strong: rgba(255, 255, 255, 0.18);
+  --shadow-pop: 0 12px 34px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --accent: #0a84ff;
+  --accent-hover: #3a9bff;
+  --accent-soft: rgba(10, 132, 255, 0.18);
+  --selection: rgba(10, 132, 255, 0.22);
+  --hl-yellow: rgba(255, 214, 10, 0.32);
+  --hl-green: rgba(48, 209, 88, 0.28);
+  --hl-blue: rgba(10, 132, 255, 0.3);
+  --hl-pink: rgba(255, 55, 95, 0.28);
+  --hl-purple: rgba(191, 90, 242, 0.3);
+  color-scheme: dark;
+}
+
+/**
+ * 夜晚模式让**纸也变暗**：PDF 画布反色。
+ *
+ * - 文字页：白底黑字 → 黑底白字；
+ * - 图表/彩色内容：`hue-rotate(180deg)` 抵消反色的色相翻转，颜色基本保持原色相；
+ * - 已知代价：PDF 里的**照片会变负片**（反色模式的通行取舍，与 Zotero 一致）。
+ *
+ * 只作用在画布上：文本层是透明的、划词/批注/搜索高亮都画在 DOM 层里，不受反色影响。
+ */
+.rd-root[data-reader-theme='dark'] .rd-pdf-canvas {
+  filter: invert(1) hue-rotate(180deg);
+}
+
+/* 深色纸上的划词高亮：原来的 32% 蓝在黑底上偏暗，提亮一些 */
+.rd-root[data-reader-theme='dark'] .rd-sel-layer .sel-line {
+  background: rgba(80, 160, 255, 0.42);
+}
+
+/* 深色纸上的搜索命中：黄底在黑底上要更实一点才看得清 */
+.rd-root[data-reader-theme='dark'] .rd-search-hit {
+  background: rgba(255, 204, 0, 0.32);
+  box-shadow: inset 0 0 0 1px rgba(255, 204, 0, 0.6);
+}
+.rd-root[data-reader-theme='dark'] .rd-search-hit.is-current {
+  background: rgba(255, 149, 0, 0.5);
+  box-shadow: inset 0 0 0 1.5px rgba(255, 149, 0, 0.95);
 }
 
 html[data-theme='dark'] .rd-root[data-reader-theme='light'] {
