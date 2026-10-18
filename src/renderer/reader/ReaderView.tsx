@@ -1205,29 +1205,82 @@ export function ReaderView(): React.ReactElement | null {
 
   return (
     <div className="rd-root" data-reader-theme={themeAttr} ref={stageRef}>
-      <header className="rd-toolbar">
+      <header className={`rd-toolbar${pending ? ' is-selecting' : ''}`}>
         <button type="button" className="icon-btn rd-back" title="返回文献库（Esc）" onClick={closeReader}>
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <path d="m14 6-6 6 6 6" />
           </svg>
         </button>
-        <div className="rd-title" title={item.title || item.name}>
-          <div className="rd-title-main">{item.title || item.name}</div>
-          <div className="rd-title-sub">{subtitle(item)}</div>
-        </div>
-        <button
-          type="button"
-          className={`icon-btn${item.starred ? ' is-star' : ''}`}
-          title={item.starred ? '取消星标' : '加星标'}
-          onClick={() => void toggleStar()}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill={item.starred ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
-            <path d="m12 4 2.4 4.9 5.4.8-3.9 3.8.9 5.4-4.8-2.5-4.8 2.5.9-5.4L4.2 9.7l5.4-.8z" />
-          </svg>
-        </button>
-        <button type="button" className="rd-state" title="切换阅读状态" onClick={() => void cycleReadState()}>
-          {{ unread: '未读', reading: '在读', read: '已读' }[item.readState]}
-        </button>
+        {/*
+          划词时：顶部栏中间这一段**顶替成划词工具条**（标题 / 星标 / 阅读状态暂时让位）。
+          为什么不是浮动工具条：用户实测"浮在选区上方会挡住正文，很烦"，
+          而且它压住的那块文字选不中（工具条会截获指针）。
+          右侧的页码 / 缩放 / 视图等控件保持不动，取消选区后自动恢复。
+        */}
+        {pending ? (
+          <SelectionToolbar
+            text={pending.text}
+            color={settings.annotationColor}
+            onColor={(color: HighlightColor) => void updateSettings({ annotationColor: color })}
+            onAnnotate={(type) => {
+              if (type === 'note') {
+                const rect = pending.pageEl.getBoundingClientRect();
+                void createAnnotation({
+                  type: 'note',
+                  page: pending.page,
+                  rects: [
+                    {
+                      x: Math.max(0, Math.min(0.97, (pending.rect.right - rect.left) / rect.width)),
+                      y: Math.max(0, Math.min(0.97, (pending.rect.top - rect.top) / rect.height)),
+                      w: 0.02,
+                      h: 0.02,
+                    },
+                  ],
+                  text: pending.text,
+                  anchor: pending.anchor,
+                  comment: '',
+                });
+                return;
+              }
+              // 工具条只给这四种；bookmark 走独立入口（工具栏的加书签按钮），这里防御性忽略
+              if (type === 'bookmark') return;
+              annotateSelection(type);
+            }}
+            onCopy={() => {
+              void copyText(pending.text).then((ok) =>
+                pushToast({ kind: ok ? 'success' : 'warn', message: ok ? '已复制' : '复制失败', ttl: 1600 }),
+              );
+              setPending(null);
+            }}
+            onSearch={() => {
+              setSearchInput(pending.text);
+              setSearchOpen(true);
+              void runSearch(pending.text, { jump: true });
+              setPending(null);
+            }}
+            onClose={() => setPending(null)}
+          />
+        ) : (
+          <>
+            <div className="rd-title" title={item.title || item.name}>
+              <div className="rd-title-main">{item.title || item.name}</div>
+              <div className="rd-title-sub">{subtitle(item)}</div>
+            </div>
+            <button
+              type="button"
+              className={`icon-btn${item.starred ? ' is-star' : ''}`}
+              title={item.starred ? '取消星标' : '加星标'}
+              onClick={() => void toggleStar()}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill={item.starred ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round">
+                <path d="m12 4 2.4 4.9 5.4.8-3.9 3.8.9 5.4-4.8-2.5-4.8 2.5.9-5.4L4.2 9.7l5.4-.8z" />
+              </svg>
+            </button>
+            <button type="button" className="rd-state" title="切换阅读状态" onClick={() => void cycleReadState()}>
+              {{ unread: '未读', reading: '在读', read: '已读' }[item.readState]}
+            </button>
+          </>
+        )}
 
         <span className="rd-toolbar-gap" />
 
@@ -1300,28 +1353,31 @@ export function ReaderView(): React.ReactElement | null {
 
         {isPdf ? (
           <>
-            <button
-              type="button"
-              className={`rd-chip${fit === 'fit-width' ? ' is-on' : ''}`}
-              title="适应宽度（Ctrl+0）"
-              onClick={() => {
-                setFit('fit-width');
-                void updateSettings({ defaultZoom: 'fit-width' });
-              }}
-            >
-              适宽
-            </button>
-            <button
-              type="button"
-              className={`rd-chip${fit === 'fit-page' ? ' is-on' : ''}`}
-              title="适应页面"
-              onClick={() => {
-                setFit('fit-page');
-                void updateSettings({ defaultZoom: 'fit-page' });
-              }}
-            >
-              适页
-            </button>
+            {/* 包一层容器：划词时窗口很窄要隐藏这两个，靠 CSS 的 .is-selecting 规则按宽度取舍 */}
+            <span className="rd-fit-chips">
+              <button
+                type="button"
+                className={`rd-chip${fit === 'fit-width' ? ' is-on' : ''}`}
+                title="适应宽度（Ctrl+0）"
+                onClick={() => {
+                  setFit('fit-width');
+                  void updateSettings({ defaultZoom: 'fit-width' });
+                }}
+              >
+                适宽
+              </button>
+              <button
+                type="button"
+                className={`rd-chip${fit === 'fit-page' ? ' is-on' : ''}`}
+                title="适应页面"
+                onClick={() => {
+                  setFit('fit-page');
+                  void updateSettings({ defaultZoom: 'fit-page' });
+                }}
+              >
+                适页
+              </button>
+            </span>
             <div className="rd-seg" role="group" aria-label="页面布局">
               {(['single', 'double', 'continuous'] as const).map((mode) => (
                 <button
@@ -1555,10 +1611,6 @@ export function ReaderView(): React.ReactElement | null {
                   viewerRef.current = handle;
                 }}
                 onZoom={(value) => {
-                  if (value === -1) {
-                    setFit(fit === 'fit-width' ? 'fit-page' : 'fit-width');
-                    return;
-                  }
                   applyZoom(value);
                 }}
                 onPageChange={setPage}
@@ -1712,52 +1764,6 @@ export function ReaderView(): React.ReactElement | null {
       </div>
 
       {/* 快捷键面板由 App 层渲染（文献库与阅读器共用），这里不再单独挂一个 */}
-      {pending ? (
-        <SelectionToolbar
-          anchor={pending.rect}
-          text={pending.text}
-          color={settings.annotationColor}
-          onColor={(color: HighlightColor) => void updateSettings({ annotationColor: color })}
-          onAnnotate={(type) => {
-            if (type === 'note') {
-              const rect = pending.pageEl.getBoundingClientRect();
-              void createAnnotation({
-                type: 'note',
-                page: pending.page,
-                rects: [
-                  {
-                    x: Math.max(0, Math.min(0.97, (pending.rect.right - rect.left) / rect.width)),
-                    y: Math.max(0, Math.min(0.97, (pending.rect.top - rect.top) / rect.height)),
-                    w: 0.02,
-                    h: 0.02,
-                  },
-                ],
-                text: pending.text,
-                anchor: pending.anchor,
-                comment: '',
-              });
-              return;
-            }
-            // 工具条只给这四种；bookmark 走独立入口（工具栏的加书签按钮），这里防御性忽略
-            if (type === 'bookmark') return;
-            annotateSelection(type);
-          }}
-          onCopy={() => {
-            void copyText(pending.text).then((ok) =>
-              pushToast({ kind: ok ? 'success' : 'warn', message: ok ? '已复制' : '复制失败', ttl: 1600 }),
-            );
-            setPending(null);
-          }}
-          onSearch={() => {
-            setSearchInput(pending.text);
-            setSearchOpen(true);
-            void runSearch(pending.text, { jump: true });
-            setPending(null);
-          }}
-          onClose={() => setPending(null)}
-        />
-      ) : null}
-
       {selectedAnn ? (
         <AnnotationCard
           annotation={selectedAnn.annotation}

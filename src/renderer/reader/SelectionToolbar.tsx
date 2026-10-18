@@ -1,21 +1,21 @@
 /**
  * 划词工具条 + 已有批注卡片。
- * 工具条浮在选区上方（空间不够就翻到下方），颜色取 5 个高亮色。
+ *
+ * ## 工具条为什么改成了"顶部栏里的一行"
+ *
+ * 用户的原话：浮在选区上方的工具条"一划就挡在正文上，很烦、不实用"。
+ * 它还会挡住正文里的字 —— 想选工具条下面的文字时会被工具条截获（已知缺陷）。
+ *
+ * 现在：划词时它**并进顶部的 `.rd-toolbar` 那一行**（顶替"标题 + 星标 + 在读"），
+ * 不跟随选区、不覆盖正文、不改变页面布局。选中文字的内容**不再显示**（用户要求去掉）。
+ * 文字只保留在无障碍属性里（`已选中 N 字`），视觉上只有按钮。
  */
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Annotation, AnnotationRect, AnnotationType, HighlightColor } from '@shared/types';
 import { HIGHLIGHT_COLORS } from '@shared/types';
 
-export interface ToolbarAnchor {
-  /** 相对视口的选区包围盒 */
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-}
-
 export interface SelectionToolbarProps {
-  anchor: ToolbarAnchor;
+  /** 选中的文字：**不再显示**，只用于无障碍提示（title/aria-label） */
   text: string;
   color: HighlightColor;
   onColor: (color: HighlightColor) => void;
@@ -24,9 +24,6 @@ export interface SelectionToolbarProps {
   onSearch: () => void;
   onClose: () => void;
 }
-
-const TOOLBAR_W = 372;
-const TOOLBAR_H = 42;
 
 const TOOLS: { type: AnnotationType; label: string; icon: React.ReactElement }[] = [
   {
@@ -82,7 +79,6 @@ const TOOLS: { type: AnnotationType; label: string; icon: React.ReactElement }[]
 ];
 
 export function SelectionToolbar({
-  anchor,
   text,
   color,
   onColor,
@@ -91,20 +87,7 @@ export function SelectionToolbar({
   onSearch,
   onClose,
 }: SelectionToolbarProps): React.ReactElement {
-  const ref = useRef<HTMLDivElement | null>(null);
-  const [pos, setPos] = useState({ left: anchor.left, top: anchor.top - TOOLBAR_H - 10 });
   const [paletteOpen, setPaletteOpen] = useState(false);
-
-  useLayoutEffect(() => {
-    const el = ref.current;
-    const width = el?.offsetWidth ?? TOOLBAR_W;
-    const height = el?.offsetHeight ?? TOOLBAR_H;
-    const centerX = (anchor.left + anchor.right) / 2;
-    const left = Math.min(Math.max(8, centerX - width / 2), Math.max(8, window.innerWidth - width - 8));
-    let top = anchor.top - height - 10;
-    if (top < 8) top = Math.min(window.innerHeight - height - 8, anchor.bottom + 10);
-    setPos({ left, top });
-  }, [anchor]);
 
   useEffect(() => {
     if (!paletteOpen) return;
@@ -113,14 +96,8 @@ export function SelectionToolbar({
     return () => window.removeEventListener('pointerdown', close, true);
   }, [paletteOpen]);
 
-  const preview = text.length > 26 ? `${text.slice(0, 26)}…` : text;
-
   return (
-    <div className="rd-sel-toolbar" ref={ref} style={{ left: pos.left, top: pos.top }} role="toolbar" aria-label="划词操作">
-      <div className="rd-sel-quote" title={text}>
-        {preview}
-      </div>
-      <span className="rd-sel-sep" />
+    <div className="rd-sel-toolbar" role="toolbar" aria-label={`划词操作（已选中 ${text.length} 字）`} title={`已选中 ${text.length} 字`}>
       <button
         type="button"
         className="rd-sel-color"

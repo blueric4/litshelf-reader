@@ -135,7 +135,7 @@ function AnnotationsPanel({
       <div className="rd-panel-empty">
         <div className="rd-empty-title">还没有批注</div>
         <div className="rd-empty-desc">
-          在正文里划一段文字，上方会弹出工具条：高亮、下划线、波浪线、写批注都可以。
+          在正文里划一段文字，顶部栏会变成标注工具条：高亮、下划线、波浪线、写批注都可以。
           {searchOpen ? '' : ' 也能用工具条的搜索按钮在文内查找。'}
         </div>
       </div>

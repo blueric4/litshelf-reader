@@ -459,106 +459,6 @@ function getPrevLineClosestOffset(chars: ZoteroChar[], offset: number): number |
   return closestOffset;
 }
 
-/** 词组/行组的字符区间（上行半开）：`[anchorOffset, headOffset)` */
-interface WordRange {
-  anchorOffset: number;
-  headOffset: number;
-}
-
-/**
- * Zotero 的字符带 `wordBreakAfter`（"这个字之后是一个词的边界"）；冻结的 `ZoteroChar` 里没有声明它
- * （契约里只有 `lineBreakAfter` / `paragraphBreakAfter` / `spaceAfter`）。这里做结构化读取：
- * 模型构建方（`selectionModel.ts`）只要在字符对象上多挂一个 `wordBreakAfter`，双击选词就走 Zotero 原路径。
- */
-function hasWordBreakAfter(char: ZoteroChar): boolean {
-  return (char as ZoteroChar & { wordBreakAfter?: boolean }).wordBreakAfter === true;
-}
-
-/**
- * 对应 Zotero `selection.js::getClosestWord`。
- *
- * 按 `wordBreakAfter` 把字符切成词，取和 `rect` 距离最近的**整个词**：
- * 词矩形是这个词所有字符 `inlineRect` 的并集，距离用 `rectsDist`；严格小于才更新（平局取前面的词）。
- *
- * 【与 Zotero 的差异，仅限"没有词边界元数据"时】上游假设 `wordBreakAfter` 一定存在，
- * 一个都没有时会返回 `{anchorOffset: undefined, headOffset: NaN}`（那个返回值传给
- * `getSelectionRanges` 会直接抛异常）。本模型可能不提供这个词边界，所以这里返回 null，
- * 由 `getWordSelectionRanges` 决定退路（退回上游的 `getClosestLine`）。有元数据时逐字一致。
- */
-function getClosestWord(chars: ZoteroChar[], rect: [number, number, number, number]): WordRange | null {
-  let closestWordStart: number | undefined;
-  let closestWordEnd: number | undefined;
-  let closestWordDistance: number | null = null;
-  let start = 0;
-  for (let i = 0; i < chars.length; i++) {
-    let char = chars[i];
-    if (hasWordBreakAfter(char)) {
-      let end = i;
-      let wordChars = chars.slice(start, end + 1);
-      let wordRect: [number, number, number, number] = [
-        Math.min(...wordChars.map(x => x.inlineRect[0])),
-        Math.min(...wordChars.map(x => x.inlineRect[1])),
-        Math.max(...wordChars.map(x => x.inlineRect[2])),
-        Math.max(...wordChars.map(x => x.inlineRect[3])),
-      ];
-      let distance = rectsDist(rect, wordRect);
-      if (closestWordDistance === null || distance < closestWordDistance) {
-        closestWordDistance = distance;
-        closestWordStart = start;
-        closestWordEnd = end;
-      }
-      start = end + 1;
-    }
-  }
-  if (closestWordStart === undefined || closestWordEnd === undefined) {
-    return null;
-  }
-  return {
-    anchorOffset: closestWordStart,
-    headOffset: closestWordEnd + 1
-  };
-}
-
-/**
- * 对应 Zotero `selection.js::getClosestLine`（三击选行 / 双击选词缺失词边界时的退路）。
- *
- * 与 `getClosestWord` 同构，只是按 `lineBreakAfter` 切行。
- * 【差异，仅限类型】上游在没有 `lineBreakAfter` 时同样返回 undefined 字段；这里返回 null。
- */
-function getClosestLine(chars: ZoteroChar[], rect: [number, number, number, number]): WordRange | null {
-  let closestLineStart: number | undefined;
-  let closestLineEnd: number | undefined;
-  let closestLineDistance: number | null = null;
-  let start = 0;
-  for (let i = 0; i < chars.length; i++) {
-    let char = chars[i];
-    if (char.lineBreakAfter) {
-      let end = i;
-      let lineChars = chars.slice(start, end + 1);
-      let lineRect: [number, number, number, number] = [
-        Math.min(...lineChars.map(x => x.inlineRect[0])),
-        Math.min(...lineChars.map(x => x.inlineRect[1])),
-        Math.max(...lineChars.map(x => x.inlineRect[2])),
-        Math.max(...lineChars.map(x => x.inlineRect[3])),
-      ];
-      let distance = rectsDist(rect, lineRect);
-      if (closestLineDistance === null || distance < closestLineDistance) {
-        closestLineDistance = distance;
-        closestLineStart = start;
-        closestLineEnd = end;
-      }
-      start = end + 1;
-    }
-  }
-  if (closestLineStart === undefined || closestLineEnd === undefined) {
-    return null;
-  }
-  return {
-    anchorOffset: closestLineStart,
-    headOffset: closestLineEnd + 1
-  };
-}
-
 /* ================================================================== *
  * 五、range → 落页的 selectionRange：Zotero `selection.js::extractRange(*)`
  * ================================================================== */
@@ -988,8 +888,7 @@ export function getTextFromSelectionRanges(selectionRanges: ResolvedSelectionRan
 }
 
 /* ================================================================== *
- * 八、键盘调整选区 / 双击选词：Zotero `selection.js::getModifiedSelectionRanges` /
- *     `getWordSelectionRanges`
+ * 八、键盘调整选区：Zotero `selection.js::getModifiedSelectionRanges`
  * ================================================================== */
 
 /**
@@ -1110,61 +1009,6 @@ export function getModifiedSelectionRanges(
   else if (typeof modifier === 'object') {
     let position = modifier;
     head = position;
-  }
-  return getSelectionRanges(pages, anchor, head);
-}
-
-/**
- * 对应 Zotero `selection.js::getWordSelectionRanges`（双击选词 / 双击拖选多个词）。
- *
- * 两端各自 `getClosestWord` 找到所在的**整个词**，再按"谁在前"决定：
- *   - 锚点词在焦点词之前（同页比较词首 / 跨页比较页号）→ `anchor = 锚点词首`、`head = 焦点词末`；
- *   - 否则 → `anchor = 锚点词末`、`head = 焦点词首`（反向拖选，方向保留在 anchor/head 里）。
- * 比较用的是 `anchorWord.anchorOffset <= headWord.anchorOffset`（**词首**之间比，不是词末），
- * 这个细节决定了从右往左双击拖时选区怎么写，照抄。
- *
- * 【与 Zotero 的差异，仅限"模型没提供词边界"时】冻结的 `ZoteroChar` 没有 `wordBreakAfter`，
- * 若模型也没挂这个字段，`getClosestWord` 返回 null → 这里退回上游的 `getClosestLine`（整行），
- * 而不是让双击选词彻底失效。模型一旦提供 `wordBreakAfter`，行为与上游逐字一致。
- */
-export function getWordSelectionRanges(
-  pages: (PageCharModel | null | undefined)[],
-  anchorPosition: { pageIndex: number; rects: [number, number, number, number][] },
-  headPosition: { pageIndex: number; rects: [number, number, number, number][] },
-): ResolvedSelectionRange[] {
-  // 【守卫，非算法改动】两端都要有矩形才能算词；上游假设调用方一定给了。
-  if (!anchorPosition.rects.length || !headPosition.rects.length) {
-    return [];
-  }
-  const anchorPage = pages[anchorPosition.pageIndex];
-  if (!anchorPage) {
-    return [];
-  }
-  let { chars } = anchorPage;
-  let anchorWord = getClosestWord(chars, anchorPosition.rects[0]) ?? getClosestLine(chars, anchorPosition.rects[0]);
-  const headPage = pages[headPosition.pageIndex];
-  // 【守卫，非算法改动】上游直接 `pdfPages[headPosition.pageIndex].chars`（假设页面在）；
-  // 冻结签名允许 null/undefined，这里返回空（= 这次不按模型纠正选区）。
-  if (!headPage) {
-    return [];
-  }
-  chars = headPage.chars;
-  let headWord = getClosestWord(chars, headPosition.rects[0]) ?? getClosestLine(chars, headPosition.rects[0]);
-  if (!anchorWord || !headWord) {
-    return [];
-  }
-  // 上游是 `let anchor = { pageIndex }; let head = { pageIndex };` 然后在分支里赋 offset；
-  // TS 要求先给初值，这里写 0（两个分支都会覆盖它，行为一致）。
-  let anchor: TextPosition = { pageIndex: anchorPosition.pageIndex, offset: 0 };
-  let head: TextPosition = { pageIndex: headPosition.pageIndex, offset: 0 };
-  if (anchorWord.anchorOffset <= headWord.anchorOffset && anchor.pageIndex === head.pageIndex
-      || anchor.pageIndex < head.pageIndex) {
-    anchor.offset = anchorWord.anchorOffset;
-    head.offset = headWord.headOffset;
-  }
-  else {
-    anchor.offset = anchorWord.headOffset;
-    head.offset = headWord.anchorOffset;
   }
   return getSelectionRanges(pages, anchor, head);
 }

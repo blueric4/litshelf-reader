@@ -2198,7 +2198,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
      * 实测会有"按下点明明在文字上、松手却是空选区"的情况，而命中与样式都正常。
      * 只在这种情况动手，而且只朝"按下点 → 松手点"这一条走：
      *   · 已经有非空选区 → 立刻放手；
-     *   · 按下/松手位移 < 6px（单击、双击选词、Shift+点击）→ 放手；
+     *   · 按下/松手位移 < 6px（单击、Shift+点击）→ 放手；
      *   · 两端必须落在同一页的文本层文字上，否则放手；
      *   · 构造出来的区间必须非空，否则放手。
      */
@@ -2481,7 +2481,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
         className={`rd-pdf-scroll is-${layout}`}
         ref={scrollRef}
         tabIndex={-1}
-        onDoubleClick={() => onZoom(-1)}
       >
         {!totalReady ? (
           <div className="rd-stage-center">
