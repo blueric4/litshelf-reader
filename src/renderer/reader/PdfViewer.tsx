@@ -1716,14 +1716,10 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   const layerByPageRef = useRef(new Map<number, { pageEl: HTMLElement; textLayer: HTMLElement }>());
   /** 引擎给的最后一次选区（模型坐标 + 客户端矩形） */
   const engineSelRef = useRef<EngineSelection | null>(null);
-
-  const handleLayer = useCallback((page: number, layer: { pageEl: HTMLElement; textLayer: HTMLElement } | null) => {
-    if (!layer) {
-      layerByPageRef.current.delete(page);
-      return;
-    }
-    layerByPageRef.current.set(page, layer);
-  }, []);
+  /** 页面尺寸观察器（要在页面重建后持续观测"新出现的"页面元素，见 handleLayer） */
+  const pageResizeObserverRef = useRef<ResizeObserver | null>(null);
+  /** 重算高亮的补偿定时器（rAF + 两拍延时；页面重建有 160ms 防抖 + 异步渲染） */
+  const engineRefreshTimersRef = useRef<number[]>([]);
 
   /** 引擎 → 产品：把引擎给的选区翻成工具条/批注要的形状（页内相对矩形 + 首行 client 矩形） */
   const reportEngineSelection = useCallback(
@@ -1787,14 +1783,60 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   }
 
   /**
-   * 引擎的鼠标接线：按下 → 移动（每帧）→ 松手。
+   * 让引擎按**当前几何**重算高亮。
    *
-   * ⚠️ **挂在 `document` 上（capture），不挂在滚动容器上**：我第一版挂
-   * `scrollRef.current?.parentElement`，结果 effect 执行时容器引用还是空的，
-   * 直接 `return` 了 —— 监听器一个都没挂上，产品里"拖动一个字都选不中"（真机实测）。
-   * 挂在 document 上没有挂载时机问题：引擎本来就靠 `pages()` 里的几何命中，
-   * 不需要知道自己挂在哪个 DOM 上。是否属于阅读器由 target 判定。
+   * 为什么需要"多拍补偿"：缩放走 160ms 防抖 → `renderScale` 更新 → 页面重新渲染（异步）→
+   * 文本层/页面元素尺寸才最终确定。只在事件当下算一次，拿到的可能还是旧几何
+   * （用户实测：放大后高亮停在页面上方的空白处，滚动一下才回到正确位置）。
    */
+  const scheduleEngineRefresh = useCallback(() => {
+    for (const t of engineRefreshTimersRef.current) window.clearTimeout(t);
+    engineRefreshTimersRef.current = [];
+    const run = (): void => {
+      engineRef.current?.refresh();
+    };
+    requestAnimationFrame(run);
+    for (const delay of [120, 450]) {
+      engineRefreshTimersRef.current.push(window.setTimeout(run, delay));
+    }
+  }, []);
+
+  /**
+   * 页面文本层就绪 / 重建 / 移除 —— 缩放、切换布局、换页都会走到这里。
+   *
+   * ⚠️ 这里必须**触发一次重算**：高亮画的是视口坐标，页面一重排就会整体错位；
+   * 而原来的 ResizeObserver 只观测"组件挂载那一刻已经存在的页面"，
+   * 打开文档时页面还没渲染，导致缩放/换布局根本不会触发重算（真机复现：
+   * 160% 选中后放大到 200%，页面下移 330px，高亮却停在原地、飘在页面上方）。
+   *
+   * 顺带把新出现的页面元素补进 ResizeObserver：页面后来重建时也能被观测到。
+   */
+  const handleLayer = useCallback(
+    (page: number, layer: { pageEl: HTMLElement; textLayer: HTMLElement } | null) => {
+      if (!layer) {
+        layerByPageRef.current.delete(page);
+        return;
+      }
+      layerByPageRef.current.set(page, layer);
+      pageResizeObserverRef.current?.observe(layer.pageEl);
+      scheduleEngineRefresh();
+    },
+    [scheduleEngineRefresh],
+  );
+
+  /** 缩放 / 布局 / DPR 变化后重算高亮（兜底：即使页面没重建也保证对一次） */
+  useEffect(() => {
+    scheduleEngineRefresh();
+  }, [uniformScale, layout, dprLive, scheduleEngineRefresh]);
+
+  /** 卸载时清掉补偿定时器 */
+  useEffect(() => {
+    return () => {
+      for (const t of engineRefreshTimersRef.current) window.clearTimeout(t);
+      engineRefreshTimersRef.current = [];
+    };
+  }, []);
+
   useEffect(() => {
     let dragging = false;
     const onDown = (ev: MouseEvent): void => {
@@ -1835,6 +1877,13 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
      *   2. `wheel`（Ctrl/⌘ + 滚轮缩放走这条）
      *   3. `window.resize`（窗口尺寸变化）
      *   4. `ResizeObserver`（阅读容器或页面元素尺寸变化 —— 换布局/缩放最可靠的一条）
+     *
+     * ⚠️ 第 4 条曾经是"半残"的：本 effect 只跑一次，而打开文档那一刻页面还没渲染出来，
+     * `scrollEl.querySelectorAll('.rd-pdf-page')` 是**空的** → 一个页面都没观测到 →
+     * 缩放/换布局不触发重算（真机复现：160% 选区在放大到 200% 后飘在页面上方）。
+     * 现在：观察器存进 `pageResizeObserverRef`，由 `handleLayer` 在**每个页面文本层就绪时**
+     * 补 `observe(pageEl)`；另外 `handleLayer` 和 `[renderScale, layout, dpr]` 也会主动
+     * 触发一次带补偿的重算（见 `scheduleEngineRefresh`）。
      */
     const refresh = (): void => {
       engineRef.current?.refresh();
@@ -1847,6 +1896,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     const scrollEl = scrollRef.current;
     if (typeof ResizeObserver !== 'undefined') {
       ro = new ResizeObserver(() => refresh());
+      pageResizeObserverRef.current = ro;
       // 观察滚动容器本身，以及它内部的页面元素（页面尺寸随缩放变化）
       if (scrollEl) {
         ro.observe(scrollEl);
@@ -1866,6 +1916,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
       document.removeEventListener('scroll', refresh, true);
       document.removeEventListener('wheel', onWheel, true);
       window.removeEventListener('resize', onResize);
+      if (pageResizeObserverRef.current === ro) pageResizeObserverRef.current = null;
       ro?.disconnect();
     };
   }, []);

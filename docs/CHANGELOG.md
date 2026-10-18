@@ -25,6 +25,21 @@
    - 附带：`Shift+点击` 的扩展路径要显式标成"选取中"，否则会被新的单击判定清掉（本轮回测抓到并修了）。
    - 文件：`src/renderer/reader/selectionEngine.ts`（begin/move/end）、`src/renderer/reader/PdfViewer.tsx`。
 
+5. **修：缩放 / 切换布局后，划词高亮"飘"在页面上方（与选中文字错位）**
+   - 用户反馈：放大/换布局后，蓝色选区条停在页面**上方的空白处**，和文字对不上。
+   - 根因：高亮层画的是**视口坐标**，只靠 `engine.refresh()` 重算；而它的 ResizeObserver 在组件挂载时
+     只观测"当时已存在的 `.rd-pdf-page`"——打开文档那一刻页面还没渲染，**一个都没观测到**，
+     之后也不补观测 → 缩放/换布局（单↔双↔连续）**从不触发重算**，旧坐标就留在原地。
+     （滚动会触发重算，所以"滚一下就好"；这就是用户看到的"飘着"。）
+   - 修复：
+     ① `PdfViewer.handleLayer`（页面文本层就绪/重建/删除都走它）→ 安排一次带补偿的重算（rAF + 120ms + 450ms）；
+     ② 新增 effect 依赖 `[uniformScale, layout, dprLive]`，缩放/布局/DPR 变化后同样重算；
+     ③ ResizeObserver 存进 ref，在 `handleLayer` 里对**新出现的页面元素**补 `observe`（持续观测）；
+     ④ `selectionEngine.refresh()` 在"锚点页暂时找不到"（重绘瞬间）时**保持选区不清空**，等下一页消息再算。
+   - 文件：`src/renderer/reader/PdfViewer.tsx`、`src/renderer/reader/selectionEngine.ts`。
+   - 验收（真实鼠标 + 截图，`tmp/sel-harness/shots-overlay-min/`）：选中一段邮箱/作者行 →
+     放大到 200%、300%、切双页、切单页，高亮均精确压在原文上（修复前 200% 就能看到蓝条飘在页面上方）。
+
 ### 验收（真实鼠标 + 截图）
 
 - 拖选后工具条在顶部栏内（`position` 非 fixed）、正文零遮挡、工具条不含文字预览；

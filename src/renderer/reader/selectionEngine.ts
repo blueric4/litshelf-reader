@@ -1671,13 +1671,17 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     current: () => selection,
     refresh() {
       overlayHost = deps.overlay();
-      // 尺寸可能变了（缩放）：分块缓存按尺寸失效；锚点要重新定位到新的块
+      /**
+       * ⚠️ 缩放 / 切换布局会**重排并重绘**页面：重绘的瞬间，本页的文本层可能被临时移除，
+       * `deps.pages()` 里找不到它。这时**绝不能调 `rebuild()`** —— 它会把选区清掉
+       * （用户表现：放大一下，刚选好的文字和顶部工具条一起消失）。
+       * 正确做法：保持现状，等页面回来后的下一次 refresh 再按新几何重算。
+       */
       if (anchor) {
         const page = deps.pages().find((p) => p.pageIndex === anchor?.pageIndex);
-        if (page) {
-          const { blocks } = blocksFor(page.model, page.pageEl);
-          anchor = { pageIndex: anchor.pageIndex, offset: anchor.offset, block: blockOfChar(blocks, anchor.offset) };
-        }
+        if (!page) return;
+        const { blocks } = blocksFor(page.model, page.pageEl);
+        anchor = { pageIndex: anchor.pageIndex, offset: anchor.offset, block: blockOfChar(blocks, anchor.offset) };
       }
       rebuild();
     },
