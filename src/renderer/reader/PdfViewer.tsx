@@ -340,6 +340,15 @@ interface PdfPageProps {
    */
   onSelectionModel?: (page: number, model: PageCharModel | null) => void;
   /**
+   * 缩放"手势期间"的预览变换系数（`scale / renderScale`）。
+   *
+   * 缩放时这一页的 canvas 与文本层会立刻做一次 CSS `scale(f)` 预览（见本组件内的
+   * "缩放手势期间的视觉反馈"注释）；高亮层是独立的 fixed 层，必须**套用同一个系数**，
+   * 缩放过程中才能看起来"黏在字上"，而不是等重绘完再跳到位。
+   * `f === 1` 表示预览结束、已按新尺寸重绘。
+   */
+  onZoomPreview?: (page: number, factor: number) => void;
+  /**
    * 这一页的 DOM 就绪（页面元素 + 文本层），交给父级的**选取引擎**。
    * 引擎按几何命中，需要的正是这两块；传 null 表示这一页被卸载了。
    */
@@ -375,6 +384,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     onBands,
     onSelectionModel,
     onLayer,
+    onZoomPreview,
   } = props;
 
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -440,8 +450,8 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
    * 会让整个 canvas + 文本层被拆掉重建；拖动过程中文本层节点被替换，原生选区的锚点随之失效，
    * 表现就是"选区莫名其妙乱选/整段选中"和"文本层间歇性一个 span 都没有"。
    */
-  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer });
-  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer };
+  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer, onZoomPreview });
+  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer, onZoomPreview };
 
   /**
    * 位图实际渲染用的 scale：缩放先防抖 160ms，停手后再重绘**一次**。
@@ -496,6 +506,11 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         text.style.height = '';
       }
     }
+    /**
+     * 把同一个预览系数通知父级：高亮层（fixed，独立于页面盒子）要跟着做同样的 `scale(f)`，
+     * 否则高亮只能等重绘完成后跳到位 —— 用户要的"像黏在字上"就是这一条。
+     */
+    cbRef.current.onZoomPreview?.(pageNumber, on ? f : 1);
   }, [scale, renderScale]);
 
   // 可见性上报
@@ -1726,6 +1741,12 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     (sel: EngineSelection | null) => {
       engineSelRef.current = sel;
       if (!sel) {
+        // 选区没了：把"缩放预览"留在高亮层上的变换清掉，避免残留缩放
+        const overlay = engineOverlayRef.current;
+        if (overlay) {
+          overlay.style.transform = '';
+          overlay.style.transformOrigin = '';
+        }
         if (lastSelectionRef.current) {
           lastSelectionRef.current = null;
           onSelectionRef.current(null);
@@ -1823,6 +1844,34 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     },
     [scheduleEngineRefresh],
   );
+
+  /**
+   * 缩放"手势期间"：让高亮层跟着页面的 CSS 预览缩放走（同一原点、同一系数），
+   * 缩放过程中高亮就**黏在字上**，而不是等重绘完再跳到位（用户要的 Word 手感）。
+   *
+   * 页面的 canvas 与文本层在 `PdfPage` 里做了 `transform: scale(scale / renderScale)`
+   * （transform-origin 是页面左上角）；高亮层是独立的 fixed 层，这里套用同一个变换：
+   * 原点取「选中页左上角的视口坐标」，系数用同一个 `f`。重绘完成后 `f === 1`，变换自动清空。
+   */
+  const applyZoomPreviewToOverlay = useCallback((pageNumber: number, factor: number) => {
+    const overlay = engineOverlayRef.current;
+    if (!overlay) return;
+    const reset = (): void => {
+      overlay.style.transform = '';
+      overlay.style.transformOrigin = '';
+    };
+    const sel = engineSelRef.current;
+    if (!sel || sel.pageIndex + 1 !== pageNumber) return; // 只管选中页的通知
+    if (Math.abs(factor - 1) <= 0.002) {
+      reset();
+      return;
+    }
+    const pageEl = layerByPageRef.current.get(pageNumber)?.pageEl;
+    if (!pageEl) return;
+    const r = pageEl.getBoundingClientRect();
+    overlay.style.transformOrigin = `${r.left}px ${r.top}px`;
+    overlay.style.transform = `scale(${factor})`;
+  }, []);
 
   /** 缩放 / 布局 / DPR 变化后重算高亮（兜底：即使页面没重建也保证对一次） */
   useEffect(() => {
@@ -2593,6 +2642,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
                     onLayer={handleLayer}
+                    onZoomPreview={applyZoomPreviewToOverlay}
                   />
                 ) : (
                   <div className="rd-page-ghost" data-page-index={pageNumber} aria-hidden />
@@ -2631,6 +2681,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
                     onLayer={handleLayer}
+                    onZoomPreview={applyZoomPreviewToOverlay}
                   />
                 );
               })}
