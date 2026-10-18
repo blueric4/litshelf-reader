@@ -1351,6 +1351,22 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
   let anchor: { pageIndex: number; offset: number; block: Block | null } | null = null;
   let head: { pageIndex: number; offset: number } | null = null;
   let selection: EngineSelection | null = null;
+  /**
+   * ## "按下还没开始拖"的状态（Word 式交互）
+   *
+   * 用户的反馈：点一下空白，它会把**最近的那一个字**选上（截图里点右侧空白，结果选中了左边的「。」），
+   * 期望是 Word 那样 —— **单击 = 清空选区，只有拖动才开始选**。
+   *
+   * 所以按下时**只记录候选锚点、不画选区**；指针位移超过 `DRAG_THRESHOLD` 才真正开始选。
+   * 松手时如果从未超过阈值（= 一次点击），什么都不选（按下时已经清过旧选区了）。
+   */
+  let pressAnchor: { pageIndex: number; offset: number; block: Block | null } | null = null;
+  let pressX = 0;
+  let pressY = 0;
+  /** 是否已经越过拖动阈值、正式进入"选取中" */
+  let selecting = false;
+  /** 拖动阈值（px）：小于它视为单击。和浏览器/Word 的手感一致（约 4~6px） */
+  const DRAG_THRESHOLD_SQ = 25;
   let overlayHost: HTMLElement | null = null;
   const highlights: HTMLElement[] = [];
 
@@ -1579,25 +1595,48 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
   const engine: SelectionEngine = {
     begin(clientX, clientY, extend = false) {
       const h = hit(clientX, clientY);
-      if (!h) {
-        if (!extend) engine.clear();
-        return false;
-      }
-      const { blocks } = blocksFor(h.page.model, h.page.pageEl);
-      const blk = blockOfChar(blocks, h.offset);
       if (extend && anchor && anchor.block) {
-        // Shift+点击：锚点不动，焦点挪到"锚点块内离指针最近的字"
+        // Shift+点击：锚点不动，焦点挪到"锚点块内离指针最近的字"（立即生效，不受拖动阈值影响）
+        if (!h) return false;
         head = { pageIndex: anchor.pageIndex, offset: nearestInBlock(anchor.block, h.page.model.chars, h.x, h.y) };
+        // ⚠️ 必须标成"选取中"：否则松手时 end() 会把它当成一次普通单击、把选区清掉
+        //（实测：Shift+点击后选区闪一下就没了）
+        selecting = true;
         rebuild();
         return true;
       }
-      anchor = { pageIndex: h.page.pageIndex, offset: h.offset, block: blk };
-      head = { pageIndex: h.page.pageIndex, offset: h.offset };
-      log('按下', { page: h.page.pageIndex, char: h.page.model.chars[h.offset]?.c, blockChars: blk ? blk.order.length : null });
-      rebuild();
+      /**
+       * 普通按下（Word 式）：
+       *   1. **先清空旧选区** —— 单击就是"取消选择"，不该残留上一次的选区；
+       *   2. 只记下候选锚点，**不画任何东西**；
+       *   3. 指针移动超过阈值（`move()` 里判断）才开始真正选。
+       */
+      anchor = null;
+      head = null;
+      pressAnchor = null;
+      selecting = false;
+      clearSelection();
+      if (!h) return false;
+      const { blocks } = blocksFor(h.page.model, h.page.pageEl);
+      pressAnchor = { pageIndex: h.page.pageIndex, offset: h.offset, block: blockOfChar(blocks, h.offset) };
+      pressX = clientX;
+      pressY = clientY;
+      log('按下（待拖动）', { page: h.page.pageIndex, char: h.page.model.chars[h.offset]?.c });
       return true;
     },
     move(clientX, clientY) {
+      // 还没进入"选取中"：先看位移是否超过阈值（单击 = 什么都不选）
+      if (!selecting) {
+        if (!pressAnchor) return;
+        const dx = clientX - pressX;
+        const dy = clientY - pressY;
+        if (dx * dx + dy * dy < DRAG_THRESHOLD_SQ) return;
+        selecting = true;
+        anchor = pressAnchor;
+        pressAnchor = null;
+        head = { pageIndex: anchor.pageIndex, offset: anchor.offset };
+        log('开始拖动', { page: anchor.pageIndex });
+      }
       if (!anchor || !anchor.block) return;
       const page = deps.pages().find((p) => p.pageIndex === anchor?.pageIndex);
       if (!page) return;
@@ -1608,11 +1647,25 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
       rebuild();
     },
     end() {
+      /**
+       * 松手：如果整个按下-松手过程都没超过拖动阈值（= 单击），
+       * 保持"没有选区"（按下时已清空）。拖动过的话选区已经在 `move()` 里定好了。
+       */
+      if (!selecting) {
+        anchor = null;
+        head = null;
+        pressAnchor = null;
+        clearSelection();
+      }
+      selecting = false;
+      pressAnchor = null;
       log('松手', selection ? { chars: selection.text.length, lines: selection.rects.length } : null);
     },
     clear() {
       anchor = null;
       head = null;
+      pressAnchor = null;
+      selecting = false;
       clearSelection();
     },
     current: () => selection,

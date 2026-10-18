@@ -1800,8 +1800,17 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     const onDown = (ev: MouseEvent): void => {
       if (ev.button !== 0) return;
       const target = ev.target as HTMLElement | null;
-      if (!target?.closest?.('.rd-pdf-page')) return; // 只在页面上开始
-      // 点空白也要能清选区：引擎 begin 返回 false 时会自己清
+      if (!target?.closest?.('.rd-pdf-page')) {
+        /**
+         * 点在**页面之外的阅读区空白**（页面四周的灰色区域）→ 清空选区，Word 式。
+         * 只认阅读区（`.rd-pdf-scroll / .rd-pdf-stage`）内的点击：
+         * 顶部栏的工具条按钮、侧栏、菜单都在阅读区之外，不能被这里的清理打断
+         * （否则"点高亮按钮"会先把 pending 清掉，按钮就点不了了）。
+         */
+        if (target?.closest?.('.rd-pdf-scroll, .rd-pdf-stage')) engineRef.current?.clear();
+        return;
+      }
+      // 页面内：引擎负责"单击清空 / 拖动才开始选"（begin 不再直接出选区）
       dragging = engineRef.current?.begin(ev.clientX, ev.clientY, ev.shiftKey) ?? false;
       if (!dragging) return;
       // 原生选区彻底不用了：清掉它，避免它和自绘高亮同时出现
