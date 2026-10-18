@@ -1183,6 +1183,16 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     };
   }, []);
 
+  /**
+   * 搜索高亮**只画当前命中**（方案 A，和"书签"同一个思路：页面不刷屏，全貌放侧栏列表）。
+   *
+   * 以前把该页所有命中都画成黄块（"资源编排"一篇 26 处，当前页就有 20+ 条），
+   * 页面很花、还和批注高亮混在一起。现在页面只留"当前跳到的那一处"（橙色 + 描边），
+   * 其余命中只在侧栏逐条列出，靠「下一处 / 上一处」或点列表定位（已有自动滚动）。
+   */
+  const currentStrips =
+    activeOffset >= 0 && strips ? strips.filter((s) => Number(s.key) === activeOffset) : [];
+
   return (
     <div
       ref={rootRef}
@@ -1235,12 +1245,12 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         </div>
       ) : null}
       {!painted ? <div className="rd-page-skeleton" aria-hidden /> : null}
-      {strips && strips.length ? (
+      {currentStrips.length ? (
         <div className="rd-search-layer" aria-hidden>
-          {strips.map((strip, idx) => (
+          {currentStrips.map((strip, idx) => (
             <span
               key={`${strip.key}-${idx}`}
-              className={`rd-search-hit${Number(strip.key) === activeOffset ? ' is-current' : ''}`}
+              className="rd-search-hit is-current"
               style={{
                 left: `${strip.left}%`,
                 top: `${strip.top}%`,
