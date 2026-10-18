@@ -209,24 +209,20 @@ const TEXT_LAYER_CSS = `
 }
 .rd-pdf-text ::selection { background: transparent; }
 /* 自绘高亮：一行一条（引擎按行合并后给出矩形）。
-   颜色刻意和批注高亮区分：这里是"正在选的文字"，批注是"已经存下来的"。 */
-.rd-sel-overlay .sel-line {
-  background: rgba(0, 122, 255, 0.32);
-  border-radius: 2px;
-}
-/* 高亮的"裁切壳"：铺满阅读区、不吃事件，把高亮限制在阅读区内（防止露到侧栏/工具栏/窗口外）。
-   注意：overflow:hidden 放在壳上（而不是高亮层自己身上），否则矩形会被按自身坐标系裁掉。 */
-.rd-sel-clip {
-  position: fixed;
-  inset: 0;
-  overflow: hidden;
-  pointer-events: none;
-  z-index: 40;
-}
-.rd-sel-overlay {
+   颜色刻意和批注高亮区分：这里是"正在选的文字"，批注是"已经存下来的"。
+
+   ⚠️ 高亮现在画在**每页内部**的 .rd-sel-layer（相对坐标，百分比定位），
+   和批注层同一套机制：缩放（页面的 CSS 预览缩放）、翻页、切换布局时它天然跟着页面/文字走，
+   不需要"重算 + 交接"，所以不会再出现"先飘走、再跳回"的闪烁。 */
+.rd-sel-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
+  z-index: 2;
+}
+.rd-sel-layer .sel-line {
+  background: rgba(0, 122, 255, 0.32);
+  border-radius: 2px;
 }
 /* 官方 pdf.js viewer 的"拖到空白"机制：文本层末尾放一个 .endOfContent，
    平时贴在文字下方（inset:100% 0 0）、不可选中；一旦这一层进入 selecting 状态就铺满整层。
@@ -338,16 +334,7 @@ interface PdfPageProps {
    * 这一页的**划词字符模型**建好了，交给父级的划词内核（见 selectionKernel.ts）。
    * 传 null 表示这一页暂时没有可用模型（文本层没了 / 取不到文本项）→ 内核放弃纠正。
    */
-  onSelectionModel?: (page: number, model: PageCharModel | null) => void;
-  /**
-   * 缩放"手势期间"的预览变换系数（`scale / renderScale`）。
-   *
-   * 缩放时这一页的 canvas 与文本层会立刻做一次 CSS `scale(f)` 预览（见本组件内的
-   * "缩放手势期间的视觉反馈"注释）；高亮层是独立的 fixed 层，必须**套用同一个系数**，
-   * 缩放过程中才能看起来"黏在字上"，而不是等重绘完再跳到位。
-   * `f === 1` 表示预览结束、已按新尺寸重绘。
-   */
-  onZoomPreview?: (page: number, factor: number) => void;
+  onSelectionModel?: (page: number, model: PageCharModel | null, size?: { w: number; h: number }) => void;
   /**
    * 这一页的 DOM 就绪（页面元素 + 文本层），交给父级的**选取引擎**。
    * 引擎按几何命中，需要的正是这两块；传 null 表示这一页被卸载了。
@@ -384,7 +371,6 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     onBands,
     onSelectionModel,
     onLayer,
-    onZoomPreview,
   } = props;
 
   const rootRef = useRef<HTMLDivElement | null>(null);
@@ -450,8 +436,8 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
    * 会让整个 canvas + 文本层被拆掉重建；拖动过程中文本层节点被替换，原生选区的锚点随之失效，
    * 表现就是"选区莫名其妙乱选/整段选中"和"文本层间歇性一个 span 都没有"。
    */
-  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer, onZoomPreview });
-  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer, onZoomPreview };
+  const cbRef = useRef({ onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer });
+  cbRef.current = { onMap, onDropMap, onFirstPaint, onStuck, onBands, onSelectionModel, onLayer };
 
   /**
    * 位图实际渲染用的 scale：缩放先防抖 160ms，停手后再重绘**一次**。
@@ -506,11 +492,6 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         text.style.height = '';
       }
     }
-    /**
-     * 把同一个预览系数通知父级：高亮层（fixed，独立于页面盒子）要跟着做同样的 `scale(f)`，
-     * 否则高亮只能等重绘完成后跳到位 —— 用户要的"像黏在字上"就是这一条。
-     */
-    cbRef.current.onZoomPreview?.(pageNumber, on ? f : 1);
   }, [scale, renderScale]);
 
   // 可见性上报
@@ -1012,7 +993,7 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
         spans: layer.querySelectorAll('span:not(.markedContent)').length,
         items: items.length,
       });
-      report(pageNumber, model);
+      report(pageNumber, model, { w: viewport.width, h: viewport.height });
       // 页面 DOM 就绪：把"页面元素 + 文本层"交给父级的选取引擎（引擎只按几何命中，不看 DOM 顺序）
       if (model) {
         const pageEl = rootRef.current;
@@ -1217,6 +1198,12 @@ const PdfPage = memo(function PdfPage(props: PdfPageProps): React.ReactElement {
     >
       <canvas ref={canvasRef} className="rd-pdf-canvas" />
       <div ref={textRef} className="rd-pdf-host" data-page={pageNumber} />
+      {/*
+        划词高亮层（**页内相对坐标**，百分比定位）：和批注层同一套机制。
+        页面怎么缩放（CSS 预览缩放）/翻页/换布局，它都天然跟着页面走 —— 不需要重算、不会闪烁。
+        引擎把每行矩形换算成百分比后塞进这一层（见 selectionEngine.paint 的 highlightHost 分支）。
+      */}
+      <div className="rd-sel-layer" />
       {links.length ? (
         // 链接热区压在文本层之上（与 pdf.js 的 annotationLayer 同一套做法）：容器不吃事件、
         // 只有链接本身 pointer-events:auto，所以链接可点、其它地方照常划词。
@@ -1735,18 +1722,14 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   const pageResizeObserverRef = useRef<ResizeObserver | null>(null);
   /** 重算高亮的补偿定时器（rAF + 两拍延时；页面重建有 160ms 防抖 + 异步渲染） */
   const engineRefreshTimersRef = useRef<number[]>([]);
+  /** 每页模型坐标系尺寸（构建模型时的渲染像素宽/高）：把 pageRects 换算成百分比用 */
+  const modelSizeRef = useRef(new Map<number, { w: number; h: number }>());
 
   /** 引擎 → 产品：把引擎给的选区翻成工具条/批注要的形状（页内相对矩形 + 首行 client 矩形） */
   const reportEngineSelection = useCallback(
     (sel: EngineSelection | null) => {
       engineSelRef.current = sel;
       if (!sel) {
-        // 选区没了：把"缩放预览"留在高亮层上的变换清掉，避免残留缩放
-        const overlay = engineOverlayRef.current;
-        if (overlay) {
-          overlay.style.transform = '';
-          overlay.style.transformOrigin = '';
-        }
         if (lastSelectionRef.current) {
           lastSelectionRef.current = null;
           onSelectionRef.current(null);
@@ -1784,7 +1767,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     [],
   );
 
-  const engineOverlayRef = useRef<HTMLDivElement | null>(null);
   const engineRef = useRef<ReturnType<typeof createSelectionEngine> | null>(null);
   if (!engineRef.current) {
     engineRef.current = createSelectionEngine({
@@ -1793,23 +1775,30 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
         for (const [pageNumber, layer] of layerByPageRef.current) {
           const model = selectionModelsRef.current.get(pageNumber - 1)?.model;
           if (!model) continue;
-          out.push({ pageIndex: pageNumber - 1, pageEl: layer.pageEl, textLayer: layer.textLayer, model });
+          const size = modelSizeRef.current.get(pageNumber);
+          const rect = layer.pageEl.getBoundingClientRect();
+          out.push({
+            pageIndex: pageNumber - 1,
+            pageEl: layer.pageEl,
+            textLayer: layer.textLayer,
+            model,
+            modelWidth: size?.w || rect.width,
+            modelHeight: size?.h || rect.height,
+          });
         }
         return out;
       },
-      overlay: () => engineOverlayRef.current,
+      // 高亮画进**每页内部**的相对坐标层（和批注层同一套机制）→ 缩放/翻页天然跟随，不会飘
+      highlightHost: (pageIndex) => {
+        const layer = layerByPageRef.current.get(pageIndex + 1);
+        return layer?.pageEl.querySelector<HTMLElement>('.rd-sel-layer') ?? null;
+      },
       onSelection: (sel) => reportEngineSelection(sel),
       debug: SELECTION_DEBUG,
     });
   }
 
-  /**
-   * 让引擎按**当前几何**重算高亮。
-   *
-   * 为什么需要"多拍补偿"：缩放走 160ms 防抖 → `renderScale` 更新 → 页面重新渲染（异步）→
-   * 文本层/页面元素尺寸才最终确定。只在事件当下算一次，拿到的可能还是旧几何
-   * （用户实测：放大后高亮停在页面上方的空白处，滚动一下才回到正确位置）。
-   */
+  /** 页面模型/尺寸变了（重绘、缩放）→ 让引擎重算（只为保持客户端矩形新鲜，视觉不依赖它） */
   const scheduleEngineRefresh = useCallback(() => {
     for (const t of engineRefreshTimersRef.current) window.clearTimeout(t);
     engineRefreshTimersRef.current = [];
@@ -1845,46 +1834,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     [scheduleEngineRefresh],
   );
 
-  /**
-   * 缩放"手势期间"：让高亮层跟着页面的 CSS 预览缩放走（同一原点、同一系数），
-   * 缩放过程中高亮就**黏在字上**，而不是等重绘完再跳到位（用户要的 Word 手感）。
-   *
-   * 页面的 canvas 与文本层在 `PdfPage` 里做了 `transform: scale(scale / renderScale)`
-   * （transform-origin 是页面左上角）；高亮层是独立的 fixed 层，这里套用同一个变换：
-   * 原点取「选中页左上角的视口坐标」，系数用同一个 `f`。重绘完成后 `f === 1`，变换自动清空。
-   */
-  const applyZoomPreviewToOverlay = useCallback((pageNumber: number, factor: number) => {
-    const overlay = engineOverlayRef.current;
-    if (!overlay) return;
-    const reset = (): void => {
-      overlay.style.transform = '';
-      overlay.style.transformOrigin = '';
-    };
-    const sel = engineSelRef.current;
-    if (!sel || sel.pageIndex + 1 !== pageNumber) return; // 只管选中页的通知
-    if (Math.abs(factor - 1) <= 0.002) {
-      reset();
-      return;
-    }
-    const pageEl = layerByPageRef.current.get(pageNumber)?.pageEl;
-    if (!pageEl) return;
-    const r = pageEl.getBoundingClientRect();
-    overlay.style.transformOrigin = `${r.left}px ${r.top}px`;
-    overlay.style.transform = `scale(${factor})`;
-  }, []);
-
-  /** 缩放 / 布局 / DPR 变化后重算高亮（兜底：即使页面没重建也保证对一次） */
-  useEffect(() => {
-    scheduleEngineRefresh();
-  }, [uniformScale, layout, dprLive, scheduleEngineRefresh]);
-
-  /** 卸载时清掉补偿定时器 */
-  useEffect(() => {
-    return () => {
-      for (const t of engineRefreshTimersRef.current) window.clearTimeout(t);
-      engineRefreshTimersRef.current = [];
-    };
-  }, []);
 
   useEffect(() => {
     let dragging = false;
@@ -2176,7 +2125,7 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
   }
 
   /** 各页上报的划词模型：**先包成 SelectionModel** 再存（内核只认模型本身，方法在包装层上） */
-  const handleSelectionModel = useCallback((page: number, model: PageCharModel | null) => {
+  const handleSelectionModel = useCallback((page: number, model: PageCharModel | null, size?: { w: number; h: number }) => {
     // ⚠️ 键用 **0 起页号**（`page` 是 1 起的渲染页号）—— 与模型内部、内核的一致，
     // 漏掉这个换算会让后面所有 `get()` 全部落空（踩过，见 deps 里的注释）。
     const pageIndex = page - 1;
@@ -2184,8 +2133,10 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
     selectionKernelRef.current?.invalidate(pageIndex);
     if (!model) {
       selectionModelsRef.current.delete(pageIndex);
+      modelSizeRef.current.delete(page);
       return;
     }
+    if (size && size.w > 0 && size.h > 0) modelSizeRef.current.set(page, size);
     selectionModelsRef.current.set(pageIndex, new SelectionModel(model));
   }, []);
 
@@ -2642,7 +2593,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
                     onLayer={handleLayer}
-                    onZoomPreview={applyZoomPreviewToOverlay}
                   />
                 ) : (
                   <div className="rd-page-ghost" data-page-index={pageNumber} aria-hidden />
@@ -2681,7 +2631,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
                     goToPage={goToPage}
                     onSelectionModel={handleSelectionModel}
                     onLayer={handleLayer}
-                    onZoomPreview={applyZoomPreviewToOverlay}
                   />
                 );
               })}
@@ -2713,9 +2662,6 @@ export const PdfViewer = memo(function PdfViewer(props: PdfViewerProps): React.R
              结果全被裁掉；所以外面套一层"只负责裁切"的壳。
           2. 位置不能改回 per-page（每页挂一层）：坐标是客户端坐标，跟着页面走会算两次偏移。
       */}
-      <div className="rd-sel-clip">
-        <div ref={engineOverlayRef} className="rd-sel-overlay" />
-      </div>
       <span className="rd-sr-only" aria-live="polite">
         第 {currentPage} / {total} 页
       </span>

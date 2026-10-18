@@ -49,6 +49,15 @@ export interface EngineSelection {
   text: string;
   /** 每行一条矩形（客户端坐标）：行内取"首字左边界 → 末字右边界" */
   rects: EngineRect[];
+  /**
+   * 每行一条矩形（**页内坐标，单位 = 模型坐标系像素**，原点在页面左上角）。
+   *
+   * 为什么还要这一份：高亮现在画在**页面内部的相对坐标层**里（和批注层同一套机制），
+   * 缩放（页面的 CSS 预览缩放）、翻页、切换布局时它会天然跟着页面/文字走，
+   * 不需要"重算 + 交接"，从根上消除"先飘走、再跳回"的闪烁。
+   * 换算成百分比 = 除以 `PageHandle.modelWidth / modelHeight`。
+   */
+  pageRects: EngineRect[];
   /** 选中的字符序号（按视觉顺序），给上层做精确映射用 */
   charIndices: number[];
 }
@@ -58,13 +67,21 @@ export interface PageHandle {
   pageEl: HTMLElement;
   textLayer: HTMLElement;
   model: PageCharModel;
+  /** 构建 model 时页面坐标系的宽/高（渲染像素）：用于把 pageRects 换算成百分比 */
+  modelWidth: number;
+  modelHeight: number;
 }
 
 export interface EngineDeps {
   /** 当前可见/可选的页面（顺序无所谓，命中用几何判定） */
   pages: () => PageHandle[];
-  /** 高亮层容器（**固定在视口上**，矩形是客户端坐标，直接摆进去即可） */
-  overlay: () => HTMLElement | null;
+  /**
+   * 每页的**高亮容器**（页面内部的一层，坐标用页内相对百分比）。
+   * 给了它就优先走"跟着页面走"的绘制方式；没给则退回旧的 fixed overlay（客户端坐标）。
+   */
+  highlightHost?: (pageIndex: number) => HTMLElement | null;
+  /** 旧的高亮层容器（固定在视口上，矩形是客户端坐标）。仅作兜底保留 */
+  overlay?: () => HTMLElement | null;
   /** 选区变化时通知外部（工具条定位、上报批注等） */
   onSelection: (selection: EngineSelection | null) => void;
   /** 命中容差（CSS 像素）：指针离字多远还算"点在字上"。默认 14 */
@@ -1525,11 +1542,42 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
   };
 
   const paint = (): void => {
-    const host = deps.overlay() ?? overlayHost;
-    if (!host) return;
     for (const el of highlights) el.remove();
     highlights.length = 0;
     if (!selection) return;
+
+    /**
+     * ## 优先：画进**页面内部**的相对坐标层（和批注层同一套机制）
+     *
+     * 这样缩放（页面的 CSS 预览缩放）、翻页、切换布局时，高亮天然跟着页面/文字走：
+     * 页面盒子尺寸一变，百分比定位自动等比缩放，**不需要重算也不需要交接** ——
+     * 从根上消除"先飘走、再跳回"的闪烁（用户逐帧录屏抓到过：y285 → y601 → y285 → y601）。
+     */
+    const hostFor = deps.highlightHost;
+    if (hostFor) {
+      const page = deps.pages().find((p) => p.pageIndex === selection?.pageIndex);
+      const host = hostFor(selection.pageIndex);
+      if (!page || !host || page.modelWidth <= 0 || page.modelHeight <= 0) return;
+      const w = page.modelWidth;
+      const h = page.modelHeight;
+      for (const [x1, y1, x2, y2] of selection.pageRects) {
+        const div = host.ownerDocument.createElement('div');
+        div.className = 'sel-line';
+        div.style.position = 'absolute';
+        div.style.left = `${(x1 / w) * 100}%`;
+        div.style.top = `${(y1 / h) * 100}%`;
+        div.style.width = `${(Math.max(1, x2 - x1) / w) * 100}%`;
+        div.style.height = `${(Math.max(1, y2 - y1) / h) * 100}%`;
+        div.style.pointerEvents = 'none';
+        host.appendChild(div);
+        highlights.push(div);
+      }
+      return;
+    }
+
+    // 兜底：旧的 fixed overlay（客户端坐标）
+    const host = deps.overlay?.() ?? overlayHost;
+    if (!host) return;
     for (const [x1, y1, x2, y2] of selection.rects) {
       const div = host.ownerDocument.createElement('div');
       div.className = 'sel-line';
@@ -1585,6 +1633,8 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
       end: idx[idx.length - 1] + 1,
       text: textOf(chars, idx),
       rects: buildLineRects(chars, idx, rect),
+      // 页内坐标（原点 = 页面左上角，单位 = 模型坐标系像素）：画进页面内部层用
+      pageRects: buildLineRects(chars, idx, { left: 0, top: 0 }),
       charIndices: idx,
     };
     paint();
@@ -1670,7 +1720,7 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     },
     current: () => selection,
     refresh() {
-      overlayHost = deps.overlay();
+      overlayHost = deps.overlay?.() ?? overlayHost;
       /**
        * ⚠️ 缩放 / 切换布局会**重排并重绘**页面：重绘的瞬间，本页的文本层可能被临时移除，
        * `deps.pages()` 里找不到它。这时**绝不能调 `rebuild()`** —— 它会把选区清掉
@@ -1694,7 +1744,7 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
     },
   };
 
-  overlayHost = deps.overlay();
+  overlayHost = deps.overlay?.() ?? null;
 
   /**
    * 诊断入口（自动化验收用）：把每页的"行数 / 栏缝 / 块规模 / 行高"打出来。
