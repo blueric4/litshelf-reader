@@ -463,7 +463,34 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): Seam[] {
     if (dup) continue;
     seams.push({ at: c.at, lo: c.lo - medianH, hi: c.hi + medianH });
   }
-  return seams.sort((a, b) => a.lo - b.lo || a.at - b.at);
+
+  /**
+   * ⑥ **把被少量"未投票行"打断的同一条栏缝合并回一整条**。
+   *
+   * 为什么必须合并（这是"分栏选区在段中被切开"的根因，真机复现：300% 缩放时第 7 页
+   * 左栏的正文被切成 13字/3字/9字 三个小块，选区往下拖卡在 1 个字）：
+   *   · 栏缝的 y 范围来自"投票行聚类"——中间只要有几行没在这一列留空隙
+   *     （表格行、通栏行、甚至两端对齐的行），聚类就把同一条缝切成 3 段；
+   *   · `makeLine` 生成行的 `gutters` 时只算**在它 y 处生效**的缝 →
+   *     缺口段里的行拿不到这条缝 → `gutters` 集合与同栏其它行不同 →
+   *     `buildBlocks` 的 `sameGutters` 判据把它们判成不同块 → **块在段落中间断开**；
+   *   · 高倍缩放时行数变多、缺口更常见，所以 200% 正常、300% 才炸（用户报告"有时分栏分得很奇怪"）。
+   *
+   * 合并条件：x 相近（`minApart` 内）且 y 缺口不太大（≤ 4 倍字高）。
+   * 缺口里若真有"通栏行"，它横跨栏缝、`gutters` 里不含这条缝，仍会自然分到别的块里。
+   */
+  const mergedSeams: Seam[] = [];
+  for (const s of seams.sort((a, b) => a.at - b.at || a.lo - b.lo)) {
+    const prev = mergedSeams[mergedSeams.length - 1];
+    if (prev && Math.abs(prev.at - s.at) < minApart && s.lo - prev.hi <= medianH * 4) {
+      prev.at = (prev.at * (prev.hi - prev.lo) + s.at * (s.hi - s.lo)) / Math.max(1, prev.hi - prev.lo + s.hi - s.lo);
+      prev.lo = Math.min(prev.lo, s.lo);
+      prev.hi = Math.max(prev.hi, s.hi);
+      continue;
+    }
+    mergedSeams.push({ ...s });
+  }
+  return mergedSeams.sort((a, b) => a.lo - b.lo || a.at - b.at);
 }
 
 /**
@@ -680,8 +707,26 @@ function buildLines(chars: readonly ZoteroChar[], seamsIn?: readonly Seam[]): Li
      */
     const thr = Math.max(6, medianGap * 1.8);
     const breakAt: number[] = [];
+    const cyLine = (ln.top + ln.bottom) / 2;
     for (const g of gaps) {
       if (g.w <= thr) continue;
+      /**
+       * ## 断口必须**落在已检出的栏缝附近**，否则不切
+       *
+       * 这条守卫是"高倍缩放下正文被切成碎块"的根因修复（真机复现：300% 时第 7 页
+       * `在 AI 时代，财会人才需具备全局…` 被切成 `在` / `AI` / `时代…` 三段，
+       * 块碎成 53 个，选区往下拖卡在 1 个字）。
+       *
+       * 原因：阈值 `max(6, 字距中位数×1.8)` 在高倍缩放下会被**英文单词两侧的空格**顶破
+       * （中文行内字距≈0，阈值退化到 6px，而缩放后 " AI " 的空隙可能 10px+）→
+       * 把一行正文从空格处切成两段。
+       * 真跨栏行的断口**一定**落在栏缝上（两栏之间的空白走廊），所以用"缝的位置"来判：
+       * 断口离任何一条（在该行 y 处生效的）栏缝都远 → 只是词间距，不能切。
+       */
+      const nearSeam = seams.some(
+        (s) => seamActiveAt(s, cyLine) && Math.abs(s.at - g.at) <= Math.max(g.w, medianW * 2),
+      );
+      if (!nearSeam) continue;
       const leftChars = g.k;
       const rightChars = ln.chars.length - g.k;
       /**
@@ -1220,13 +1265,13 @@ function buildBlocks(lines: readonly Line[], chars: readonly ZoteroChar[], media
 let diagPageNo = 0;
 
 /** 分块结果缓存：模型对象 + 页面像素尺寸为键（缩放后尺寸变 → 自动重算） */
-const blockCache = new WeakMap<PageCharModel, { key: string; blocks: Block[] }>();
+const blockCache = new WeakMap<PageCharModel, { key: string; blocks: Block[]; seams: Seam[]; lineCount: number }>();
 
-function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[] } {
+function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]; seams: Seam[]; lineCount: number } {
   const r = pageEl.getBoundingClientRect();
   const key = `${Math.round(r.width)}x${Math.round(r.height)}`;
   const cached = blockCache.get(model);
-  if (cached && cached.key === key) return { blocks: cached.blocks };
+  if (cached && cached.key === key) return { blocks: cached.blocks, seams: cached.seams, lineCount: cached.lineCount };
 
   const chars = model.chars;
   diagPageNo = model.pageIndex + 1;
@@ -1240,7 +1285,7 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
     .sort((a, b) => a - b);
   const medianCharWidth = widths.length ? widths[Math.floor(widths.length / 2)] : 8;
   const blocks = buildBlocks(lines, chars, medianCharWidth, seams);
-  blockCache.set(model, { key, blocks });
+  blockCache.set(model, { key, blocks, seams, lineCount: lines.length });
 
   // 诊断：把"行 + 行内间隙 + 分块"写到磁盘（CDP 返回值有大小限制，写文件没有）
   try {
@@ -1352,7 +1397,7 @@ function blocksFor(model: PageCharModel, pageEl: HTMLElement): { blocks: Block[]
       top: Math.round(b.top),
     }));
   }
-  return { blocks };
+  return { blocks, seams, lineCount: lines.length };
 }
 
 /** 客户端坐标 → 命中页面的辅助：页面必须可见（尺寸 > 0） */
@@ -1753,10 +1798,14 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
   if (typeof window !== 'undefined') {
     (window as unknown as { __litshelfBlocks?: () => unknown }).__litshelfBlocks = () =>
       deps.pages().map((p) => {
-        const { blocks } = blocksFor(p.model, p.pageEl);
+        const { blocks, seams, lineCount } = blocksFor(p.model, p.pageEl);
+        const chars = p.model.chars;
         return {
           page: p.pageIndex + 1,
-          chars: p.model.chars.length,
+          chars: chars.length,
+          lineCount,
+          /** 检出的栏缝：位置 + 生效的纵向范围（排查"块在段中被切开"的关键数据） */
+          seams: seams.map((s) => ({ at: Math.round(s.at), lo: Math.round(s.lo), hi: Math.round(s.hi) })),
           blocks: blocks.map((b) => ({
             chars: b.order.length,
             lines: b.lines.length,
@@ -1765,6 +1814,8 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
             left: Math.round(b.left),
             right: Math.round(b.right),
             size: Math.round(b.size),
+            /** 块开头 12 个字（用于判断"这个块是不是断在句子中间"） */
+            text: b.order.slice(0, 12).map((i) => chars[i]?.c ?? '').join(''),
           })),
         };
       });
