@@ -450,7 +450,51 @@ function pageGuttersOf(chars: readonly ZoteroChar[]): Seam[] {
       if (lp < 0.25 || rp < 0.25) continue;
       const ratio = lp / rp;
       if (ratio < 0.75 || ratio > 1.33) continue;
-      cands.push({ at, n: cluster.length, lo, hi, ratio, score: cluster.length - Math.abs(1 - ratio) * 2 });
+
+      /**
+       * ## ⑥ 把纵向范围扩大：**穿过"只有单边文字"的行**，只被"通栏行"截断
+       *
+       * 真机复现（《组织韧性》第 1 页，200%）：引言双栏区里**右栏比左栏早开始 2 行**
+       * （左栏上面是"０ 引言"标题）。这两行只有右栏的字 → 它们不可能"在栏缝处留空隙"
+       * → 不参与投票 → 栏缝的 y 范围从第 3 行才开始（实测 lo=1342，而右栏从 1289 就开始了）。
+       * 结果：这 2 行的 `gutters` 集合与下面同栏的行不同 → 被并块判据拆成独立小块 →
+       * **用户在右栏顶部往下拖，选区只选 2~3 行就停住**（用户截图复现）。
+       *
+       * 判定"通栏行"的方法：这一行**左侧有字、右侧也有字、但两者之间没有足够宽的空白**
+       * （< minSeam）= 字真的横跨栏缝 → 它才是双栏区的终点；
+       * 只有一侧有字（某栏还没排到这里）→ 不构成反证，缝继续贯穿。
+       * 扩展距离上限 8 倍字高，避免把远处无关的段落卷进来。
+       */
+      const crossesSeamAt = (row: Row): boolean => {
+        const rects2 = row.chars.map((c) => charRectOf(c)).sort((a, b) => a[0] - b[0]);
+        let leftMax = Number.NEGATIVE_INFINITY;
+        let rightMin = Number.POSITIVE_INFINITY;
+        for (const r of rects2) {
+          if (r[0] <= at && r[2] >= at) return true; // 有字直接跨过缝位置 → 通栏
+          if (r[2] <= at) leftMax = Math.max(leftMax, r[2]);
+          if (r[0] >= at) rightMin = Math.min(rightMin, r[0]);
+        }
+        if (!Number.isFinite(leftMax) || !Number.isFinite(rightMin)) return false; // 只有单边 → 兼容
+        return rightMin - leftMax < minSeam; // 两边都有字但没有缝的空白 → 通栏
+      };
+      const maxExtend = medianH * 8;
+      let extLo = lo;
+      for (let ri = cluster[0] - 1; ri >= 0; ri -= 1) {
+        const r = rows[ri];
+        if (r.y >= extLo) continue;
+        if (extLo - r.y > maxExtend) break;
+        if (crossesSeamAt(r)) break;
+        extLo = r.y;
+      }
+      let extHi = hi;
+      for (let ri = cluster[cluster.length - 1] + 1; ri < rows.length; ri += 1) {
+        const r = rows[ri];
+        if (r.y <= extHi) continue;
+        if (r.y - extHi > maxExtend) break;
+        if (crossesSeamAt(r)) break;
+        extHi = r.y;
+      }
+      cands.push({ at, n: cluster.length, lo: extLo, hi: extHi, ratio, score: cluster.length - Math.abs(1 - ratio) * 2 });
     }
   }
 
@@ -879,6 +923,23 @@ function buildLines(chars: readonly ZoteroChar[], seamsIn?: readonly Seam[]): Li
   }
   splitLines.length = 0;
   splitLines.push(...clampPieces);
+  /**
+   * ## 给**所有行**统一重算 `gutters`（不只是被切过的行）
+   *
+   * 这是"分栏页选区在段落中间卡住"的最后一块拼图（真机复现：《组织韧性》第 1 页 200%，
+   * 引言右栏**前 2 行**独立成块，往下拖只能选 2~3 行）。
+   *
+   * 原因：`gutters` 原来只有 `makeLine()` 产生的行才有值 —— 也就是**只有被切分的行**带正确集合，
+   * 没被切分的行一直是初始化的 `[]`。于是同栏里"被切过的行"和"没切过的行"集合不同，
+   * `buildBlocks` 的 `sameGutters` 判据把它们判成不同块 → 块在段落中间断开。
+   * 这里在行构建结束时统一按同一套规则重算，保证同栏行的集合完全一致。
+   */
+  for (const ln of splitLines) {
+    const cy = (ln.top + ln.bottom) / 2;
+    ln.gutters = seams
+      .filter((s) => seamActiveAt(s, cy) && !(ln.left < s.at - 1 && ln.right > s.at + 1))
+      .map((s) => s.at);
+  }
   /**
    * 诊断：报告"哪些行被切开了、切成几段"。运行时自报，避免我在离线复算里自欺。
    */
@@ -1816,6 +1877,9 @@ export function createSelectionEngine(deps: EngineDeps): SelectionEngine {
             size: Math.round(b.size),
             /** 块开头 12 个字（用于判断"这个块是不是断在句子中间"） */
             text: b.order.slice(0, 12).map((i) => chars[i]?.c ?? '').join(''),
+            /** 首行"没有跨过的栏缝"集合（排查块被拆开的原因） */
+            gutters: (b.lines[0]?.gutters ?? []).map((g) => Math.round(g)),
+            firstCy: b.lines[0] ? Math.round((b.lines[0].top + b.lines[0].bottom) / 2) : null,
           })),
         };
       });
